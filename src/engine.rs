@@ -8,6 +8,7 @@
 use crate::model::{Hop, HopId, Layer, Path, Status};
 use crate::platform::{self, Platform};
 use crate::probe;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// The canonical hop order of the connectivity chain, host → internet.
@@ -51,24 +52,41 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
 
         let Some(route) = route else {
             // No default route: link is down, everything downstream is moot.
-            let mut link = Hop::new(HopId::Link, Layer::Link, "Wi-Fi");
-            link.status = Status::Fail;
-            link.summary = Some("No active network interface / default route".into());
-            let _ = tx.send(link);
-            for id in [HopId::Gateway, HopId::Wan, HopId::Dns, HopId::Captive] {
-                let mut h = Hop::new(id, Layer::Network, "—");
-                h.status = Status::Skipped;
-                let _ = tx.send(h);
+            // Source correctly-typed hops from the skeleton; fail the link and
+            // skip everything downstream.
+            for mut hop in skeleton().hops {
+                match hop.id {
+                    HopId::Host => continue,
+                    HopId::Link => {
+                        hop.status = Status::Fail;
+                        hop.summary = Some("No active network interface / default route".into());
+                    }
+                    _ => hop.status = Status::Skipped,
+                }
+                let _ = tx.send(hop);
             }
             return;
         };
 
-        // L2 link telemetry is a blocking `system_profiler` call.
+        // L2 link telemetry is a blocking `system_profiler` call that can be
+        // slow (multi-second) and has been known to wedge. Bound it so a hung
+        // call degrades the Link hop instead of freezing the whole run.
         let iface = route.interface.clone();
         let tx_link = tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let p = platform::current();
-            let _ = tx_link.send(probe::link::probe(&p, &iface));
+        tokio::spawn(async move {
+            let handle = tokio::task::spawn_blocking(move || {
+                probe::link::probe(&platform::current(), &iface)
+            });
+            let hop = match tokio::time::timeout(Duration::from_secs(8), handle).await {
+                Ok(Ok(hop)) => hop,
+                _ => {
+                    let mut hop = Hop::new(HopId::Link, Layer::Link, "Wi-Fi");
+                    hop.status = Status::Warn;
+                    hop.summary = Some("Link telemetry timed out (system_profiler slow)".into());
+                    hop
+                }
+            };
+            let _ = tx_link.send(hop);
         });
 
         // Gateway.

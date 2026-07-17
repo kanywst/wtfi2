@@ -39,7 +39,15 @@ fn run(cmd: &str, args: &[&str]) -> Result<String, PlatformError> {
 impl Platform for MacOs {
     fn route(&self) -> Result<RouteInfo, PlatformError> {
         let text = run("route", &["-n", "get", "default"])?;
-        let mut info = parse_route(&text)?;
+        let mut info = match parse_route(&text) {
+            Ok(i) => i,
+            // No IPv4 default route — fall back to the IPv6 table so an
+            // IPv6-only network isn't reported as fully offline.
+            Err(_) => {
+                let v6 = run("route", &["-n", "get", "-inet6", "default"])?;
+                parse_route(&v6)?
+            }
+        };
         if let Ok(tun) = run("scutil", &["--nwi"]) {
             if let Some(iface) = detect_tunnel(&tun) {
                 info.tunnel_active = true;
@@ -50,6 +58,22 @@ impl Platform for MacOs {
     }
 
     fn link(&self, interface: &str) -> Result<LinkInfo, PlatformError> {
+        // `system_profiler SPAirPortDataType` always describes the Wi-Fi card,
+        // regardless of which interface owns the default route. If the route
+        // isn't the Wi-Fi device (e.g. wired Ethernet with Wi-Fi still idle),
+        // don't grade this link by the Wi-Fi signal.
+        let wifi_dev = run("networksetup", &["-listallhardwareports"])
+            .ok()
+            .and_then(|t| wifi_device(&t));
+        if let Some(dev) = &wifi_dev {
+            if dev != interface {
+                return Ok(LinkInfo {
+                    interface: interface.to_string(),
+                    is_wifi: false,
+                    ..Default::default()
+                });
+            }
+        }
         let text = run("system_profiler", &["SPAirPortDataType"])?;
         let mut info = parse_airport(&text);
         info.interface = interface.to_string();
@@ -70,7 +94,14 @@ fn parse_route(text: &str) -> Result<RouteInfo, PlatformError> {
     for line in text.lines() {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("gateway:") {
-            info.gateway = rest.trim().parse().ok();
+            // A link-local IPv6 gateway carries a zone id: `fe80::1%en0`.
+            // Split it off so the address parses, and keep the zone for ping.
+            let (addr, zone) = match rest.trim().split_once('%') {
+                Some((a, z)) => (a, Some(z.to_string())),
+                None => (rest.trim(), None),
+            };
+            info.gateway = addr.parse().ok();
+            info.gateway_zone = zone;
         } else if let Some(rest) = t.strip_prefix("interface:") {
             info.interface = rest.trim().to_string();
         } else if t.starts_with("recvpipe") {
@@ -90,6 +121,27 @@ fn parse_route(text: &str) -> Result<RouteInfo, PlatformError> {
         return Err(PlatformError::NoNetwork);
     }
     Ok(info)
+}
+
+/// Parse the Wi-Fi device name from `networksetup -listallhardwareports`.
+///
+/// ```text
+/// Hardware Port: Wi-Fi
+/// Device: en0
+/// ```
+fn wifi_device(text: &str) -> Option<String> {
+    let mut in_wifi = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(port) = t.strip_prefix("Hardware Port:") {
+            in_wifi = matches!(port.trim(), "Wi-Fi" | "AirPort");
+        } else if in_wifi {
+            if let Some(dev) = t.strip_prefix("Device:") {
+                return Some(dev.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 fn detect_tunnel(nwi: &str) -> Option<String> {
@@ -256,5 +308,20 @@ mod tests {
         let r = parse_resolvers(DNS);
         assert_eq!(r.nameservers.len(), 1);
         assert_eq!(r.nameservers[0].to_string(), "192.168.0.1");
+    }
+
+    #[test]
+    fn route_strips_ipv6_zone() {
+        let text = "      gateway: fe80::1%en0\n    interface: en0";
+        let r = parse_route(text).unwrap();
+        assert_eq!(r.gateway.unwrap().to_string(), "fe80::1");
+        assert_eq!(r.gateway_zone.as_deref(), Some("en0"));
+    }
+
+    #[test]
+    fn wifi_device_parsed() {
+        let text = "Hardware Port: Ethernet\nDevice: en5\n\n\
+                    Hardware Port: Wi-Fi\nDevice: en0\nEthernet Address: aa:bb";
+        assert_eq!(wifi_device(text).as_deref(), Some("en0"));
     }
 }

@@ -34,11 +34,17 @@ impl Probe {
 }
 
 /// ICMP-ping an address via the system `ping`/`ping6` binary (setuid, no sudo).
-pub async fn ping(addr: IpAddr, wait: Duration) -> Probe {
+///
+/// `zone` carries the scope id for a link-local IPv6 target (`fe80::1%en0`),
+/// without which the kernel can't pick an egress interface.
+pub async fn ping(addr: IpAddr, zone: Option<&str>, wait: Duration) -> Probe {
     let secs = wait.as_secs().max(1).to_string();
     let (bin, target) = match addr {
         IpAddr::V4(v4) => ("ping", v4.to_string()),
-        IpAddr::V6(v6) => ("ping6", v6.to_string()),
+        IpAddr::V6(v6) => match zone {
+            Some(z) => ("ping6", format!("{v6}%{z}")),
+            None => ("ping6", v6.to_string()),
+        },
     };
     let out = Command::new(bin)
         .args(["-c", "1", "-t", &secs, &target])

@@ -40,8 +40,11 @@ impl Status {
         }
     }
 
+    /// Whether the probe has settled. `Skipped` counts as settled — otherwise
+    /// an outage (which legitimately skips downstream hops) would leave the
+    /// live dashboard stuck on "scanning" and never render a verdict.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Status::Ok | Status::Warn | Status::Fail)
+        !matches!(self, Status::Pending)
     }
 }
 

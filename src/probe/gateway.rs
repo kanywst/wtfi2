@@ -30,7 +30,7 @@ pub async fn probe(route: &RouteInfo) -> Hop {
         return hop;
     };
 
-    match ping(gw, Duration::from_secs(2)).await {
+    match ping(gw, route.gateway_zone.as_deref(), Duration::from_secs(2)).await {
         Probe::Up(d) => {
             let ms = d.as_secs_f64() * 1000.0;
             hop.latency_ms = Some(ms);

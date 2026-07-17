@@ -139,4 +139,18 @@ mod tests {
         // WAN comes before DNS in the vec, so it is the first break.
         assert_eq!(p.first_break().unwrap().id, HopId::Wan);
     }
+
+    #[test]
+    fn skipped_hops_count_as_complete() {
+        // A real outage skips downstream hops; the path must still be
+        // "complete" so the dashboard renders a verdict instead of spinning.
+        let mut link = Hop::new(HopId::Link, Layer::Link, "Wi-Fi");
+        link.status = Status::Fail;
+        let mut gw = Hop::new(HopId::Gateway, Layer::Network, "Gateway");
+        gw.status = Status::Skipped;
+        let p = Path {
+            hops: vec![link, gw],
+        };
+        assert!(p.is_complete());
+    }
 }

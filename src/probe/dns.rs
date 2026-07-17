@@ -41,7 +41,8 @@ pub async fn probe() -> Hop {
     // use the public resolvers as context for the cause.
     hop.status = match (system.ok, system.latency) {
         (true, Some(ms)) => latency_status(ms),
-        _ if cf.ok || google.ok => Status::Fail, // public DNS works, system doesn't
+        // System resolver is dead either way; the cf/google split only shapes
+        // the cause text below.
         _ => Status::Fail,
     };
 

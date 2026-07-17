@@ -54,6 +54,8 @@ impl LinkInfo {
 pub struct RouteInfo {
     pub interface: String,
     pub gateway: Option<IpAddr>,
+    /// Scope/zone id for a link-local IPv6 gateway (e.g. `en0` in `fe80::1%en0`).
+    pub gateway_zone: Option<String>,
     pub mtu: Option<u32>,
     /// True when a VPN/tunnel interface (utun/tailscale) owns a route.
     pub tunnel_active: bool,

@@ -42,13 +42,21 @@ pub fn diagnose(path: &Path) -> Verdict {
         };
     }
 
-    // 1. The connection is broken somewhere: explain the *first* break, since
-    //    everything downstream is just collateral.
+    // 1. A positively-detected captive portal wins over any upstream break it
+    //    caused. Portals blackhole direct TCP to 1.1.1.1:443, so the WAN hop
+    //    fails first in the chain — but "sign in to the Wi-Fi" is the real,
+    //    actionable root cause, not "your ISP is down".
+    if hop_status(path, HopId::Captive) == Status::Fail {
+        return explain_break(path, HopId::Captive);
+    }
+
+    // 2. Otherwise the connection is broken somewhere: explain the *first*
+    //    break, since everything downstream is just collateral.
     if let Some(broken) = path.first_break() {
         return explain_break(path, broken.id);
     }
 
-    // 2. Nothing is broken — surface the worst degradation, if any.
+    // 3. Nothing is broken — surface the worst degradation, if any.
     if let Some(warn) = path
         .hops
         .iter()
@@ -58,7 +66,7 @@ pub fn diagnose(path: &Path) -> Verdict {
         return explain_warn(path, warn.id);
     }
 
-    // 3. Clean bill of health.
+    // 4. Clean bill of health.
     Verdict {
         status: Status::Ok,
         headline: "You're fully online".into(),
@@ -211,6 +219,27 @@ mod tests {
         };
         let v = diagnose(&p);
         assert!(v.headline.contains("router"));
+    }
+
+    #[test]
+    fn captive_portal_overrides_upstream_wan_fail() {
+        // Portals blackhole TCP to 1.1.1.1, so WAN fails first in the chain —
+        // but the portal is the real, actionable cause.
+        let p = Path {
+            hops: vec![
+                hop(HopId::Link, Layer::Link, Status::Ok),
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                hop(HopId::Wan, Layer::Internet, Status::Fail),
+                hop(HopId::Dns, Layer::Application, Status::Skipped),
+                hop(HopId::Captive, Layer::Application, Status::Fail),
+            ],
+        };
+        let v = diagnose(&p);
+        assert!(
+            v.headline.to_lowercase().contains("portal"),
+            "expected portal verdict, got: {}",
+            v.headline
+        );
     }
 
     #[test]
