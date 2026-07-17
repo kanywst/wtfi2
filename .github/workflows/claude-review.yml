@@ -1,8 +1,8 @@
 name: Claude Review
 
 # Automatic review on every PR, running on your Claude Pro/Max subscription
-# (no pay-per-token API key needed). Auth uses CLAUDE_CODE_OAUTH_TOKEN, which
-# you generate locally with `claude setup-token` and add as a repo secret.
+# (no pay-per-token API key needed). Auth uses CLAUDE_CODE_OAUTH_TOKEN, a
+# *repository* secret you generate locally with `claude setup-token`.
 on:
   pull_request:
     types: [opened, synchronize]
@@ -14,14 +14,24 @@ permissions:
 jobs:
   review:
     runs-on: ubuntu-latest
-    # Skip if the token secret isn't configured yet, so PRs aren't blocked.
+    # Only for same-repo PRs (fork PRs can't see the secret anyway).
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    env:
+      # Empty when the secret is unset — lets us skip gracefully (green)
+      # instead of hard-failing the check on repos without the token.
+      HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
     steps:
+      - name: Note missing token
+        if: env.HAS_TOKEN != 'true'
+        run: echo "::notice::CLAUDE_CODE_OAUTH_TOKEN not set — skipping Claude review."
+
       - uses: actions/checkout@v5
+        if: env.HAS_TOKEN == 'true'
         with:
           fetch-depth: 1
 
       - uses: anthropics/claude-code-action@v1
+        if: env.HAS_TOKEN == 'true'
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
