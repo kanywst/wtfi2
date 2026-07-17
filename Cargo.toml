@@ -1,0 +1,43 @@
+[package]
+name = "wtfi2"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "What The F*ck Internet — a live, visual network path diagnostic that pinpoints exactly where your connection dies."
+license = "MIT"
+repository = "https://github.com/kanywst/wtfi"
+readme = "README.md"
+keywords = ["network", "wifi", "diagnostic", "tui", "macos"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "wtfi"
+path = "src/main.rs"
+
+[lib]
+name = "wtfi2"
+path = "src/lib.rs"
+
+[dependencies]
+# TUI + terminal
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+# async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "net", "time", "sync"] }
+futures = "0.3"
+# errors
+color-eyre = "0.6"
+# probes
+hickory-resolver = "0.26"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# cli + serialization
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
