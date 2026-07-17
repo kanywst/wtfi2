@@ -2,7 +2,7 @@ name: Claude
 
 # Interactive assistant: mention @claude in an issue or PR comment and it
 # responds with the full repo/PR context. Same subscription-based auth as the
-# review workflow (CLAUDE_CODE_OAUTH_TOKEN).
+# review workflow (CLAUDE_CODE_OAUTH_TOKEN, a repository secret).
 on:
   issue_comment:
     types: [created]
@@ -19,10 +19,14 @@ jobs:
     # Only wake up when someone actually mentions @claude.
     if: contains(github.event.comment.body, '@claude')
     runs-on: ubuntu-latest
+    env:
+      HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v5
+        if: env.HAS_TOKEN == 'true'
 
       - uses: anthropics/claude-code-action@v1
+        if: env.HAS_TOKEN == 'true'
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
