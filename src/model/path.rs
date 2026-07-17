@@ -112,8 +112,15 @@ impl Path {
 
     /// The first hop (closest to the host) that is broken, if any.
     /// This is "where the connection died".
+    ///
+    /// Ordered by [`HopId`] position in the chain rather than vec order, so the
+    /// result is stable even if probes ever land out of order — matching how
+    /// the diagnosis engine selects the worst warning.
     pub fn first_break(&self) -> Option<&Hop> {
-        self.hops.iter().find(|h| h.status == Status::Fail)
+        self.hops
+            .iter()
+            .filter(|h| h.status == Status::Fail)
+            .min_by_key(|h| h.id as usize)
     }
 
     /// True once every hop has a terminal status.
@@ -138,6 +145,18 @@ mod tests {
         p.hops = vec![g, w, d];
         // WAN comes before DNS in the vec, so it is the first break.
         assert_eq!(p.first_break().unwrap().id, HopId::Wan);
+    }
+
+    #[test]
+    fn first_break_uses_chain_order_not_vec_order() {
+        // Fails inserted out of chain order: Dns before Gateway in the vec.
+        let mut d = Hop::new(HopId::Dns, Layer::Application, "DNS");
+        d.status = Status::Fail;
+        let mut g = Hop::new(HopId::Gateway, Layer::Network, "Gateway");
+        g.status = Status::Fail;
+        let p = Path { hops: vec![d, g] };
+        // Gateway is earlier in the chain, so it wins regardless of vec order.
+        assert_eq!(p.first_break().unwrap().id, HopId::Gateway);
     }
 
     #[test]
