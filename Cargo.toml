@@ -6,6 +6,7 @@ rust-version = "1.88"
 description = "What The F*ck Internet — a live, visual network path diagnostic that pinpoints exactly where your connection dies."
 license = "MIT"
 repository = "https://github.com/kanywst/wtfi2"
+homepage = "https://github.com/kanywst/wtfi2"
 readme = "README.md"
 keywords = ["network", "wifi", "diagnostic", "tui", "macos"]
 categories = ["command-line-utilities"]
@@ -41,3 +42,8 @@ serde_json = "1"
 lto = "thin"
 strip = true
 codegen-units = 1
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
