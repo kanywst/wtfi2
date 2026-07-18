@@ -1,5 +1,9 @@
 # wtfi2
 
+[![CI](https://github.com/kanywst/wtfi2/actions/workflows/ci.yml/badge.svg)](https://github.com/kanywst/wtfi2/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/kanywst/wtfi2)](https://github.com/kanywst/wtfi2/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **What The F\*ck Internet** — a live, visual network-path diagnostic that
 pinpoints *exactly* where your connection dies, and tells you how to fix it.
 
@@ -55,7 +59,15 @@ The one-shot report (`wtfi`):
 
 ## Install
 
-From source (requires Rust 1.88+):
+Homebrew (macOS):
+
+```bash
+brew install kanywst/tap/wtfi2
+```
+
+The installed command is `wtfi`.
+
+Or from source (requires Rust 1.88+):
 
 ```bash
 git clone https://github.com/kanywst/wtfi2
