@@ -12,6 +12,9 @@ installers = ["shell", "homebrew"]
 # Publish the Homebrew formula to this tap on release
 tap = "kanywst/homebrew-tap"
 publish-jobs = ["homebrew"]
+# We hand-patch release.yml (idempotent formula commit), so opt out of dist's
+# "CI is up to date" check for that file.
+allow-dirty = ["ci"]
 # macOS only — the platform layer targets macOS (Linux is on the roadmap)
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
 # Path that installers should place binaries in
