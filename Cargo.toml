@@ -46,4 +46,6 @@ codegen-units = 1
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
-lto = "thin"
+# Package debug symbols into .dSYM bundles for macOS release artifacts.
+# (lto is inherited from [profile.release], so it isn't repeated here.)
+split-debuginfo = "packed"
