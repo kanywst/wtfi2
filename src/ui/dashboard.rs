@@ -113,13 +113,14 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         tokio::select! {
             maybe_ev = events.next() => {
                 if let Some(Ok(Event::Key(k))) = maybe_ev
-                    && k.kind == KeyEventKind::Press {
-                        match k.code {
-                            KeyCode::Char('q') | KeyCode::Esc => break,
-                            KeyCode::Char('r') => rx = app.restart(),
-                            _ => {}
-                        }
+                    && k.kind == KeyEventKind::Press
+                {
+                    match k.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('r') => rx = app.restart(),
+                        _ => {}
                     }
+                }
             }
             _ = ticker.tick() => {
                 app.tick = app.tick.wrapping_add(1);
