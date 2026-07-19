@@ -126,20 +126,22 @@ Built for 2026, single self-contained binary:
 | CLI          | `clap` 4                                           |
 
 The OS-specific data acquisition sits behind a `Platform` trait, so the whole
-diagnostic stack is portable — only a thin macOS module touches `system_profiler`,
+diagnostic stack is portable — only a thin macOS module touches CoreWLAN,
 `route` and `scutil`.
 
 ## Platform support
 
-macOS-first (validated on macOS 26). Since macOS 14 the OS redacts the SSID and
-BSSID unless the calling app holds Location permission — so those show as
-*hidden* in an unsigned build, while RSSI, noise, channel and everything that
-actually matters for diagnosis remain available without sudo.
+macOS-first (validated on macOS 26). Link telemetry comes from **CoreWLAN**
+(`objc2-core-wlan`) — instant, no sudo — with `system_profiler` as a fallback.
+Since macOS 14 the OS redacts the SSID and BSSID unless the calling app holds
+Location permission, so those show as *hidden* in an unsigned build, while RSSI,
+noise, channel, PHY and everything that actually matters for diagnosis remain
+available.
 
 ## Roadmap
 
-- CoreWLAN via `objc2-core-wlan` for instant link telemetry and real SSID/BSSID
-  in a signed `.app` bundle.
+- Real SSID/BSSID via Location authorization in a signed `.app` bundle
+  (CoreWLAN telemetry already lands instantly today).
 - Linux platform module (`nl80211` / `netlink`).
 - Historical trends and export.
 

@@ -74,6 +74,11 @@ impl Platform for MacOs {
                 });
             }
         }
+        // Prefer CoreWLAN: instant, no multi-second system_profiler spawn.
+        if let Some(info) = super::corewlan::read_link(interface) {
+            return Ok(info);
+        }
+        // Fallback when CoreWLAN yields nothing (rare / unusual setups).
         let text = run("system_profiler", &["SPAirPortDataType"])?;
         let mut info = parse_airport(&text);
         info.interface = interface.to_string();

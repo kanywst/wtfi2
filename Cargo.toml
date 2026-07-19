@@ -36,6 +36,13 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# CoreWLAN for instant link telemetry (RSSI/noise/channel/PHY) without the
+# multi-second system_profiler spawn.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+objc2-core-wlan = { version = "0.3", default-features = false, features = ["std", "CWInterface", "CWWiFiClient", "CWChannel", "CoreWLANTypes"] }
+
 [dev-dependencies]
 
 [profile.release]
