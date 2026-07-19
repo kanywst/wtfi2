@@ -1,6 +1,6 @@
 //! L3 gateway probe: can we reach the default router?
 
-use super::net::{ping, Probe};
+use super::net::{Probe, ping};
 use crate::model::{Hop, HopId, Layer, Metric, Status};
 use crate::platform::RouteInfo;
 use std::time::Duration;
@@ -17,11 +17,11 @@ pub async fn probe(route: &RouteInfo) -> Hop {
             m
         });
     }
-    if route.tunnel_active {
-        if let Some(t) = &route.tunnel_iface {
-            hop.metrics
-                .push(Metric::new("Tunnel", t.clone()).with_status(Status::Warn));
-        }
+    if route.tunnel_active
+        && let Some(t) = &route.tunnel_iface
+    {
+        hop.metrics
+            .push(Metric::new("Tunnel", t.clone()).with_status(Status::Warn));
     }
 
     let Some(gw) = route.gateway else {

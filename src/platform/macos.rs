@@ -48,11 +48,11 @@ impl Platform for MacOs {
                 parse_route(&v6)?
             }
         };
-        if let Ok(tun) = run("scutil", &["--nwi"]) {
-            if let Some(iface) = detect_tunnel(&tun) {
-                info.tunnel_active = true;
-                info.tunnel_iface = Some(iface);
-            }
+        if let Ok(tun) = run("scutil", &["--nwi"])
+            && let Some(iface) = detect_tunnel(&tun)
+        {
+            info.tunnel_active = true;
+            info.tunnel_iface = Some(iface);
         }
         Ok(info)
     }
@@ -65,14 +65,14 @@ impl Platform for MacOs {
         let wifi_dev = run("networksetup", &["-listallhardwareports"])
             .ok()
             .and_then(|t| wifi_device(&t));
-        if let Some(dev) = &wifi_dev {
-            if dev != interface {
-                return Ok(LinkInfo {
-                    interface: interface.to_string(),
-                    is_wifi: false,
-                    ..Default::default()
-                });
-            }
+        if let Some(dev) = &wifi_dev
+            && dev != interface
+        {
+            return Ok(LinkInfo {
+                interface: interface.to_string(),
+                is_wifi: false,
+                ..Default::default()
+            });
         }
         // Prefer CoreWLAN: instant, no multi-second system_profiler spawn.
         if let Some(info) = super::corewlan::read_link(interface) {
@@ -140,10 +140,8 @@ fn wifi_device(text: &str) -> Option<String> {
         let t = line.trim();
         if let Some(port) = t.strip_prefix("Hardware Port:") {
             in_wifi = matches!(port.trim(), "Wi-Fi" | "AirPort");
-        } else if in_wifi {
-            if let Some(dev) = t.strip_prefix("Device:") {
-                return Some(dev.trim().to_string());
-            }
+        } else if in_wifi && let Some(dev) = t.strip_prefix("Device:") {
+            return Some(dev.trim().to_string());
         }
     }
     None
@@ -244,14 +242,12 @@ fn parse_resolvers(text: &str) -> ResolverInfo {
     let mut ns = Vec::new();
     for line in text.lines() {
         let t = line.trim();
-        if let Some(rest) = t.split_once(':') {
-            if rest.0.trim().starts_with("nameserver[") {
-                if let Ok(ip) = rest.1.trim().parse() {
-                    if !ns.contains(&ip) {
-                        ns.push(ip);
-                    }
-                }
-            }
+        if let Some(rest) = t.split_once(':')
+            && rest.0.trim().starts_with("nameserver[")
+            && let Ok(ip) = rest.1.trim().parse()
+            && !ns.contains(&ip)
+        {
+            ns.push(ip);
         }
     }
     ResolverInfo { nameservers: ns }

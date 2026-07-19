@@ -2,7 +2,7 @@
 
 use crate::diagnose::Verdict;
 use crate::model::{Path, Status};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn status_str(s: Status) -> &'static str {
     match s {

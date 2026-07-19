@@ -4,7 +4,7 @@
 //! exercises the actual forwarding path and needs no root, unlike raw ICMP.
 //! Runs IPv4 and IPv6 concurrently to expose asymmetric blackholing.
 
-use super::net::{tcp_connect, Probe};
+use super::net::{Probe, tcp_connect};
 use crate::model::{Hop, HopId, Layer, Metric, Status};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;

@@ -5,17 +5,17 @@
 //! probe results. The connectivity chain re-probes on a fixed cadence so the
 //! topology, verdict, and telemetry update in real time.
 
-use crate::diagnose::{diagnose, Verdict};
+use crate::diagnose::{Verdict, diagnose};
 use crate::engine;
 use crate::model::{Hop, HopId, Path, Status};
 use color_eyre::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use futures::StreamExt;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Gauge, Padding, Paragraph};
-use ratatui::Frame;
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -112,15 +112,14 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     loop {
         tokio::select! {
             maybe_ev = events.next() => {
-                if let Some(Ok(Event::Key(k))) = maybe_ev {
-                    if k.kind == KeyEventKind::Press {
+                if let Some(Ok(Event::Key(k))) = maybe_ev
+                    && k.kind == KeyEventKind::Press {
                         match k.code {
                             KeyCode::Char('q') | KeyCode::Esc => break,
                             KeyCode::Char('r') => rx = app.restart(),
                             _ => {}
                         }
                     }
-                }
             }
             _ = ticker.tick() => {
                 app.tick = app.tick.wrapping_add(1);

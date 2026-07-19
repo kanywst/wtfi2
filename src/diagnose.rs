@@ -152,7 +152,9 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
     let (headline, cause, fix) = match id {
         HopId::Link => (
             "Weak Wi-Fi signal",
-            format!("You're online, but the link is marginal — {summary}. Expect stalls and retransmits."),
+            format!(
+                "You're online, but the link is marginal — {summary}. Expect stalls and retransmits."
+            ),
             Some("Move closer to the AP or switch to 5 GHz.".to_string()),
         ),
         HopId::Wan => (
@@ -165,11 +167,7 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
             format!("Resolution works but is sluggish — {summary}."),
             Some("Try a faster resolver like 1.1.1.1.".to_string()),
         ),
-        _ => (
-            "Minor degradation",
-            summary,
-            None,
-        ),
+        _ => ("Minor degradation", summary, None),
     };
     Verdict {
         status: Status::Warn,
