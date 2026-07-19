@@ -1,8 +1,8 @@
 name: Claude Review
 
 # Automatic review on every PR, running on your Claude Pro/Max subscription
-# (no pay-per-token API key needed). Auth uses CLAUDE_CODE_OAUTH_TOKEN, a
-# *repository* secret you generate locally with `claude setup-token`.
+# (no pay-per-token API key needed). Auth uses CLAUDE_CODE_OAUTH_TOKEN, held in
+# the environment of the same name (generate it with `claude setup-token`).
 on:
   pull_request:
     types: [opened, synchronize]
@@ -14,6 +14,8 @@ permissions:
 jobs:
   review:
     runs-on: ubuntu-latest
+    # The OAuth token lives in this environment's secrets.
+    environment: CLAUDE_CODE_OAUTH_TOKEN
     # Only for same-repo PRs (fork PRs can't see the secret anyway).
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     env:
