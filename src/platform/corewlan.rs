@@ -12,6 +12,7 @@
 
 use super::LinkInfo;
 use objc2_core_wlan::{CWChannelBand, CWChannelWidth, CWPHYMode, CWSecurity, CWWiFiClient};
+use objc2_foundation::NSString;
 
 /// Read the current Wi-Fi link via CoreWLAN, or `None` if unavailable / not
 /// associated (the caller then falls back to `system_profiler`).
@@ -20,7 +21,10 @@ pub fn read_link(interface: &str) -> Option<LinkInfo> {
     // we treat as "unknown". No mutation, no main-thread requirement.
     unsafe {
         let client = CWWiFiClient::sharedWiFiClient();
-        let iface = client.interface()?;
+        // Query the specific interface backing the default route, not just the
+        // system default Wi-Fi interface (matters with more than one adapter).
+        let name = NSString::from_str(interface);
+        let iface = client.interfaceWithName(Some(&name))?;
 
         let rssi = iface.rssiValue();
         let ssid = iface.ssid();
@@ -29,11 +33,14 @@ pub fn read_link(interface: &str) -> Option<LinkInfo> {
             return None;
         }
 
+        // CoreWLAN returns 0 on transient read errors; valid dBm are negative,
+        // so only trust negative readings (a stray 0 would skew SNR / grading).
+        let noise = iface.noiseMeasurement();
         let mut info = LinkInfo {
             interface: interface.to_string(),
             is_wifi: true,
-            rssi_dbm: Some(rssi as i32),
-            noise_dbm: Some(iface.noiseMeasurement() as i32),
+            rssi_dbm: (rssi < 0).then_some(rssi as i32),
+            noise_dbm: (noise < 0).then_some(noise as i32),
             ssid: ssid.map(|s| s.to_string()),
             bssid: iface.bssid().map(|s| s.to_string()),
             phy_mode: phy_mode_str(iface.activePHYMode()),
