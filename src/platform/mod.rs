@@ -10,6 +10,9 @@ use std::net::IpAddr;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+#[cfg(target_os = "macos")]
+mod corewlan;
+
 /// Physical / link-layer (L2) facts about the active Wi-Fi interface.
 #[derive(Debug, Clone, Default)]
 pub struct LinkInfo {
