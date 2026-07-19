@@ -1,7 +1,7 @@
 [package]
 name = "wtfi2"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.88"
 description = "What The F*ck Internet — a live, visual network path diagnostic that pinpoints exactly where your connection dies."
 license = "MIT"

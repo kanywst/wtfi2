@@ -4,9 +4,9 @@
 //! "DNS is down" from "your ISP's resolver is slow" from "everything's fine".
 
 use crate::model::{Hop, HopId, Layer, Metric, Status};
-use hickory_resolver::config::{ResolverConfig, CLOUDFLARE, GOOGLE};
-use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
+use hickory_resolver::config::{CLOUDFLARE, GOOGLE, ResolverConfig};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use std::time::{Duration, Instant};
 
 const QUERY: &str = "cloudflare.com.";
@@ -59,11 +59,7 @@ pub async fn probe() -> Hop {
 }
 
 fn latency_status(ms: f64) -> Status {
-    if ms <= 80.0 {
-        Status::Ok
-    } else {
-        Status::Warn
-    }
+    if ms <= 80.0 { Status::Ok } else { Status::Warn }
 }
 
 fn failed(label: &'static str) -> Bench {
