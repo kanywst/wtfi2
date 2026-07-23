@@ -108,19 +108,34 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
             let _ = tx_dns.send(probe::dns::probe().await);
         });
 
-        // VPN / tunnel — conditional: only a hop when a tunnel actually owns a
-        // route. Runs blocking platform calls off-thread like the link probe.
+        // VPN / tunnel — conditional: only a hop when a tunnel is active. Seed a
+        // pending hop up front so a finished base chain can't run the diagnosis
+        // (and briefly mis-blame the ISP for a full-tunnel outage) before the
+        // VPN result lands. The blocking platform calls (scutil/ifconfig/ps) are
+        // bounded like the link probe so a hung tool can't hold the scan channel
+        // open forever — on timeout we still emit a terminal (warn) hop.
         if route.tunnel_active {
+            let mut pending = Hop::new(HopId::Vpn, Layer::Network, "VPN");
+            pending.subtitle = route.tunnel_iface.clone();
+            let _ = tx.send(pending);
+
             let tx_vpn = tx.clone();
             let route_vpn = route.clone();
             tokio::spawn(async move {
-                if let Ok(hop) = tokio::task::spawn_blocking(move || {
+                let handle = tokio::task::spawn_blocking(move || {
                     probe::vpn::probe(&platform::current(), &route_vpn)
-                })
-                .await
-                {
-                    let _ = tx_vpn.send(hop);
-                }
+                });
+                let hop = match tokio::time::timeout(Duration::from_secs(8), handle).await {
+                    Ok(Ok(hop)) => hop,
+                    _ => {
+                        let mut hop = Hop::new(HopId::Vpn, Layer::Network, "VPN");
+                        hop.status = Status::Warn;
+                        hop.summary =
+                            Some("VPN telemetry timed out (scutil/ifconfig/ps slow)".into());
+                        hop
+                    }
+                };
+                let _ = tx_vpn.send(hop);
             });
         }
 
