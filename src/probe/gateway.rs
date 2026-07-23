@@ -17,13 +17,6 @@ pub async fn probe(route: &RouteInfo) -> Hop {
             m
         });
     }
-    if route.tunnel_active
-        && let Some(t) = &route.tunnel_iface
-    {
-        hop.metrics
-            .push(Metric::new("Tunnel", t.clone()).with_status(Status::Warn));
-    }
-
     let Some(gw) = route.gateway else {
         hop.status = Status::Fail;
         hop.summary = Some("No default gateway — you have no route off this machine".into());

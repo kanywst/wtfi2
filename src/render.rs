@@ -108,9 +108,10 @@ fn verdict_block(v: &Verdict, p: &Palette) -> String {
 }
 
 fn detail(path: &Path, p: &Palette, verbose: bool) -> String {
+    use crate::model::HopId;
     let mut s = String::new();
     for hop in &path.hops {
-        if hop.id == crate::model::HopId::Host {
+        if hop.id == HopId::Host {
             continue;
         }
         let head = format!(
@@ -139,4 +140,47 @@ fn detail(path: &Path, p: &Palette, verbose: bool) -> String {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diagnose::diagnose;
+    use crate::model::{Hop, HopId, Layer, Metric, Path};
+
+    fn ok(id: HopId, layer: Layer, title: &str) -> Hop {
+        let mut h = Hop::new(id, layer, title);
+        h.status = Status::Ok;
+        h
+    }
+
+    #[test]
+    fn vpn_hop_renders_in_topology_and_detail() {
+        // A conditional VPN hop sits between Gateway and Internet and must show
+        // up in both the topology chain and the per-hop detail block.
+        let mut vpn = ok(HopId::Vpn, Layer::Network, "VPN");
+        vpn.subtitle = Some("Tailscale".into());
+        vpn.summary = Some("Tailscale full-tunnel VPN on utun4".into());
+        vpn.metrics.push(Metric::new("Mode", "full-tunnel"));
+        let path = Path {
+            hops: vec![
+                ok(HopId::Link, Layer::Link, "Wi-Fi"),
+                ok(HopId::Gateway, Layer::Network, "Gateway"),
+                vpn,
+                ok(HopId::Wan, Layer::Internet, "Internet"),
+                ok(HopId::Dns, Layer::Application, "DNS"),
+            ],
+        };
+        let out = report(&path, &diagnose(&path), true, false);
+        assert!(out.contains("VPN"), "topology/detail must name the VPN hop");
+        assert!(out.contains("Tailscale full-tunnel VPN on utun4"));
+        // Chain order: VPN between Gateway and Internet.
+        let g = out.find("Gateway").unwrap();
+        let v = out.find("VPN").unwrap();
+        let i = out.find("Internet").unwrap();
+        assert!(
+            g < v && v < i,
+            "VPN must render between Gateway and Internet"
+        );
+    }
 }

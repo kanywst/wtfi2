@@ -71,6 +71,21 @@ pub struct ResolverInfo {
     pub nameservers: Vec<IpAddr>,
 }
 
+/// VPN / overlay-tunnel facts. Distinct from [`RouteInfo::tunnel_active`],
+/// which only says *whether* a tunnel exists; this describes it.
+#[derive(Debug, Clone, Default)]
+pub struct VpnInfo {
+    /// True when a tunnel interface is part of the active network state.
+    pub active: bool,
+    /// Tunnel interface backing it, e.g. `utun4`.
+    pub interface: Option<String>,
+    /// The tunnel-assigned local address, when configured.
+    pub local_ip: Option<IpAddr>,
+    /// Best-effort vendor label inferred from the tunnel address, e.g.
+    /// `Tailscale` for the 100.64.0.0/10 CGNAT range. `None` when unknown.
+    pub vendor: Option<String>,
+}
+
 /// Errors from platform data acquisition.
 #[derive(Debug)]
 pub enum PlatformError {
@@ -102,6 +117,9 @@ pub trait Platform: Send + Sync {
     fn link(&self, interface: &str) -> Result<LinkInfo, PlatformError>;
     /// Read the configured DNS resolvers.
     fn resolvers(&self) -> Result<ResolverInfo, PlatformError>;
+    /// Describe the active VPN/overlay tunnel, if any. An inactive result
+    /// (`VpnInfo::active == false`) is normal, not an error.
+    fn vpn(&self) -> Result<VpnInfo, PlatformError>;
 }
 
 /// Return the platform implementation for the current OS.
