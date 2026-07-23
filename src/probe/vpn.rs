@@ -46,7 +46,7 @@ pub fn probe(platform: &impl Platform, route: &RouteInfo) -> Hop {
 
     // Tunnel present and addressed → healthy. Present but unaddressed → warn:
     // the interface is up but not actually carrying traffic yet.
-    if info.local_ip.is_some() || info.active {
+    if info.active && info.local_ip.is_some() {
         hop.status = Status::Ok;
         let where_ = iface.as_deref().unwrap_or("the tunnel");
         let vendor = info
@@ -65,4 +65,84 @@ pub fn probe(platform: &impl Platform, route: &RouteInfo) -> Hop {
             Some("Tunnel interface is up but has no address — not carrying traffic".into());
     }
     hop
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::{LinkInfo, PlatformError, ResolverInfo, VpnInfo};
+
+    struct MockPlatform(VpnInfo);
+    impl Platform for MockPlatform {
+        fn route(&self) -> Result<RouteInfo, PlatformError> {
+            Ok(RouteInfo::default())
+        }
+        fn link(&self, _: &str) -> Result<LinkInfo, PlatformError> {
+            Ok(LinkInfo::default())
+        }
+        fn resolvers(&self) -> Result<ResolverInfo, PlatformError> {
+            Ok(ResolverInfo::default())
+        }
+        fn vpn(&self) -> Result<VpnInfo, PlatformError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn route_on(iface: &str) -> RouteInfo {
+        RouteInfo {
+            interface: iface.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn mode(hop: &Hop) -> &str {
+        hop.metrics
+            .iter()
+            .find(|m| m.label == "Mode")
+            .map(|m| m.value.as_str())
+            .unwrap_or("")
+    }
+
+    #[test]
+    fn full_tunnel_when_vpn_owns_default_route() {
+        let vpn = VpnInfo {
+            active: true,
+            interface: Some("utun4".into()),
+            local_ip: Some("100.86.1.2".parse().unwrap()),
+            vendor: Some("Tailscale".into()),
+        };
+        // The default route is on the tunnel → full-tunnel.
+        let hop = probe(&MockPlatform(vpn), &route_on("utun4"));
+        assert_eq!(hop.status, Status::Ok);
+        assert_eq!(mode(&hop), "full-tunnel");
+        assert!(hop.summary.unwrap().contains("full-tunnel"));
+    }
+
+    #[test]
+    fn split_tunnel_when_default_route_stays_off_the_tunnel() {
+        let vpn = VpnInfo {
+            active: true,
+            interface: Some("utun4".into()),
+            local_ip: Some("10.8.0.2".parse().unwrap()),
+            vendor: None,
+        };
+        let hop = probe(&MockPlatform(vpn), &route_on("en0"));
+        assert_eq!(hop.status, Status::Ok);
+        assert_eq!(mode(&hop), "split-tunnel");
+    }
+
+    #[test]
+    fn active_but_unaddressed_tunnel_warns() {
+        // Interface is up in the network state but hasn't been assigned an
+        // address — it isn't actually carrying traffic, so don't claim Ok.
+        let vpn = VpnInfo {
+            active: true,
+            interface: Some("utun4".into()),
+            local_ip: None,
+            vendor: None,
+        };
+        let hop = probe(&MockPlatform(vpn), &route_on("en0"));
+        assert_eq!(hop.status, Status::Warn);
+        assert!(hop.summary.unwrap().contains("no address"));
+    }
 }

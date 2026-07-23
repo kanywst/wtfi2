@@ -268,23 +268,46 @@ fn parse_signal_noise(v: &str) -> (Option<i32>, Option<i32>) {
     (sig, noise)
 }
 
-/// Pull the IPv4 `inet` address out of `ifconfig <iface>` output.
+/// Pull the tunnel's local address out of `ifconfig <iface>`, preferring IPv4.
+///
+/// Falls back to a global IPv6 address for IPv6-only tunnels, skipping the
+/// `fe80::` link-local that every interface carries (which says nothing about
+/// the tunnel). Any `%zone` scope suffix is stripped before parsing.
 ///
 /// ```text
 /// utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1400
 ///     inet 100.86.1.2 --> 100.86.1.2 netmask 0xffffffff
 /// ```
 fn parse_ifconfig_inet(text: &str) -> Option<IpAddr> {
+    let mut v6_fallback = None;
     for line in text.lines() {
         let t = line.trim();
-        if let Some(rest) = t.strip_prefix("inet ")
-            && let Some(addr) = rest.split_whitespace().next()
-            && let Ok(ip) = addr.parse()
+        if let Some(rest) = t.strip_prefix("inet ") {
+            if let Some(ip) = rest.split_whitespace().next().and_then(parse_addr) {
+                return Some(ip); // IPv4 wins outright.
+            }
+        } else if let Some(rest) = t.strip_prefix("inet6 ")
+            && v6_fallback.is_none()
+            && let Some(ip) = rest.split_whitespace().next().and_then(parse_addr)
+            && !is_link_local(ip)
         {
-            return Some(ip);
+            v6_fallback = Some(ip);
         }
     }
-    None
+    v6_fallback
+}
+
+/// Parse an address token, dropping any `%zone` scope suffix (`fe80::1%utun4`).
+fn parse_addr(tok: &str) -> Option<IpAddr> {
+    tok.split('%').next()?.parse().ok()
+}
+
+fn is_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        // fe80::/10 — the top 10 bits are 1111111010.
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
 }
 
 /// Best-effort vendor guess from a tunnel's local address. Tailscale hands out
@@ -415,6 +438,34 @@ mod tests {
                     \tinet 100.86.1.2 --> 100.86.1.2 netmask 0xffffffff\n\
                     \tinet6 fe80::1%utun4 prefixlen 64";
         assert_eq!(parse_ifconfig_inet(text).unwrap().to_string(), "100.86.1.2");
+    }
+
+    #[test]
+    fn ifconfig_prefers_ipv4_over_ipv6() {
+        // Link-local v6 comes first in the output, but IPv4 must still win.
+        let text = "utun4: flags=8051 mtu 1400\n\
+                    \tinet6 fe80::1%utun4 prefixlen 64\n\
+                    \tinet 100.86.1.2 --> 100.86.1.2 netmask 0xffffffff\n\
+                    \tinet6 fd7a:115c:a1e0::1 prefixlen 48";
+        assert_eq!(parse_ifconfig_inet(text).unwrap().to_string(), "100.86.1.2");
+    }
+
+    #[test]
+    fn ifconfig_falls_back_to_global_ipv6() {
+        // IPv6-only tunnel: skip the link-local, keep the global address.
+        let text = "utun6: flags=8051 mtu 1400\n\
+                    \tinet6 fe80::abcd%utun6 prefixlen 64 scopeid 0x1d\n\
+                    \tinet6 fd7a:115c:a1e0::53 prefixlen 48";
+        assert_eq!(
+            parse_ifconfig_inet(text).unwrap().to_string(),
+            "fd7a:115c:a1e0::53"
+        );
+    }
+
+    #[test]
+    fn ifconfig_link_local_only_is_none() {
+        let text = "utun7: flags=8051 mtu 1400\n\tinet6 fe80::1%utun7 prefixlen 64";
+        assert_eq!(parse_ifconfig_inet(text), None);
     }
 
     #[test]
