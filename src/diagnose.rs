@@ -80,6 +80,17 @@ fn hop_status(path: &Path, id: HopId) -> Status {
     path.get(id).map(|h| h.status).unwrap_or(Status::Skipped)
 }
 
+/// Whether an active full-tunnel VPN is present — the tunnel that would make a
+/// WAN failure the VPN's fault rather than the ISP's. Keyed off the `Mode`
+/// metric the VPN probe records.
+fn vpn_is_full_tunnel(path: &Path) -> bool {
+    path.get(HopId::Vpn).is_some_and(|h| {
+        h.metrics
+            .iter()
+            .any(|m| m.label == "Mode" && m.value == "full-tunnel")
+    })
+}
+
 fn explain_break(path: &Path, id: HopId) -> Verdict {
     let (headline, cause, fix, confidence) = match id {
         HopId::Link => (
@@ -101,12 +112,26 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
                 Confidence::Likely,
             )
         }
-        HopId::Wan => (
-            "Your ISP / uplink is down",
-            "The router answers locally, but nothing beyond it is reachable — the break is between your router and the internet.".to_string(),
-            Some("Check the modem/ONU lights; this is usually an ISP or WAN-cable outage, not your Mac.".to_string()),
-            Confidence::Likely,
-        ),
+        HopId::Wan => {
+            // A full-tunnel VPN carries *all* egress, so a dead tunnel looks
+            // exactly like an ISP outage from the WAN probe's point of view.
+            // Reframe the verdict instead of blaming the ISP outright.
+            if vpn_is_full_tunnel(path) {
+                (
+                    "Internet is down — through your VPN",
+                    "The router answers locally, but nothing beyond it is reachable. A full-tunnel VPN is active, so this is most likely the tunnel, not your ISP.".to_string(),
+                    Some("Disconnect the VPN and re-test — if it comes back, the tunnel was the problem.".to_string()),
+                    Confidence::Likely,
+                )
+            } else {
+                (
+                    "Your ISP / uplink is down",
+                    "The router answers locally, but nothing beyond it is reachable — the break is between your router and the internet.".to_string(),
+                    Some("Check the modem/ONU lights; this is usually an ISP or WAN-cable outage, not your Mac.".to_string()),
+                    Confidence::Likely,
+                )
+            }
+        }
         HopId::Dns => {
             let wan_ok = hop_status(path, HopId::Wan) == Status::Ok;
             let cause = if wan_ok {
@@ -126,6 +151,16 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
             "DNS and routing work, but a hotspot login page is intercepting your traffic — you're not really online yet.".to_string(),
             Some("Open http://captive.apple.com in a browser and sign in.".to_string()),
             Confidence::Certain,
+        ),
+        // Defensive: the VPN probe currently grades only Ok/Warn, so a VPN hop
+        // is never itself the `first_break`. A full-tunnel VPN outage instead
+        // surfaces through the `HopId::Wan` reframe above. Kept for exhaustive-
+        // ness and in case the probe gains a hard-fail signal later.
+        HopId::Vpn => (
+            "Your VPN tunnel is down",
+            "A VPN tunnel is present but isn't carrying traffic, so anything routed through it is cut off.".to_string(),
+            Some("Reconnect or quit the VPN client, then re-test.".to_string()),
+            Confidence::Likely,
         ),
         HopId::Internet | HopId::Host => (
             "You're offline",
@@ -238,6 +273,45 @@ mod tests {
             "expected portal verdict, got: {}",
             v.headline
         );
+    }
+
+    #[test]
+    fn full_tunnel_vpn_reframes_wan_outage() {
+        use crate::model::Metric;
+        let mut vpn = hop(HopId::Vpn, Layer::Network, Status::Ok);
+        vpn.metrics.push(Metric::new("Mode", "full-tunnel"));
+        let p = Path {
+            hops: vec![
+                hop(HopId::Link, Layer::Link, Status::Ok),
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                vpn,
+                hop(HopId::Wan, Layer::Internet, Status::Fail),
+            ],
+        };
+        let v = diagnose(&p);
+        assert!(
+            v.headline.contains("VPN"),
+            "full-tunnel VPN should own a WAN outage, got: {}",
+            v.headline
+        );
+        assert!(v.fix.as_deref().unwrap().contains("Disconnect the VPN"));
+    }
+
+    #[test]
+    fn split_tunnel_vpn_leaves_wan_outage_as_isp() {
+        use crate::model::Metric;
+        let mut vpn = hop(HopId::Vpn, Layer::Network, Status::Ok);
+        vpn.metrics.push(Metric::new("Mode", "split-tunnel"));
+        let p = Path {
+            hops: vec![
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                vpn,
+                hop(HopId::Wan, Layer::Internet, Status::Fail),
+            ],
+        };
+        // Split-tunnel doesn't carry the default route, so a WAN outage is
+        // still the ISP's, not the tunnel's.
+        assert!(diagnose(&p).headline.contains("ISP"));
     }
 
     #[test]

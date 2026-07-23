@@ -10,4 +10,5 @@ pub mod dns;
 pub mod gateway;
 pub mod link;
 pub mod net;
+pub mod vpn;
 pub mod wan;

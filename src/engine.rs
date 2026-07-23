@@ -108,6 +108,22 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
             let _ = tx_dns.send(probe::dns::probe().await);
         });
 
+        // VPN / tunnel — conditional: only a hop when a tunnel actually owns a
+        // route. Runs blocking platform calls off-thread like the link probe.
+        if route.tunnel_active {
+            let tx_vpn = tx.clone();
+            let route_vpn = route.clone();
+            tokio::spawn(async move {
+                if let Ok(hop) = tokio::task::spawn_blocking(move || {
+                    probe::vpn::probe(&platform::current(), &route_vpn)
+                })
+                .await
+                {
+                    let _ = tx_vpn.send(hop);
+                }
+            });
+        }
+
         // Captive portal.
         let tx_cap = tx;
         tokio::spawn(async move {
@@ -122,9 +138,7 @@ pub async fn run_once() -> Path {
     let mut path = skeleton();
     let mut rx = spawn();
     while let Some(hop) = rx.recv().await {
-        if let Some(slot) = path.get_mut(hop.id) {
-            *slot = hop;
-        }
+        path.upsert(hop);
     }
     path
 }

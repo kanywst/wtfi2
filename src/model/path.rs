@@ -33,6 +33,10 @@ pub enum HopId {
     Host,
     Link,
     Gateway,
+    /// Overlay VPN / tunnel hop — only present when a tunnel is active. Sits
+    /// between the local gateway and the WAN because traffic is encapsulated
+    /// here before it egresses to the internet.
+    Vpn,
     Wan,
     Dns,
     Captive,
@@ -110,6 +114,24 @@ impl Path {
         self.hops.iter_mut().find(|h| h.id == id)
     }
 
+    /// Replace the hop with the same id, or insert it in chain order.
+    ///
+    /// Conditional hops (e.g. the VPN tunnel) aren't in the seed skeleton, so
+    /// they land here for the first time and must slot into the right place —
+    /// ordered by [`HopId`] position — rather than being dropped or appended.
+    pub fn upsert(&mut self, hop: Hop) {
+        if let Some(slot) = self.get_mut(hop.id) {
+            *slot = hop;
+            return;
+        }
+        let pos = self
+            .hops
+            .iter()
+            .position(|h| (h.id as usize) > (hop.id as usize))
+            .unwrap_or(self.hops.len());
+        self.hops.insert(pos, hop);
+    }
+
     /// The first hop (closest to the host) that is broken, if any.
     /// This is "where the connection died".
     ///
@@ -157,6 +179,32 @@ mod tests {
         let p = Path { hops: vec![d, g] };
         // Gateway is earlier in the chain, so it wins regardless of vec order.
         assert_eq!(p.first_break().unwrap().id, HopId::Gateway);
+    }
+
+    #[test]
+    fn upsert_inserts_conditional_hop_in_chain_order() {
+        let mut p = Path {
+            hops: vec![
+                Hop::new(HopId::Gateway, Layer::Network, "Gateway"),
+                Hop::new(HopId::Wan, Layer::Internet, "Internet"),
+            ],
+        };
+        // A VPN hop isn't in the seed; it must land between Gateway and Wan.
+        p.upsert(Hop::new(HopId::Vpn, Layer::Network, "VPN"));
+        let ids: Vec<_> = p.hops.iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec![HopId::Gateway, HopId::Vpn, HopId::Wan]);
+    }
+
+    #[test]
+    fn upsert_replaces_existing_hop_in_place() {
+        let mut p = Path {
+            hops: vec![Hop::new(HopId::Vpn, Layer::Network, "VPN")],
+        };
+        let mut updated = Hop::new(HopId::Vpn, Layer::Network, "VPN");
+        updated.status = Status::Ok;
+        p.upsert(updated);
+        assert_eq!(p.hops.len(), 1);
+        assert_eq!(p.hops[0].status, Status::Ok);
     }
 
     #[test]

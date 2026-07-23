@@ -11,7 +11,8 @@
 //! Location permission, so those fields are best-effort. RSSI/noise are not
 //! redacted, which is what actually matters for signal diagnosis.
 
-use super::{LinkInfo, Platform, PlatformError, ResolverInfo, RouteInfo};
+use super::{LinkInfo, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo};
+use std::net::IpAddr;
 use std::process::Command;
 
 pub struct MacOs;
@@ -89,6 +90,33 @@ impl Platform for MacOs {
         let text = run("scutil", &["--dns"])?;
         Ok(parse_resolvers(&text))
     }
+
+    fn vpn(&self) -> Result<VpnInfo, PlatformError> {
+        // `scutil --nwi` lists interfaces that are part of the *active* network
+        // state, so a utun here is a real tunnel, not one of the idle utun0-3
+        // devices macOS always keeps around.
+        let nwi = run("scutil", &["--nwi"])?;
+        let Some(iface) = detect_tunnel(&nwi) else {
+            return Ok(VpnInfo::default());
+        };
+        let local_ip = run("ifconfig", &[&iface])
+            .ok()
+            .and_then(|t| parse_ifconfig_inet(&t));
+        // Vendor: a running VPN client's daemon name is the most reliable
+        // sudo-free signal — the tunnel interface is an opaque `utunN` for
+        // nearly every vendor. Fall back to the tunnel address range.
+        let vendor = run("ps", &["-axo", "comm="])
+            .ok()
+            .and_then(|ps| vendor_from_processes(&ps))
+            .or_else(|| local_ip.and_then(vendor_from_ip))
+            .map(str::to_string);
+        Ok(VpnInfo {
+            active: true,
+            interface: Some(iface),
+            vendor,
+            local_ip,
+        })
+    }
 }
 
 // ---- pure parsers (unit-tested against real macOS 26 output) ----
@@ -147,6 +175,8 @@ fn wifi_device(text: &str) -> Option<String> {
     None
 }
 
+/// The first active tunnel interface in `scutil --nwi`. With multiple
+/// concurrent tunnels this reports only one; the common case is a single VPN.
 fn detect_tunnel(nwi: &str) -> Option<String> {
     nwi.lines()
         .filter_map(|l| l.trim().split(':').next().map(str::trim))
@@ -238,6 +268,66 @@ fn parse_signal_noise(v: &str) -> (Option<i32>, Option<i32>) {
     (sig, noise)
 }
 
+/// Pull the IPv4 `inet` address out of `ifconfig <iface>` output.
+///
+/// ```text
+/// utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1400
+///     inet 100.86.1.2 --> 100.86.1.2 netmask 0xffffffff
+/// ```
+fn parse_ifconfig_inet(text: &str) -> Option<IpAddr> {
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("inet ")
+            && let Some(addr) = rest.split_whitespace().next()
+            && let Ok(ip) = addr.parse()
+        {
+            return Some(ip);
+        }
+    }
+    None
+}
+
+/// Best-effort vendor guess from a tunnel's local address. Tailscale hands out
+/// addresses from the 100.64.0.0/10 CGNAT block, which is a strong signal on a
+/// tunnel interface. Anything else stays unlabelled rather than guessing wrong.
+fn vendor_from_ip(ip: IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            (a == 100 && (64..=127).contains(&b)).then_some("Tailscale")
+        }
+        IpAddr::V6(_) => None,
+    }
+}
+
+/// Map a running-process list (`ps -axo comm=`) to a known VPN vendor by its
+/// background daemon. More specific vendors are listed before the generic
+/// `wireguard`/`openvpn` engines they may be built on, so the first match wins
+/// the right label (e.g. Mullvad-over-WireGuard reports as `Mullvad`).
+fn vendor_from_processes(ps: &str) -> Option<&'static str> {
+    // (lowercase substring to find in a process path, vendor label).
+    const CLIENTS: &[(&str, &str)] = &[
+        ("tailscaled", "Tailscale"),
+        ("warp-svc", "Cloudflare WARP"),
+        ("cloudflarewarp", "Cloudflare WARP"),
+        ("nordvpn", "NordVPN"),
+        ("mullvad", "Mullvad"),
+        ("protonvpn", "Proton VPN"),
+        ("expressvpn", "ExpressVPN"),
+        ("vpnagentd", "Cisco AnyConnect"),
+        ("acwebsecagent", "Cisco AnyConnect"),
+        ("pangps", "GlobalProtect"),
+        ("openconnect", "OpenConnect"),
+        ("wireguard", "WireGuard"),
+        ("openvpn", "OpenVPN"),
+    ];
+    let low = ps.to_lowercase();
+    CLIENTS
+        .iter()
+        .find(|(needle, _)| low.contains(needle))
+        .map(|&(_, vendor)| vendor)
+}
+
 fn parse_resolvers(text: &str) -> ResolverInfo {
     let mut ns = Vec::new();
     for line in text.lines() {
@@ -317,6 +407,56 @@ mod tests {
         let r = parse_route(text).unwrap();
         assert_eq!(r.gateway.unwrap().to_string(), "fe80::1");
         assert_eq!(r.gateway_zone.as_deref(), Some("en0"));
+    }
+
+    #[test]
+    fn ifconfig_inet_parsed() {
+        let text = "utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1400\n\
+                    \tinet 100.86.1.2 --> 100.86.1.2 netmask 0xffffffff\n\
+                    \tinet6 fe80::1%utun4 prefixlen 64";
+        assert_eq!(parse_ifconfig_inet(text).unwrap().to_string(), "100.86.1.2");
+    }
+
+    #[test]
+    fn vendor_detects_tailscale_cgnat() {
+        assert_eq!(
+            vendor_from_ip("100.86.1.2".parse().unwrap()),
+            Some("Tailscale")
+        );
+        // A plain private-range tunnel address stays unlabelled.
+        assert_eq!(vendor_from_ip("10.8.0.2".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn vendor_detects_client_processes() {
+        let ps = "/usr/sbin/cfprefsd\n\
+                  /Applications/Mullvad VPN.app/Contents/Resources/mullvad-daemon\n\
+                  /usr/libexec/wifid";
+        assert_eq!(vendor_from_processes(ps), Some("Mullvad"));
+        // A vendor with its own daemon wins over the generic engine it's built on.
+        assert_eq!(
+            vendor_from_processes("/usr/local/bin/tailscaled --state=/x"),
+            Some("Tailscale")
+        );
+        assert_eq!(
+            vendor_from_processes("/usr/sbin/openvpn --config x.ovpn"),
+            Some("OpenVPN")
+        );
+        // No VPN client running → no label.
+        assert_eq!(
+            vendor_from_processes("/usr/sbin/bluetoothd\n/usr/libexec/nsurlsessiond"),
+            None
+        );
+    }
+
+    #[test]
+    fn detect_tunnel_finds_utun() {
+        let nwi = "Network information\n\n\
+                   IPv4 network interface information\n\
+                   \t  en0 : flags : 0x5 (IPv4,DNS)\n\
+                   \tutun4 : flags : 0x5 (IPv4,DNS)\n\n\
+                   \tNetwork interfaces: en0 utun4";
+        assert_eq!(detect_tunnel(nwi).as_deref(), Some("utun4"));
     }
 
     #[test]

@@ -54,9 +54,7 @@ impl App {
             HopId::Wan => push(&mut self.wan_hist, hop.latency_ms),
             _ => {}
         }
-        if let Some(slot) = self.path.get_mut(hop.id) {
-            *slot = hop;
-        }
+        self.path.upsert(hop);
         if self.path.is_complete() {
             self.verdict = diagnose(&self.path);
             self.scanning = false;
@@ -64,6 +62,11 @@ impl App {
     }
 
     fn restart(&mut self) -> mpsc::UnboundedReceiver<Hop> {
+        // Drop conditional hops (e.g. VPN) so a tunnel that disconnected between
+        // sweeps doesn't linger as a Pending hop that never resolves — which
+        // would leave `is_complete()` false forever and wedge the dashboard.
+        // The next sweep re-adds it via `upsert` only if the tunnel is still up.
+        self.path.hops.retain(|h| engine::CHAIN.contains(&h.id));
         // Keep telemetry history; reset statuses to pending for the new sweep.
         for hop in &mut self.path.hops {
             if hop.id != HopId::Host {
