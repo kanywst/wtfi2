@@ -27,7 +27,7 @@ jobs:
         if: env.HAS_TOKEN != 'true'
         run: echo "::notice::CLAUDE_CODE_OAUTH_TOKEN not set — skipping Claude review."
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         if: env.HAS_TOKEN == 'true'
         with:
           fetch-depth: 1
