@@ -240,8 +240,10 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
         },
         HopId::Wan => match loss_at(path, HopId::Wan) {
             Some(l) => {
-                // Chain order means the gateway wasn't the earlier warning, so
-                // the loss starts past your own kit — worth saying out loud.
+                // Chain order means the gateway wasn't an earlier warning, so
+                // in practice the LAN is always clean here and the loss starts
+                // past your own kit — worth saying out loud. Guarded anyway so
+                // a future gateway grade can't make the claim retroactively.
                 let lan = if hop_status(path, HopId::Gateway) == Status::Ok {
                     " Your LAN is clean — the router answers every probe — so this starts past your own equipment."
                 } else {

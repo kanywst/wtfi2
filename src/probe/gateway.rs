@@ -8,13 +8,16 @@ use std::time::Duration;
 /// Echoes per sweep. Enough that two drops (the degradation threshold) means
 /// something, few enough to finish well inside the dashboard's re-probe tick.
 const SAMPLES: u32 = 5;
-/// Spacing between echoes. macOS only lets root go below 100 ms.
+/// Spacing between echoes: wide enough that the burst samples a slice of time
+/// rather than one instant, short enough to finish in under a second.
 const INTERVAL: Duration = Duration::from_millis(200);
 /// Hard ceiling on the whole burst, so a silent router costs a bounded wait.
 const BUDGET: Duration = Duration::from_secs(3);
-/// A round trip inside your own house should be steady; this much wobble means
-/// the link is contended or retransmitting.
-const JITTER_WARN_MS: f64 = 30.0;
+/// A round trip inside your own house should be steady, but Wi-Fi power save
+/// routinely parks one packet. Mean IPDV over `n` samples turns a single spike
+/// of `S` into roughly `2S/(n-1)` — `S/2` at five samples — so this sits above
+/// what one 100 ms stall can produce and only trips on sustained wobble.
+const JITTER_WARN_MS: f64 = 60.0;
 /// Above this the router itself is the bottleneck, loss or no loss.
 const SLOW_MS: f64 = 50.0;
 
