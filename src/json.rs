@@ -27,6 +27,8 @@ pub fn to_value(path: &Path, verdict: &Verdict) -> Value {
                 "status": status_str(h.status),
                 "summary": h.summary,
                 "latency_ms": h.latency_ms,
+                "loss_pct": h.loss_pct,
+                "jitter_ms": h.jitter_ms,
                 "metrics": h.metrics.iter().map(|m| json!({
                     "label": m.label,
                     "value": m.value,

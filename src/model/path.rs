@@ -81,6 +81,12 @@ pub struct Hop {
     pub summary: Option<String>,
     /// Round-trip latency in milliseconds, when meaningful.
     pub latency_ms: Option<f64>,
+    /// Share of probe samples that never came back, when the hop was measured
+    /// with a burst. A reachable hop can still be losing a quarter of its
+    /// packets, which is what "everything is green but nothing loads" means.
+    pub loss_pct: Option<f64>,
+    /// Variation between successive round trips, in milliseconds.
+    pub jitter_ms: Option<f64>,
     pub metrics: Vec<Metric>,
 }
 
@@ -94,6 +100,8 @@ impl Hop {
             status: Status::Pending,
             summary: None,
             latency_ms: None,
+            loss_pct: None,
+            jitter_ms: None,
             metrics: Vec::new(),
         }
     }

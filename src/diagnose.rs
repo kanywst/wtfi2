@@ -6,6 +6,7 @@
 //! concrete fix — the thing you actually wanted to know.
 
 use crate::model::{HopId, Path, Status};
+use crate::probe::net::LOSS_WARN_PCT;
 
 /// Confidence in a verdict, surfaced so the UI can hedge honestly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,24 +180,89 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
     }
 }
 
+/// Packet loss measured at a hop, when it's high enough to be the story rather
+/// than background noise. Reads the structured field the probes record, so the
+/// verdict never has to re-parse its own prose.
+fn loss_at(path: &Path, id: HopId) -> Option<f64> {
+    path.get(id)
+        .and_then(|h| h.loss_pct)
+        .filter(|l| *l >= LOSS_WARN_PCT)
+}
+
 fn explain_warn(path: &Path, id: HopId) -> Verdict {
     let summary = path
         .get(id)
         .and_then(|h| h.summary.clone())
         .unwrap_or_default();
     let (headline, cause, fix) = match id {
-        HopId::Link => (
-            "Weak Wi-Fi signal",
-            format!(
-                "You're online, but the link is marginal — {summary}. Expect stalls and retransmits."
+        HopId::Link => {
+            // A marginal signal is only half the story; say what it's already
+            // costing when the gateway burst shows the damage.
+            let cost = loss_at(path, HopId::Gateway)
+                .map(|l| format!(" It's already costing you {l:.0}% packet loss to the router."))
+                .unwrap_or_default();
+            (
+                "Weak Wi-Fi signal",
+                format!(
+                    "You're online, but the link is marginal — {summary}.{cost} Expect stalls and retransmits."
+                ),
+                Some("Move closer to the AP or switch to 5 GHz.".to_string()),
+            )
+        }
+        HopId::Gateway => match loss_at(path, HopId::Gateway) {
+            Some(l) => {
+                // Every hop is "up", so a checklist would call this healthy.
+                // Strong signal plus lossy LAN rules distance out and points at
+                // interference, congestion or the router itself.
+                let signal = path
+                    .get(HopId::Link)
+                    .filter(|h| h.status == Status::Ok)
+                    .and_then(|h| h.summary.clone())
+                    .map(|s| format!(" The signal itself is fine ({s}), so this isn't distance."))
+                    .unwrap_or_default();
+                (
+                    "Your local network is dropping packets",
+                    format!(
+                        "Every hop is technically up, but {l:.0}% of probes to your own router never came back.{signal} That alone stalls pages, calls and streams while everything still looks online."
+                    ),
+                    Some(
+                        "Switch to 5 GHz or a quieter channel, move off a crowded band, and power-cycle the router if it persists.".to_string(),
+                    ),
+                )
+            }
+            // Degraded without qualifying loss means slow or jittery; the
+            // hop's own summary already says which, so don't guess here.
+            None => (
+                "Your router is answering poorly",
+                format!("The LAN works, but the hop to your own router is degraded — {summary}."),
+                Some("Check for a saturated LAN or a router that needs a restart.".to_string()),
             ),
-            Some("Move closer to the AP or switch to 5 GHz.".to_string()),
-        ),
-        HopId::Wan => (
-            "Internet is up but degraded",
-            format!("Reachable, but quality is poor — {summary}."),
-            Some("Check for background traffic or a congested uplink.".to_string()),
-        ),
+        },
+        HopId::Wan => match loss_at(path, HopId::Wan) {
+            Some(l) => {
+                // Chain order means the gateway wasn't the earlier warning, so
+                // the loss starts past your own kit — worth saying out loud.
+                let lan = if hop_status(path, HopId::Gateway) == Status::Ok {
+                    " Your LAN is clean — the router answers every probe — so this starts past your own equipment."
+                } else {
+                    ""
+                };
+                (
+                    "Your uplink is dropping packets",
+                    format!(
+                        "The internet is reachable, but {l:.0}% of connections through it never complete.{lan}"
+                    ),
+                    Some(
+                        "Usually ISP congestion or a flaky modem/ONU — power-cycle the modem, and report persistent loss to your ISP.".to_string(),
+                    ),
+                )
+            }
+            None => (
+                "Internet is up but degraded",
+                format!("Reachable, but quality is poor — {summary}."),
+                Some("Check for background traffic or a congested uplink.".to_string()),
+            ),
+        },
         HopId::Dns => (
             "DNS is slow",
             format!("Resolution works but is sluggish — {summary}."),
@@ -312,6 +378,107 @@ mod tests {
         // Split-tunnel doesn't carry the default route, so a WAN outage is
         // still the ISP's, not the tunnel's.
         assert!(diagnose(&p).headline.contains("ISP"));
+    }
+
+    fn lossy(id: HopId, layer: Layer, loss_pct: f64) -> Hop {
+        let mut h = hop(id, layer, Status::Warn);
+        h.loss_pct = Some(loss_pct);
+        h
+    }
+
+    #[test]
+    fn lossy_lan_is_diagnosed_even_though_every_hop_is_up() {
+        // The whole point of measuring loss: nothing is broken, a checklist
+        // would say "all good", but the network is unusable.
+        let p = Path {
+            hops: vec![
+                hop(HopId::Link, Layer::Link, Status::Ok),
+                lossy(HopId::Gateway, Layer::Network, 40.0),
+                hop(HopId::Wan, Layer::Internet, Status::Ok),
+                hop(HopId::Dns, Layer::Application, Status::Ok),
+            ],
+        };
+        let v = diagnose(&p);
+        assert_eq!(v.status, Status::Warn);
+        assert!(
+            v.headline.contains("dropping packets"),
+            "expected a loss verdict, got: {}",
+            v.headline
+        );
+        assert!(v.cause.contains("40%"), "cause must quote the loss");
+    }
+
+    #[test]
+    fn strong_signal_with_lossy_lan_rules_out_distance() {
+        // Full bars but unusable — the verdict must say the signal is fine so
+        // the user stops walking towards the router.
+        let mut link = hop(HopId::Link, Layer::Link, Status::Ok);
+        link.summary = Some("Excellent · -45 dBm".into());
+        let p = Path {
+            hops: vec![link, lossy(HopId::Gateway, Layer::Network, 40.0)],
+        };
+        let v = diagnose(&p);
+        assert!(v.cause.contains("-45 dBm"));
+        assert!(v.cause.contains("isn't distance"));
+    }
+
+    #[test]
+    fn weak_link_owns_the_verdict_but_quotes_the_loss_it_causes() {
+        // Both hops warn; the link is earlier in the chain and is the cause,
+        // while the gateway loss is the evidence of what it costs.
+        let mut link = hop(HopId::Link, Layer::Link, Status::Warn);
+        link.summary = Some("Weak · -82 dBm".into());
+        let p = Path {
+            hops: vec![link, lossy(HopId::Gateway, Layer::Network, 60.0)],
+        };
+        let v = diagnose(&p);
+        assert!(v.headline.contains("Weak Wi-Fi"));
+        assert!(
+            v.cause.contains("60% packet loss"),
+            "link verdict should quote the damage, got: {}",
+            v.cause
+        );
+    }
+
+    #[test]
+    fn clean_lan_with_lossy_wan_blames_the_uplink() {
+        let p = Path {
+            hops: vec![
+                hop(HopId::Link, Layer::Link, Status::Ok),
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                lossy(HopId::Wan, Layer::Internet, 40.0),
+                hop(HopId::Dns, Layer::Application, Status::Ok),
+            ],
+        };
+        let v = diagnose(&p);
+        assert!(
+            v.headline.contains("uplink"),
+            "expected an uplink verdict, got: {}",
+            v.headline
+        );
+        assert!(v.cause.contains("LAN is clean"));
+        assert!(v.fix.as_deref().unwrap().contains("ISP"));
+    }
+
+    #[test]
+    fn loss_below_the_threshold_is_not_the_story() {
+        // A single dropped echo is Wi-Fi noise. If a probe still grades the hop
+        // as degraded, the verdict must fall back to the generic explanation
+        // rather than claiming packet loss.
+        let mut gw = hop(HopId::Gateway, Layer::Network, Status::Warn);
+        gw.loss_pct = Some(LOSS_WARN_PCT - 5.0);
+        gw.summary = Some("Router is sluggish — 120 ms round trip".into());
+        let p = Path {
+            hops: vec![hop(HopId::Link, Layer::Link, Status::Ok), gw],
+        };
+        let v = diagnose(&p);
+        assert!(
+            !v.headline.contains("dropping packets"),
+            "sub-threshold loss must not be reported as loss, got: {}",
+            v.headline
+        );
+        // The verdict defers to the hop's own summary rather than guessing.
+        assert!(v.cause.contains("sluggish"));
     }
 
     #[test]
