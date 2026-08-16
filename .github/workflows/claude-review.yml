@@ -1,48 +1,131 @@
-name: Claude Review
+name: Claude review
 
-# Automatic review on every PR, running on your Claude Pro/Max subscription
-# (no pay-per-token API key needed). Auth uses CLAUDE_CODE_OAUTH_TOKEN, held in
-# the environment of the same name (generate it with `claude setup-token`).
+# CI answers "does it build and do the tests pass". This asks the question no
+# script here can. It reviews, it does not gate: nothing here is a required
+# check.
+#
+# The action refuses to run when this file differs from the copy on the default
+# branch, so a pull request cannot rewrite its own reviewer. The cost is that
+# any change to this file, including the one that added it, goes unreviewed by
+# Claude until it is merged.
+
 on:
   pull_request:
-    types: [opened, synchronize]
+    # converted_to_draft is here to cancel, not to run. The job skips drafts, so
+    # the run this starts exists only to take over the concurrency group and stop
+    # a review of a pull request its author has just pulled back.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
 
-permissions:
-  contents: read
-  pull-requests: write
+permissions: {}
+
+# One review per pull request. A rapid re-push cancels the run it superseded
+# rather than paying for a review of a diff that no longer exists.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   review:
+    # A pull request from a fork gets no secrets, so the job would fail on
+    # authentication rather than say anything useful. Dependabot is same-repo but
+    # is handed dependabot secrets rather than the repository's, so it would fail
+    # the token check and paint every dependency bump red; the type check keeps
+    # every bot out for the same reason. Drafts are skipped until they are marked
+    # ready, which is what the ready_for_review trigger is for.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type == 'User' &&
+      github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    # The OAuth token lives in this environment's secrets.
+    timeout-minutes: 20
+    # The token is an environment secret here rather than a repository one, so
+    # the job has to name the environment to see it at all. Without this line
+    # the guard below fails every pull request.
     environment: CLAUDE_CODE_OAUTH_TOKEN
-    # Only for same-repo PRs (fork PRs can't see the secret anyway).
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
-    env:
-      # Empty when the secret is unset — lets us skip gracefully (green)
-      # instead of hard-failing the check on repos without the token.
-      HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+    permissions:
+      contents: read
+      pull-requests: write
+      # Required by the action's default GitHub App authentication.
+      id-token: write
     steps:
-      - name: Note missing token
-        if: env.HAS_TOKEN != 'true'
-        run: echo "::notice::CLAUDE_CODE_OAUTH_TOKEN not set — skipping Claude review."
-
-      - uses: actions/checkout@v7
-        if: env.HAS_TOKEN == 'true'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 1
+          fetch-depth: 0
+          # Nothing here pushes, and the action authenticates through the GitHub
+          # App rather than this token. Leaving the token in the workspace git
+          # config only widens what the third-party action can reach.
+          persist-credentials: false
 
-      - uses: anthropics/claude-code-action@v1
-        if: env.HAS_TOKEN == 'true'
+      # Without the secret the action exits successfully having reviewed
+      # nothing, which is worse than failing: the check goes green and the
+      # pull request looks reviewed. Fail here instead, where the reason is
+      # legible.
+      - name: Require the token
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "::error::CLAUDE_CODE_OAUTH_TOKEN is not set. Generate one with 'claude setup-token', then: gh secret set CLAUDE_CODE_OAUTH_TOKEN"
+            exit 1
+          fi
+
+      - uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1
         with:
+          # A subscription token, not an API key: runs against the Claude plan
+          # instead of API credits. Generate it with `claude setup-token`.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          track_progress: true
           prompt: |
-            Review this pull request. It's a macOS network-diagnostic TUI CLI
-            written in Rust (ratatui + tokio). Focus on:
-            - correctness bugs and wrong diagnoses (false OK / false BROKEN)
-            - parser edge cases over system_profiler / route / scutil output
-            - async orchestration and the tokio::select! render loop
-            - panics that could leave the terminal in a broken state
-            Be concise and only flag real issues; skip nitpicks.
+            REPO: ${{ github.repository }}
+            PR: ${{ github.event.pull_request.number }}
+
+            wtfi2 is a macOS-first Rust TUI that renders a network connection as a chain of
+            hops — You, Wi-Fi, Gateway, an optional VPN, Internet, DNS, Portal — probes each
+            one concurrently, and reduces the result to a single root-cause verdict plus a
+            fix. src/probe/* does the measuring, src/platform/* hides the macOS-specific data
+            acquisition behind a trait, src/engine.rs fans the probes out over a channel,
+            src/diagnose.rs turns the completed chain into the verdict, and src/ui/dashboard.rs
+            is the live ratatui view. It ships as a single binary and needs no sudo.
+
+            Do not repeat what CI already does. cargo fmt, clippy with -D warnings, the tests
+            and the release build all run on this PR already.
+
+            Look for what only a reader can catch:
+
+            1. Wrong diagnoses. The entire product is one sentence, so a hop graded Ok when
+               it isn't, a first_break that names the wrong hop, or a verdict that blames the
+               ISP for a dead VPN is the worst defect available here — it reads exactly like
+               a correct answer. Fail is reserved for total unreachability and quality
+               problems cap at Warn, so that a degraded-but-alive hop can never be picked as
+               the break.
+
+            2. Measurements that never happened, reported as measurements that did. The
+               probes shell out to ping, route, scutil and system_profiler and parse text. A
+               tool that failed before transmitting, a flag a binary does not actually have,
+               or a summary line that never printed must surface as unmeasured — never as 0%,
+               never as 100%. This is the bug class that has actually bitten this repo.
+
+            3. Parser drift against real macOS output. Field names, %zone suffixes on
+               link-local addresses, (DUP!) replies, redacted SSIDs and privilege-dependent
+               output all vary by OS version. A parser that quietly yields None turns into a
+               wrong hop status two layers up rather than an error.
+
+            4. The render loop. tokio::select! in src/ui/dashboard.rs owns the terminal: a
+               panic or a hop that never reaches a terminal status leaves is_complete() false
+               and the dashboard spinning, or drops the user back to a shell still in raw mode
+               with the alternate screen up. Conditional hops such as the VPN are the ones to
+               watch.
+
+            5. Time budgets. Every probe has to finish inside the dashboard's re-probe tick.
+               A child process with no ceiling, or a per-sample timeout that can start near
+               the end of a burst budget, stretches the sweep past it.
+
+            Post findings as inline comments on the lines they concern. Use one
+            top-level comment for the summary, posted with
+            `gh pr comment --edit-last --create-if-none` so that a re-review
+            replaces the previous summary rather than stacking another one
+            underneath it. Be specific and cite `file:line`. If the diff is
+            clean against all of the above, say so in one line rather than
+            manufacturing nits.
+
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
