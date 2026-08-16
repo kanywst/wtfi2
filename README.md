@@ -24,6 +24,7 @@ cause** so the answer is one line, not ten.
 - **Root-cause reasoning.** It correlates the hops ("IPs reachable but names
   aren't → DNS-only outage") into a single verdict plus a concrete fix, and it
   hedges honestly with a confidence level.
+- **Catches "up but unusable".** Every hop can answer and still be dropping a quarter of your packets. wtfi measures loss and jitter per hop, so the classic full-bars-nothing-loads network is diagnosed instead of being reported as healthy — and it says whether the loss is your Wi-Fi or your uplink.
 - **Live dashboard.** `wtfi -w` re-probes continuously with real-time latency
   sparklines and a signal gauge, so you can walk around and find the dead zone.
 - **No sudo required.** Signal, noise, gateway RTT, dual-stack reachability,
@@ -100,17 +101,14 @@ complete:
 
 1. **L2 Link** — Wi-Fi RSSI, noise, SNR, channel, PHY mode, security and tx
    rate, graded into a signal quality.
-2. **L3 Gateway** — resolves the default route and pings the router for RTT,
-   flagging VPN/tunnel interfaces and sub-1500 MTU.
-3. **WAN** — real TCP handshakes to anycast resolvers over IPv4 and IPv6 to
-   expose asymmetric blackholing without needing raw ICMP.
+2. **L3 Gateway** — resolves the default route and sends a short ICMP burst to the router, measuring RTT, packet loss and jitter, and flagging VPN/tunnel interfaces and sub-1500 MTU.
+3. **WAN** — real TCP handshakes to anycast resolvers over IPv4 and IPv6 to expose asymmetric blackholing without needing raw ICMP, then repeats the handshake to measure loss and jitter on the uplink itself.
 4. **DNS** — benchmarks the system resolver against Cloudflare and Google to
    separate "DNS is down" from "your resolver is just slow".
 5. **Captive portal** — a plain-HTTP hotspot check that catches login-page
    interception before you think you're online.
 
-The diagnosis engine then walks the completed chain, finds the *first* break
-(everything downstream is collateral), and turns it into the verdict.
+The diagnosis engine then walks the completed chain, finds the *first* break (everything downstream is collateral), and turns it into the verdict. With no break at all it moves on to quality: a hop that answers but loses ≥ 25% of a burst counts as degradation, and where that loss starts decides whether the verdict blames your Wi-Fi, your router or your ISP.
 
 ## Tech stack
 

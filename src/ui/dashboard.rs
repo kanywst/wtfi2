@@ -377,18 +377,50 @@ fn telemetry(f: &mut Frame, area: Rect, app: &App) {
         ));
     f.render_widget(g, rows[0]);
 
-    sparkline(f, rows[1], "gateway", &app.gw_hist, Color::Cyan);
-    sparkline(f, rows[2], "wan", &app.wan_hist, Color::Magenta);
+    sparkline(
+        f,
+        rows[1],
+        "gateway",
+        &app.gw_hist,
+        Color::Cyan,
+        loss_badge(app, HopId::Gateway),
+    );
+    sparkline(
+        f,
+        rows[2],
+        "wan",
+        &app.wan_hist,
+        Color::Magenta,
+        loss_badge(app, HopId::Wan),
+    );
+}
+
+/// Loss badge for a telemetry row. `None` when the path is clean, so a healthy
+/// network stays uncluttered and any badge at all means something.
+fn loss_badge(app: &App, id: HopId) -> Option<String> {
+    app.path
+        .get(id)
+        .and_then(|h| h.loss_pct)
+        .filter(|l| *l > 0.0)
+        .map(|l| format!(" {l:.0}% loss"))
 }
 
 /// Dependency-free unicode sparkline so we fully control scaling.
-fn sparkline(f: &mut Frame, area: Rect, label: &str, hist: &VecDeque<f64>, col: Color) {
+fn sparkline(
+    f: &mut Frame,
+    area: Rect,
+    label: &str,
+    hist: &VecDeque<f64>,
+    col: Color,
+    loss: Option<String>,
+) {
     const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let last = hist.back().copied();
     let (min, max) = hist
         .iter()
         .fold((f64::MAX, f64::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
-    let width = area.width.saturating_sub(14) as usize;
+    let reserved = 14 + loss.as_ref().map_or(0, |s| s.chars().count()) as u16;
+    let width = area.width.saturating_sub(reserved) as usize;
     let take = hist.len().saturating_sub(width);
     let spark: String = hist
         .iter()
@@ -409,6 +441,10 @@ fn sparkline(f: &mut Frame, area: Rect, label: &str, hist: &VecDeque<f64>, col: 
             last.map(|v| format!(" {v:.0}ms")).unwrap_or_default(),
             Style::new().fg(col).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(
+            loss.unwrap_or_default(),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -422,4 +458,80 @@ fn footer(f: &mut Frame, area: Rect) {
         Span::styled(format!(" auto every {REPROBE_SECS}s"), Style::new().dim()),
     ]);
     f.render_widget(Paragraph::new(line), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Layer;
+
+    fn app_with_gateway_loss(loss_pct: Option<f64>) -> App {
+        let mut app = App::new();
+        let mut gw = Hop::new(HopId::Gateway, Layer::Network, "Gateway");
+        gw.status = Status::Ok;
+        gw.loss_pct = loss_pct;
+        app.path.upsert(gw);
+        app
+    }
+
+    #[test]
+    fn clean_telemetry_row_shows_no_loss_badge() {
+        // A badge that shows "0% loss" on every healthy network is noise; the
+        // badge has to mean something the moment it appears.
+        assert_eq!(
+            loss_badge(&app_with_gateway_loss(Some(0.0)), HopId::Gateway),
+            None
+        );
+        assert_eq!(
+            loss_badge(&app_with_gateway_loss(None), HopId::Gateway),
+            None
+        );
+    }
+
+    #[test]
+    fn lossy_telemetry_row_shows_the_badge() {
+        assert_eq!(
+            loss_badge(&app_with_gateway_loss(Some(40.0)), HopId::Gateway),
+            Some(" 40% loss".to_string())
+        );
+    }
+
+    fn render_sparkline(width: u16, badge: Option<&str>) -> String {
+        let hist: VecDeque<f64> = [10.0, 40.0, 12.0, 31.0].into_iter().collect();
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width.max(1), 1)).unwrap();
+        term.draw(|f| {
+            sparkline(
+                f,
+                Rect::new(0, 0, width, 1),
+                "gateway",
+                &hist,
+                Color::Cyan,
+                badge.map(str::to_string),
+            )
+        })
+        .unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn badge_renders_alongside_the_sparkline() {
+        let out = render_sparkline(60, Some(" 40% loss"));
+        assert!(out.contains("gateway"), "row must keep its label: {out:?}");
+        assert!(out.contains("40% loss"), "badge must be visible: {out:?}");
+    }
+
+    #[test]
+    fn narrow_pane_drops_the_spark_instead_of_panicking() {
+        // The badge eats horizontal room. A pane too narrow to hold both must
+        // degrade rather than underflow the width arithmetic.
+        for width in [0u16, 1, 5, 14, 20, 24] {
+            let _ = render_sparkline(width, Some(" 100% loss"));
+        }
+    }
 }

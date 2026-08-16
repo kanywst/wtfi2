@@ -155,6 +155,35 @@ mod tests {
     }
 
     #[test]
+    fn lossy_path_reports_degraded_even_with_no_broken_hop() {
+        // End-to-end through the real diagnosis and renderer: no hop is down,
+        // so the topology stays unbroken, yet the report must not say "all
+        // good" — it has to name the loss and where it is.
+        let mut gw = ok(HopId::Gateway, Layer::Network, "Gateway");
+        gw.status = Status::Warn;
+        gw.loss_pct = Some(40.0);
+        gw.summary = Some("Router answers (4 ms) but the local path is unhealthy".into());
+        gw.metrics
+            .push(Metric::new("Loss", "40% (2/5 lost)").with_status(Status::Warn));
+        let path = Path {
+            hops: vec![
+                ok(HopId::Link, Layer::Link, "Wi-Fi"),
+                gw,
+                ok(HopId::Wan, Layer::Internet, "Internet"),
+                ok(HopId::Dns, Layer::Application, "DNS"),
+            ],
+        };
+        let out = report(&path, &diagnose(&path), true, false);
+        assert!(
+            out.contains("DEGRADED"),
+            "must not read as all-good:\n{out}"
+        );
+        assert!(out.contains("dropping packets"));
+        assert!(out.contains("40%"));
+        assert!(!out.contains("─✗─"), "nothing is broken, so no break glyph");
+    }
+
+    #[test]
     fn vpn_hop_renders_in_topology_and_detail() {
         // A conditional VPN hop sits between Gateway and Internet and must show
         // up in both the topology chain and the per-hop detail block.
