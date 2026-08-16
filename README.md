@@ -116,7 +116,7 @@ Built for 2026, single self-contained binary:
 
 | Layer        | Choice                                             |
 | ------------ | -------------------------------------------------- |
-| Language     | Rust (edition 2021, MSRV 1.88)                     |
+| Language     | Rust (edition 2024, MSRV 1.88)                     |
 | TUI          | `ratatui` 0.30 immediate-mode + `crossterm` 0.29   |
 | Async        | `tokio` with a `select!`-driven render loop        |
 | DNS          | `hickory-resolver` 0.26                            |
