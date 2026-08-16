@@ -27,8 +27,19 @@ const SPACING: Duration = Duration::from_millis(100);
 const SAMPLE_WAIT: Duration = Duration::from_secs(3);
 /// Wall-clock ceiling on the follow-up sampling, so a path that dies right
 /// after the first success can't stretch the sweep past the dashboard's tick.
-/// A burst cut short reports the samples it actually took.
-const SAMPLE_BUDGET: Duration = Duration::from_millis(2500);
+///
+/// It is a real ceiling because no sample is *started* unless its own worst
+/// case still fits inside it — checking only the start time would let a single
+/// timed-out handshake overshoot by most of [`SAMPLE_WAIT`]. The cost is that
+/// a dying path yields a short burst, which is reported as what it is: a loss
+/// figure over the handshakes actually attempted.
+const SAMPLE_BUDGET: Duration = Duration::from_millis(3600);
+
+const _: () = assert!(
+    SAMPLE_BUDGET.as_millis() >= SPACING.as_millis() + SAMPLE_WAIT.as_millis(),
+    "the budget must admit at least one full-length follow-up sample"
+);
+
 /// The public internet is allowed to wobble more than your own LAN. Sized so a
 /// single latency spike can't trip it: mean IPDV over `n` samples turns one
 /// spike of `S` into roughly `2S/(n-1)`, i.e. `S/2` at five samples.
@@ -89,14 +100,18 @@ pub async fn probe() -> Hop {
 /// instant. Reuses the first handshake as sample one — it already happened,
 /// and it was taken under the same deadline as the rest.
 ///
-/// Stops early once [`SAMPLE_BUDGET`] is spent. A path that dies right after
-/// that first success would otherwise cost every remaining sample its full
-/// timeout, and a short honest burst beats a long one that overruns the sweep.
+/// Stops early once [`SAMPLE_BUDGET`] can no longer fit a whole sample. A path
+/// that dies right after that first success would otherwise cost every
+/// remaining sample its full timeout, and a short honest burst beats a long one
+/// that overruns the sweep.
 async fn sample_quality(first: Probe) -> Quality {
     let deadline = Instant::now() + SAMPLE_BUDGET;
     let mut samples = Vec::with_capacity(SAMPLES as usize);
     samples.push(first);
-    while (samples.len() as u32) < SAMPLES && Instant::now() + SPACING < deadline {
+    // The worst case of the *whole* iteration has to fit, not just its start:
+    // a handshake that times out takes SAMPLE_WAIT no matter how much budget
+    // is left when it begins.
+    while (samples.len() as u32) < SAMPLES && Instant::now() + SPACING + SAMPLE_WAIT <= deadline {
         tokio::time::sleep(SPACING).await;
         samples.push(tcp_connect(SocketAddr::new(V4, 443), SAMPLE_WAIT).await);
     }
