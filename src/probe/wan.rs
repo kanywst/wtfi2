@@ -9,7 +9,7 @@
 use super::net::{Probe, Quality, apply_quality, tcp_connect};
 use crate::model::{Hop, HopId, Layer, Metric, Status};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const V4: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
 const V6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111));
@@ -18,20 +18,29 @@ const V6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 
 const SAMPLES: u32 = 5;
 /// Spacing, so the samples cover a slice of time rather than one instant.
 const SPACING: Duration = Duration::from_millis(100);
-/// Per-sample ceiling. The path is already known to work by this point, so a
-/// handshake this slow is indistinguishable from a dropped one.
-const SAMPLE_WAIT: Duration = Duration::from_secs(1);
-/// The public internet is allowed to wobble more than your own LAN.
-const JITTER_WARN_MS: f64 = 60.0;
+/// Ceiling for *every* handshake, reachability probe included.
+///
+/// It has to be one number: if the follow-up samples were held to a tighter
+/// deadline than the probe that declared the path up, a merely slow uplink
+/// would be reported as a lossy one — "80% of connections never complete" for
+/// a link where every connection completes, just not quickly.
+const SAMPLE_WAIT: Duration = Duration::from_secs(3);
+/// Wall-clock ceiling on the follow-up sampling, so a path that dies right
+/// after the first success can't stretch the sweep past the dashboard's tick.
+/// A burst cut short reports the samples it actually took.
+const SAMPLE_BUDGET: Duration = Duration::from_millis(2500);
+/// The public internet is allowed to wobble more than your own LAN. Sized so a
+/// single latency spike can't trip it: mean IPDV over `n` samples turns one
+/// spike of `S` into roughly `2S/(n-1)`, i.e. `S/2` at five samples.
+const JITTER_WARN_MS: f64 = 120.0;
 
 pub async fn probe() -> Hop {
     let mut hop = Hop::new(HopId::Wan, Layer::Internet, "Internet");
     hop.subtitle = Some("1.1.1.1".into());
 
-    let wait = Duration::from_secs(3);
     let (v4, v6) = tokio::join!(
-        tcp_connect(SocketAddr::new(V4, 443), wait),
-        tcp_connect(SocketAddr::new(V6, 443), wait),
+        tcp_connect(SocketAddr::new(V4, 443), SAMPLE_WAIT),
+        tcp_connect(SocketAddr::new(V6, 443), SAMPLE_WAIT),
     );
 
     // IPv4 is the critical path; IPv6 absence is common and only a soft note.
@@ -44,7 +53,9 @@ pub async fn probe() -> Hop {
         // the missing IPv6 without crying wolf about reachability.
         (true, dual_stack) => {
             let q = sample_quality(v4).await;
-            let avg = q.avg_ms().or_else(|| v4.ms()).unwrap_or(0.0);
+            // Always `Some`: this arm means the first handshake succeeded, and
+            // `sample_quality` keeps it as sample one.
+            let avg = q.avg_ms().unwrap_or_default();
             hop.latency_ms = Some(avg);
             hop.status = apply_quality(&mut hop, &q, JITTER_WARN_MS);
             let family = if dual_stack { "IPv4 + IPv6" } else { "IPv4" };
@@ -75,15 +86,17 @@ pub async fn probe() -> Hop {
 
 /// Follow the successful reachability handshake with more of the same, spaced
 /// out, so loss and jitter are measured over a slice of time rather than one
-/// instant. Reuses the first handshake as sample one — it already happened.
+/// instant. Reuses the first handshake as sample one — it already happened,
+/// and it was taken under the same deadline as the rest.
 ///
-/// A path that dies right after that first success costs the remaining samples
-/// their full timeout; that is the worst case, and it is also precisely the
-/// case worth waiting for.
+/// Stops early once [`SAMPLE_BUDGET`] is spent. A path that dies right after
+/// that first success would otherwise cost every remaining sample its full
+/// timeout, and a short honest burst beats a long one that overruns the sweep.
 async fn sample_quality(first: Probe) -> Quality {
+    let deadline = Instant::now() + SAMPLE_BUDGET;
     let mut samples = Vec::with_capacity(SAMPLES as usize);
     samples.push(first);
-    while (samples.len() as u32) < SAMPLES {
+    while (samples.len() as u32) < SAMPLES && Instant::now() + SPACING < deadline {
         tokio::time::sleep(SPACING).await;
         samples.push(tcp_connect(SocketAddr::new(V4, 443), SAMPLE_WAIT).await);
     }

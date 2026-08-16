@@ -108,6 +108,11 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     let mut events = EventStream::new();
     let mut ticker = interval(Duration::from_millis(120));
     let mut reprobe = interval(Duration::from_secs(REPROBE_SECS));
+    // A degraded network can make a sweep outlast the tick. The default burst
+    // behaviour would then fire every missed tick at once and re-probe back to
+    // back — losing the fixed cadence exactly when a steady sampling interval
+    // matters most, and skewing the sparkline's time axis.
+    reprobe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut rx = app.restart();
 
     terminal.draw(|f| draw(f, &app))?;

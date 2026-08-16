@@ -177,10 +177,17 @@ pub fn apply_quality(hop: &mut Hop, q: &Quality, jitter_warn_ms: f64) -> Status 
 /// the scope id for a link-local IPv6 target (`fe80::1%en0`), without which the
 /// kernel can't pick an egress interface.
 ///
-/// `wait` is a hard ceiling on the whole burst (`ping -t`), so a black-holed
-/// target costs a bounded amount of time rather than `count * timeout`. Output
-/// is parsed regardless of exit status: `ping` exits non-zero on 100% loss, and
-/// "everything was lost" is a result we very much want to report.
+/// `wait` bounds the burst so a black-holed target costs a bounded amount of
+/// time rather than `count * timeout`. Only `ping(8)` can enforce that itself
+/// (`-t`); `ping6(8)` has no timeout option at all — its `-t` is an unrelated
+/// boolean — so the v6 burst is bounded from out here instead.
+///
+/// Output is parsed regardless of exit status: `ping` exits non-zero on 100%
+/// loss, and "everything was lost" is a result we very much want to report.
+/// A run that produced neither replies *nor* a tally is treated as unmeasured
+/// rather than as total loss — `ping` reports pre-transmit failures (no route,
+/// interface torn down, interval refused) on stderr with an empty stdout, and
+/// a probe that never left the machine must not be reported as packet loss.
 pub async fn ping_burst(
     addr: IpAddr,
     zone: Option<&str>,
@@ -190,7 +197,9 @@ pub async fn ping_burst(
 ) -> Quality {
     let secs = wait.as_secs().max(1).to_string();
     let count_s = count.to_string();
-    let interval_s = format!("{:.1}", interval.as_secs_f64());
+    // Three decimals: `ping` accepts down to 0.002s unprivileged, and rounding
+    // a sub-50ms interval to `0.0` would get the whole burst rejected.
+    let interval_s = format!("{:.3}", interval.as_secs_f64());
     let (bin, target) = match addr {
         IpAddr::V4(v4) => ("ping", v4.to_string()),
         IpAddr::V6(v6) => match zone {
@@ -198,33 +207,61 @@ pub async fn ping_burst(
             None => ("ping6", v6.to_string()),
         },
     };
+    let is_v6 = addr.is_ipv6();
     let mut cmd = Command::new(bin);
-    cmd.args(["-c", &count_s, "-t", &secs]);
-    // Only unprivileged-safe intervals are worth asking for; macOS rejects
-    // sub-100ms spacing for non-root, and a single sample needs no spacing.
+    cmd.args(["-c", &count_s]);
+    if !is_v6 {
+        // `ping6` would swallow the value as a `hops` positional and then fail
+        // to resolve it, sending nothing at all.
+        cmd.args(["-t", &secs]);
+    }
+    // A single sample needs no spacing, and `ping` refuses intervals below
+    // 0.002s for non-root.
     if count > 1 {
         cmd.args(["-i", &interval_s]);
     }
-    let out = match cmd.arg(&target).output().await {
-        Ok(o) => o,
-        Err(_) => return Quality::default(),
+    cmd.arg(&target).kill_on_drop(true);
+
+    // Ceiling for the whole child: what `-t` already does for v4, and the only
+    // thing bounding v6. Padded so it can't pre-empt `ping`'s own tally.
+    let budget = wait + interval * count + Duration::from_secs(1);
+    let out = match timeout(budget, cmd.output()).await {
+        Ok(Ok(o)) => o,
+        _ => return Quality::default(),
     };
+
     let text = String::from_utf8_lossy(&out.stdout);
     let rtts_ms = parse_ping_times(&text);
     // Prefer ping's own tally: `-t` can cut a burst short, so the number we
     // asked for isn't necessarily the number that went out.
-    let sent = parse_ping_sent(&text).unwrap_or(count);
+    let sent = match parse_ping_sent(&text) {
+        Some(n) => n,
+        // No tally and no replies: the tool never got going.
+        None if rtts_ms.is_empty() => return Quality::default(),
+        None => count,
+    };
+    // Clamp rather than raise `sent`: duplicate replies (`(DUP!)`) are already
+    // filtered out, but any other surplus must not be able to manufacture a
+    // clean bill of health by making `received >= sent`.
+    let keep = (sent as usize).min(rtts_ms.len());
     Quality {
-        sent: sent.max(rtts_ms.len() as u32),
-        rtts_ms,
+        sent,
+        rtts_ms: rtts_ms[..keep].to_vec(),
     }
 }
 
 /// Pull every `time=3.456 ms` out of ping output, in reply order.
+///
+/// Duplicate replies are skipped: a duplicating switch or a bridge loop makes
+/// `ping` print more replies than it sent, and counting those as distinct
+/// samples would report a genuinely broken LAN as loss-free.
 fn parse_ping_times(text: &str) -> Vec<f64> {
-    text.split("time=")
-        .skip(1)
-        .filter_map(|rest| rest.split_whitespace().next()?.parse::<f64>().ok())
+    text.lines()
+        .filter(|line| !line.contains("(DUP!)"))
+        .filter_map(|line| {
+            let rest = line.split_once("time=")?.1;
+            rest.split_whitespace().next()?.parse::<f64>().ok()
+        })
         .collect()
 }
 
@@ -276,6 +313,33 @@ round-trip min/avg/max/stddev = 3.456/6.123/9.456/2.483 ms";
     }
 
     #[test]
+    fn duplicate_replies_do_not_manufacture_a_clean_bill_of_health() {
+        // A duplicating switch or bridge loop makes ping print more replies
+        // than it sent. Counting those as samples would report 0% loss on a
+        // LAN that is in fact dropping most of the originals.
+        let dup = "\
+PING 192.168.0.1 (192.168.0.1): 56 data bytes
+64 bytes from 192.168.0.1: icmp_seq=0 ttl=64 time=3.4 ms
+64 bytes from 192.168.0.1: icmp_seq=0 ttl=64 time=3.9 ms (DUP!)
+64 bytes from 192.168.0.1: icmp_seq=0 ttl=64 time=4.1 ms (DUP!)
+Request timeout for icmp_seq 1
+Request timeout for icmp_seq 2
+
+--- 192.168.0.1 ping statistics ---
+3 packets transmitted, 3 packets received, +2 duplicates, -0.0% packet loss";
+        assert_eq!(parse_ping_times(dup), vec![3.4], "DUPs are not samples");
+        let q = Quality {
+            sent: parse_ping_sent(dup).unwrap(),
+            rtts_ms: parse_ping_times(dup),
+        };
+        assert!(
+            q.loss_pct().unwrap() > LOSS_WARN_PCT,
+            "two of three originals were lost, got {:?}",
+            q.loss_pct()
+        );
+    }
+
+    #[test]
     fn parses_transmitted_count() {
         assert_eq!(parse_ping_sent(LOSSY), Some(5));
         assert_eq!(parse_ping_sent("no summary here"), None);
@@ -306,6 +370,16 @@ round-trip min/avg/max/stddev = 3.456/6.123/9.456/2.483 ms";
         assert_eq!(q.avg_ms(), None);
         assert_eq!(q.jitter_ms(), None);
         assert!(!q.is_empty());
+    }
+
+    #[test]
+    fn a_run_that_never_transmitted_is_unmeasured_not_total_loss() {
+        // `ping` reports pre-transmit failures (no route, interface gone,
+        // interval refused) on stderr and leaves stdout empty. Falling back to
+        // the requested count there would invent "100% packet loss" for a probe
+        // that never left the machine.
+        assert!(parse_ping_times("").is_empty());
+        assert_eq!(parse_ping_sent(""), None);
     }
 
     #[test]
@@ -346,6 +420,33 @@ round-trip min/avg/max/stddev = 3.456/6.123/9.456/2.483 ms";
         assert!(!q.is_empty(), "the ping binary should have run");
         assert_eq!(q.sent, 5);
         assert_eq!(q.loss_pct(), Some(100.0));
+    }
+
+    /// `ping6` has no timeout flag — its `-t` is an unrelated boolean, so a
+    /// `-t <secs>` would be eaten as a `hops` positional and the burst would
+    /// send nothing while looking like total loss. A v6 burst to a documentation
+    /// address must come back *unmeasured*, never as fabricated packet loss.
+    #[tokio::test]
+    #[ignore = "needs network; run manually with --ignored"]
+    async fn live_v6_burst_never_reports_fabricated_loss() {
+        // 2001:db8::/32 (RFC 3849) — documentation only, never routed.
+        let addr: IpAddr = "2001:db8::1".parse().unwrap();
+        let q = ping_burst(
+            addr,
+            None,
+            5,
+            Duration::from_millis(200),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            q.is_empty() || q.loss_pct() == Some(100.0),
+            "a v6 burst must be unmeasured or genuinely lost, got {q:?}"
+        );
+        assert!(
+            q.rtts_ms.is_empty(),
+            "nothing can come back from a documentation prefix"
+        );
     }
 
     #[test]
