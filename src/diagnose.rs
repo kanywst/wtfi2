@@ -32,7 +32,20 @@ pub struct Verdict {
 
 /// Derive a verdict from a (ideally complete) path.
 pub fn diagnose(path: &Path) -> Verdict {
-    // 0. Still probing — don't render a health claim from half the evidence.
+    // 0. No platform module: every hop is skipped, which would otherwise fall
+    //    all the way through to the clean bill of health below. Absence of
+    //    evidence is not health.
+    if let Some(reason) = crate::platform::UNSUPPORTED_OS {
+        return Verdict {
+            status: Status::Skipped,
+            headline: "Can't diagnose on this OS".into(),
+            cause: reason.into(),
+            fix: None,
+            confidence: Confidence::Certain,
+        };
+    }
+
+    // 1. Still probing — don't render a health claim from half the evidence.
     if path.hops.iter().any(|h| h.status == Status::Pending) {
         return Verdict {
             status: Status::Pending,
@@ -43,7 +56,7 @@ pub fn diagnose(path: &Path) -> Verdict {
         };
     }
 
-    // 1. A positively-detected captive portal wins over any upstream break it
+    // 2. A positively-detected captive portal wins over any upstream break it
     //    caused. Portals blackhole direct TCP to 1.1.1.1:443, so the WAN hop
     //    fails first in the chain — but "sign in to the Wi-Fi" is the real,
     //    actionable root cause, not "your ISP is down".
@@ -51,13 +64,13 @@ pub fn diagnose(path: &Path) -> Verdict {
         return explain_break(path, HopId::Captive);
     }
 
-    // 2. Otherwise the connection is broken somewhere: explain the *first*
+    // 3. Otherwise the connection is broken somewhere: explain the *first*
     //    break, since everything downstream is just collateral.
     if let Some(broken) = path.first_break() {
         return explain_break(path, broken.id);
     }
 
-    // 3. Nothing is broken — surface the worst degradation, if any.
+    // 4. Nothing is broken — surface the worst degradation, if any.
     if let Some(warn) = path
         .hops
         .iter()
@@ -67,7 +80,7 @@ pub fn diagnose(path: &Path) -> Verdict {
         return explain_warn(path, warn.id);
     }
 
-    // 4. Clean bill of health.
+    // 5. Clean bill of health.
     Verdict {
         status: Status::Ok,
         headline: "You're fully online".into(),
@@ -290,6 +303,19 @@ mod tests {
         let mut h = Hop::new(id, layer, "x");
         h.status = s;
         h
+    }
+
+    /// A path of skipped hops has no break and no warning, so without the
+    /// platform guard it reaches the clean bill of health and calls an OS wtfi
+    /// cannot even probe "fully online". No-op on a supported OS.
+    #[test]
+    fn an_unsupported_os_is_never_called_healthy() {
+        if crate::platform::UNSUPPORTED_OS.is_none() {
+            return;
+        }
+        let v = diagnose(&Path::default());
+        assert_eq!(v.status, Status::Skipped);
+        assert_ne!(v.headline, "You're fully online");
     }
 
     #[test]
