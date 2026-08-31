@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/kanywst/wtfi2/actions/workflows/ci.yml/badge.svg)](https://github.com/kanywst/wtfi2/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/kanywst/wtfi2)](https://github.com/kanywst/wtfi2/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/wtfi2)](https://crates.io/crates/wtfi2)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **What The F\*ck Internet** — a live, visual network-path diagnostic that
@@ -66,15 +67,21 @@ Homebrew (macOS):
 brew install kanywst/tap/wtfi2
 ```
 
-The installed command is `wtfi`.
+From crates.io (requires Rust 1.88+):
 
-Or from source (requires Rust 1.88+):
+```bash
+cargo install wtfi2
+```
+
+Or from source:
 
 ```bash
 git clone https://github.com/kanywst/wtfi2
 cd wtfi2
 cargo install --path .
 ```
+
+The installed command is `wtfi` in every case. Note that the crate builds anywhere but only *diagnoses* on macOS — see [Platform support](#platform-support).
 
 ## Usage
 
@@ -136,6 +143,8 @@ Since macOS 14 the OS redacts the SSID and BSSID unless the calling app holds
 Location permission, so those show as *hidden* in an unsigned build, while RSSI,
 noise, channel, PHY and everything that actually matters for diagnosis remain
 available.
+
+On any other OS there is no platform module yet, so `wtfi` refuses up front — one line on stderr and exit 3 — rather than probing and reporting your network as broken. The crate still compiles everywhere, which is what keeps `cargo install` and the docs.rs build honest.
 
 ## Roadmap
 
