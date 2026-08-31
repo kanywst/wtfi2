@@ -1,15 +1,10 @@
-//! Fallback [`Platform`] for an OS that has no module yet.
+//! Fallback [`Platform`] for an OS with no module yet.
 //!
-//! `macos.rs` is the only real implementation today. This stub exists so the
-//! crate still *compiles* everywhere — `cargo publish`, docs.rs and a Linux
-//! `cargo install` all need that — while every fact-gathering call refuses
-//! honestly instead of inventing data. `main` checks [`super::UNSUPPORTED_OS`]
-//! before probing, so this impl is a backstop rather than a path a user
-//! normally reaches.
+//! Exists so the crate compiles off macOS — crates.io and docs.rs both build
+//! there. Every query refuses rather than inventing a reading.
 
 use super::{LinkInfo, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo};
 
-/// Refuses every query with [`PlatformError::Unsupported`].
 pub struct Unsupported;
 
 impl Platform for Unsupported {
@@ -43,8 +38,10 @@ mod tests {
         assert!(matches!(p.vpn(), Err(PlatformError::Unsupported)));
     }
 
+    /// Guards against the two `cfg` gates drifting: this module compiling while
+    /// `UNSUPPORTED_OS` still claims the OS is supported would skip the refusal.
     #[test]
     fn the_os_is_reported_as_unsupported() {
-        assert!(super::super::UNSUPPORTED_OS.is_some());
+        assert!(crate::platform::UNSUPPORTED_OS.is_some());
     }
 }
