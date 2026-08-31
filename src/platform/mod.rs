@@ -13,6 +13,21 @@ pub mod macos;
 #[cfg(target_os = "macos")]
 mod corewlan;
 
+#[cfg(not(target_os = "macos"))]
+pub mod unsupported;
+
+/// Why wtfi refuses to probe on this OS, or `None` when the OS is supported.
+///
+/// macOS is the only platform with a real [`Platform`] impl today; a Linux
+/// module (`nl80211`) is on the roadmap. Callers check this *before* probing so
+/// an unsupported OS gets one honest line, rather than a fully red diagram that
+/// blames the user's network for a missing platform module.
+pub const UNSUPPORTED_OS: Option<&str> = if cfg!(target_os = "macos") {
+    None
+} else {
+    Some("wtfi has no platform module for this OS yet — macOS only for now")
+};
+
 /// Physical / link-layer (L2) facts about the active Wi-Fi interface.
 #[derive(Debug, Clone, Default)]
 pub struct LinkInfo {
@@ -95,6 +110,10 @@ pub enum PlatformError {
     Parse(String),
     /// No default route / no active network.
     NoNetwork,
+    /// This OS has no platform module, so the fact can't be gathered at all.
+    /// Distinct from [`PlatformError::NoNetwork`]: the network may well be
+    /// fine, wtfi just can't see it here.
+    Unsupported,
 }
 
 impl std::fmt::Display for PlatformError {
@@ -103,6 +122,9 @@ impl std::fmt::Display for PlatformError {
             PlatformError::Command(c) => write!(f, "command failed: {c}"),
             PlatformError::Parse(m) => write!(f, "parse error: {m}"),
             PlatformError::NoNetwork => write!(f, "no active network / default route"),
+            PlatformError::Unsupported => {
+                write!(f, "unsupported platform: no module for this OS")
+            }
         }
     }
 }
@@ -126,4 +148,10 @@ pub trait Platform: Send + Sync {
 #[cfg(target_os = "macos")]
 pub fn current() -> impl Platform {
     macos::MacOs::new()
+}
+
+/// Return the platform implementation for the current OS.
+#[cfg(not(target_os = "macos"))]
+pub fn current() -> impl Platform {
+    unsupported::Unsupported
 }
