@@ -16,8 +16,9 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # macOS-only for now: the platform layer targets macOS. A Linux module
-  # (nl80211) is on the roadmap and will add an ubuntu leg to this matrix.
+  # The full suite runs on macOS, because that is the only OS with a real
+  # platform module. A Linux module (nl80211) is on the roadmap and will
+  # promote the `package` job below into a second full leg.
   check:
     name: fmt · clippy · test · build
     runs-on: macos-latest
@@ -43,3 +44,29 @@ jobs:
 
       - name: Build (release)
         run: cargo build --release
+
+  # Guards the crates.io channel. Publishing runs on Linux and docs.rs builds
+  # there too, so the non-macOS fallback in `platform::unsupported` has to keep
+  # compiling — a regression here is invisible to the macOS job above.
+  package:
+    name: linux build · package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check (non-macOS platform fallback)
+        run: cargo clippy --all-targets --all-features
+
+      - name: Test
+        run: cargo test --all-features
+
+      # Verifies the manifest metadata and builds the packaged tree, so a
+      # release tag never trips over something `cargo publish` rejects.
+      - name: Package for crates.io
+        run: cargo publish --dry-run --locked
