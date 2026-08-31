@@ -45,6 +45,23 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
     tokio::spawn(async move {
         let _ = tx.send(host_hop());
 
+        // Nothing can be measured without a platform module, and an unmeasured
+        // hop is unknown rather than broken. Probing anyway would grade every
+        // refusal as a network fault.
+        if let Some(reason) = platform::UNSUPPORTED_OS {
+            for mut hop in skeleton().hops {
+                if hop.id == HopId::Host {
+                    continue;
+                }
+                hop.status = Status::Skipped;
+                if hop.id == HopId::Link {
+                    hop.summary = Some(reason.into());
+                }
+                let _ = tx.send(hop);
+            }
+            return;
+        }
+
         let route = tokio::task::spawn_blocking(|| platform::current().route())
             .await
             .ok()
