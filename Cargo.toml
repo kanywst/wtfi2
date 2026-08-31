@@ -10,6 +10,9 @@ homepage = "https://github.com/kanywst/wtfi2"
 readme = "README.md"
 keywords = ["network", "wifi", "diagnostic", "tui", "macos"]
 categories = ["command-line-utilities"]
+# Keep the published crate to what a consumer actually builds. The CI and
+# release-pipeline scaffolding only matters in this repo.
+exclude = [".github/", "dist-workspace.toml"]
 
 [[bin]]
 name = "wtfi"
