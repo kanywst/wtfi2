@@ -32,20 +32,7 @@ pub struct Verdict {
 
 /// Derive a verdict from a (ideally complete) path.
 pub fn diagnose(path: &Path) -> Verdict {
-    // 0. No platform module: every hop is skipped, which would otherwise fall
-    //    all the way through to the clean bill of health below. Absence of
-    //    evidence is not health.
-    if let Some(reason) = crate::platform::UNSUPPORTED_OS {
-        return Verdict {
-            status: Status::Skipped,
-            headline: "Can't diagnose on this OS".into(),
-            cause: reason.into(),
-            fix: None,
-            confidence: Confidence::Certain,
-        };
-    }
-
-    // 1. Still probing — don't render a health claim from half the evidence.
+    // 0. Still probing — don't render a health claim from half the evidence.
     if path.hops.iter().any(|h| h.status == Status::Pending) {
         return Verdict {
             status: Status::Pending,
@@ -53,6 +40,26 @@ pub fn diagnose(path: &Path) -> Verdict {
             cause: "Probing each hop from your Wi-Fi link out to the internet.".into(),
             fix: None,
             confidence: Confidence::Guess,
+        };
+    }
+
+    // 1. Nothing was measured: every hop skipped. Absence of evidence is not
+    //    health, so this must not fall through to the clean bill below. The
+    //    reason, when there is one, is whatever the Link hop recorded.
+    if path
+        .hops
+        .iter()
+        .all(|h| h.id == HopId::Host || h.status == Status::Skipped)
+    {
+        return Verdict {
+            status: Status::Skipped,
+            headline: "Nothing was measured".into(),
+            cause: path
+                .get(HopId::Link)
+                .and_then(|h| h.summary.clone())
+                .unwrap_or_else(|| "No hop reported a result.".into()),
+            fix: None,
+            confidence: Confidence::Certain,
         };
     }
 
@@ -305,17 +312,29 @@ mod tests {
         h
     }
 
-    /// A path of skipped hops has no break and no warning, so without the
-    /// platform guard it reaches the clean bill of health and calls an OS wtfi
-    /// cannot even probe "fully online". No-op on a supported OS.
+    /// A chain where nothing ran has no break and no warning, so without the
+    /// guard it reaches the clean bill of health and calls a connection that
+    /// was never measured "fully online".
     #[test]
-    fn an_unsupported_os_is_never_called_healthy() {
-        if crate::platform::UNSUPPORTED_OS.is_none() {
-            return;
-        }
-        let v = diagnose(&Path::default());
+    fn a_chain_that_never_ran_is_not_called_healthy() {
+        let mut link = hop(HopId::Link, Layer::Link, Status::Skipped);
+        link.summary = Some("no platform module for this OS".into());
+        let p = Path {
+            hops: vec![
+                hop(HopId::Host, Layer::Link, Status::Ok),
+                link,
+                hop(HopId::Gateway, Layer::Network, Status::Skipped),
+                hop(HopId::Wan, Layer::Internet, Status::Skipped),
+                hop(HopId::Dns, Layer::Application, Status::Skipped),
+                hop(HopId::Captive, Layer::Application, Status::Skipped),
+            ],
+        };
+        let v = diagnose(&p);
         assert_eq!(v.status, Status::Skipped);
         assert_ne!(v.headline, "You're fully online");
+        // The reason travels from the hop that recorded it, not from a second
+        // copy of the platform check living in here.
+        assert!(v.cause.contains("no platform module"));
     }
 
     #[test]
