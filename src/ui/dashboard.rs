@@ -276,15 +276,22 @@ fn connector(f: &mut Frame, area: Rect, sev: Status, is_break: bool) {
     f.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
-fn verdict(f: &mut Frame, area: Rect, app: &App) {
-    let v = &app.verdict;
-    let c = color(v.status);
-    let tag = match v.status {
+/// Pill label for a verdict. Exhaustive on purpose: a catch-all arm is how
+/// `Skipped` ended up announcing a break that was never observed.
+fn verdict_tag(s: Status) -> &'static str {
+    match s {
         Status::Ok => " ALL GOOD ",
         Status::Warn => " DEGRADED ",
         Status::Pending => " SCANNING ",
-        _ => " BROKEN ",
-    };
+        Status::Skipped => " UNKNOWN ",
+        Status::Fail => " BROKEN ",
+    }
+}
+
+fn verdict(f: &mut Frame, area: Rect, app: &App) {
+    let v = &app.verdict;
+    let c = color(v.status);
+    let tag = verdict_tag(v.status);
     let mut lines = vec![Line::from(vec![
         Span::styled(tag, Style::new().bg(c).fg(Color::Black).bold()),
         Span::raw(" "),
@@ -477,6 +484,24 @@ mod tests {
         gw.loss_pct = loss_pct;
         app.path.upsert(gw);
         app
+    }
+
+    /// Only a hop that actually failed may be announced as a break.
+    #[test]
+    fn only_a_real_failure_is_labelled_broken() {
+        for s in [
+            Status::Ok,
+            Status::Warn,
+            Status::Pending,
+            Status::Skipped,
+            Status::Fail,
+        ] {
+            assert_eq!(
+                verdict_tag(s).trim() == "BROKEN",
+                s == Status::Fail,
+                "{s:?} is mislabelled"
+            );
+        }
     }
 
     #[test]
