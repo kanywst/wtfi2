@@ -84,6 +84,8 @@ fn verdict_block(v: &Verdict, p: &Palette) -> String {
     let tag = match v.status {
         Status::Ok => "  ALL GOOD ",
         Status::Warn => "  DEGRADED ",
+        // Nothing measured is not the same as measured-and-broken.
+        Status::Skipped => "  UNKNOWN  ",
         _ => "  BROKEN   ",
     };
     s.push_str(&p.status(v.status, &p.bold(tag)));
