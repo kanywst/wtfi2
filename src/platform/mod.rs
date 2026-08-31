@@ -16,12 +16,8 @@ mod corewlan;
 #[cfg(not(target_os = "macos"))]
 pub mod unsupported;
 
-/// Why wtfi refuses to probe on this OS, or `None` when the OS is supported.
-///
-/// macOS is the only platform with a real [`Platform`] impl today; a Linux
-/// module (`nl80211`) is on the roadmap. Callers check this *before* probing so
-/// an unsupported OS gets one honest line, rather than a fully red diagram that
-/// blames the user's network for a missing platform module.
+/// Why wtfi refuses to probe on this OS, or `None` when it is supported.
+/// macOS is the only real [`Platform`] impl today.
 pub const UNSUPPORTED_OS: Option<&str> = if cfg!(target_os = "macos") {
     None
 } else {
@@ -110,9 +106,8 @@ pub enum PlatformError {
     Parse(String),
     /// No default route / no active network.
     NoNetwork,
-    /// This OS has no platform module, so the fact can't be gathered at all.
-    /// Distinct from [`PlatformError::NoNetwork`]: the network may well be
-    /// fine, wtfi just can't see it here.
+    /// No platform module for this OS. Distinct from `NoNetwork`: the network
+    /// may well be fine, wtfi just can't see it here.
     Unsupported,
 }
 
