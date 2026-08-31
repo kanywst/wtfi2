@@ -84,9 +84,11 @@ fn verdict_block(v: &Verdict, p: &Palette) -> String {
     let tag = match v.status {
         Status::Ok => "  ALL GOOD ",
         Status::Warn => "  DEGRADED ",
-        // Nothing measured is not the same as measured-and-broken.
+        // Nothing measured is not the same as measured-and-broken. Exhaustive
+        // on purpose: a catch-all arm is how Skipped ended up here as BROKEN.
         Status::Skipped => "  UNKNOWN  ",
-        _ => "  BROKEN   ",
+        Status::Pending => "  SCANNING ",
+        Status::Fail => "  BROKEN   ",
     };
     s.push_str(&p.status(v.status, &p.bold(tag)));
     s.push_str(&p.bold(&format!("{} {}\n", v.status.glyph(), v.headline)));
