@@ -93,6 +93,7 @@ The exit code reflects health, so scripts can branch on it:
 | 0    | All good             |
 | 1    | Degraded (warnings)  |
 | 2    | Broken               |
+| 3    | Unsupported platform |
 
 ## How it works
 
