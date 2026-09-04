@@ -12,6 +12,14 @@ installers = ["shell", "homebrew"]
 # Publish the Homebrew formula to this tap on release
 tap = "kanywst/homebrew-tap"
 publish-jobs = ["homebrew"]
+# The tap PAT is read from HOMEBREW_TAP_TOKEN, which is dist's own name for it:
+# the generated publish job hardcodes it and there is no option here to change
+# it. The account's other tap publishers — spiffe-compliance-checker,
+# mcp-opa-authz, wimsey — call the same PAT HOMEBREW_TAP_GITHUB_TOKEN because
+# they write the job themselves. Do not "fix" that inconsistency here. Renaming
+# means hand-patching a generated line against the generator, and a later
+# regeneration puts HOMEBREW_TAP_TOKEN back, at which point releases fail
+# looking for a secret that was renamed away.
 # We hand-patch release.yml (idempotent formula commit, and a fix for dist's
 # `steps.cargo-cyclonedx.output.paths` typo), so opt out of dist's "CI is up to
 # date" check for that file. The two supply-chain options below are therefore
