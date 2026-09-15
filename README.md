@@ -151,7 +151,7 @@ On any other OS there is no platform module yet, so `wtfi` refuses up front — 
 - Real SSID/BSSID via Location authorization in a signed `.app` bundle
   (CoreWLAN telemetry already lands instantly today).
 - Linux platform module (`nl80211` / `netlink`).
-- Historical trends and export.
+- Trends that survive a restart. Export already ships as `wtfi --json`, and `wtfi -w` keeps an in-session sparkline; what is missing is persisting sweeps to disk so yesterday's dead zone is still there tomorrow.
 
 ## License
 
