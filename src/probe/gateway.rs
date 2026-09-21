@@ -70,6 +70,11 @@ pub async fn probe(route: &RouteInfo) -> Hop {
     let q = if icmp.avg_ms().is_some() {
         icmp
     } else {
+        // Whether the fallback actually ran. It declines outright for a
+        // link-local IPv6 gateway, and the summary below must not then claim
+        // handshakes that were never attempted — reporting a measurement that
+        // did not happen is the bug this whole probe exists to avoid.
+        let tcp_attempted = route.gateway_zone.is_none();
         match tcp_fallback(gw, route.gateway_zone.as_deref(), &TCP_PORTS).await {
             Some((port, tcp)) => {
                 // The router is alive; ICMP is simply filtered. Grade it on
@@ -87,21 +92,23 @@ pub async fn probe(route: &RouteInfo) -> Hop {
                 // measured anything, so we cannot claim the router is down.
                 hop.status = Status::Warn;
                 hop.fault = Some(Fault::Unobserved);
-                hop.summary = Some(
-                    "Couldn't probe the gateway over ICMP or TCP — its state is unknown".into(),
-                );
+                hop.summary = Some(if tcp_attempted {
+                    "Couldn't probe the gateway over ICMP or TCP — its state is unknown".into()
+                } else {
+                    "Couldn't probe the gateway over ICMP, and a link-local gateway can't be \
+                     cross-checked over TCP — its state is unknown"
+                        .to_string()
+                });
                 return hop;
             }
             None => {
-                // Echoes went out and none came back, and no port answered
-                // either. Now the silence means something.
+                // Echoes went out and none came back. Say what was actually
+                // tried: on a link-local IPv6 gateway that is ICMP alone,
+                // because the TCP fallback can't reach `fe80::` without a
+                // scope id and declined rather than guessing.
                 hop.fail(
                     Fault::GatewaySilent,
-                    format!(
-                        "Router isn't answering — {} pings and TCP :{} all went unanswered",
-                        icmp.sent,
-                        TCP_PORTS.map(|p| p.to_string()).join("/:")
-                    ),
+                    silent_summary(icmp.sent, tcp_attempted),
                 );
                 apply_quality(&mut hop, &icmp, JITTER_WARN_MS);
                 return hop;
@@ -132,6 +139,24 @@ pub async fn probe(route: &RouteInfo) -> Hop {
         (None, _) => format!("Router reachable in {avg:.0} ms"),
     });
     hop
+}
+
+/// What a silent router's summary may claim, given what was actually tried.
+///
+/// Pure so the claim can be tested without a router to stay silent at: the bug
+/// this guards is a summary asserting three TCP handshakes on a link-local
+/// gateway where the fallback declined to send any.
+fn silent_summary(pings: u32, tcp_attempted: bool) -> String {
+    if tcp_attempted {
+        format!(
+            "Router isn't answering — {pings} pings and TCP :{} all went unanswered",
+            TCP_PORTS.map(|p| p.to_string()).join("/:")
+        )
+    } else {
+        format!(
+            "Router isn't answering — {pings} pings went unanswered, and a link-local gateway can't be reached over TCP to cross-check"
+        )
+    }
 }
 
 /// Ask the router over TCP when it won't answer ICMP.
@@ -211,6 +236,25 @@ mod tests {
     async fn a_link_local_gateway_declines_the_tcp_fallback() {
         let gw: IpAddr = "fe80::1".parse().unwrap();
         assert!(tcp_fallback(gw, Some("en0"), &TCP_PORTS).await.is_none());
+    }
+
+    /// The summary must only claim what was tried. `tcp_fallback` declines
+    /// outright for a link-local IPv6 gateway — the normal shape of a SLAAC
+    /// router, and exactly the ICMP-dropping case this fallback targets — so
+    /// the old wording reported three TCP handshakes where none were sent.
+    #[test]
+    fn a_link_local_gateway_is_not_claimed_to_have_been_tried_over_tcp() {
+        let summary = silent_summary(5, false);
+        assert!(!summary.contains("443"), "got: {summary}");
+        assert!(summary.contains("link-local"), "got: {summary}");
+        assert!(summary.contains("5 pings"), "got: {summary}");
+    }
+
+    #[test]
+    fn a_routable_gateway_reports_both_transports() {
+        let summary = silent_summary(5, true);
+        assert!(summary.contains("443"), "got: {summary}");
+        assert!(summary.contains("5 pings"), "got: {summary}");
     }
 
     /// Port order is the order a home gateway is most likely to answer on; if
