@@ -21,6 +21,20 @@ pub struct Cli {
     /// Disable ANSI color in the text report.
     #[arg(long = "no-color")]
     pub no_color: bool,
+
+    /// Give up on the whole sweep after this many seconds and report what
+    /// landed. Individual probes are bounded well below this already; raise it
+    /// only on a network so slow that whole probes are timing out.
+    #[arg(long = "timeout", value_name = "SECS", default_value_t = 20)]
+    pub timeout_secs: u64,
+}
+
+impl Cli {
+    /// The sweep ceiling, floored at one second so `--timeout 0` can't turn
+    /// every run into an instant "nothing was measured".
+    pub fn sweep_deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs.max(1))
+    }
 }
 
 impl Cli {

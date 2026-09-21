@@ -91,6 +91,7 @@ wtfi -w           # live dashboard (q to quit, r to re-probe now)
 wtfi -v           # verbose: every metric for every hop
 wtfi --json       # machine-readable output for scripts/CI
 wtfi --no-color   # plain text, no ANSI
+wtfi --timeout 5  # give up on the sweep sooner and report what landed
 ```
 
 The exit code reflects health, so scripts can branch on it:

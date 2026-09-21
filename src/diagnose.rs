@@ -251,6 +251,25 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
         .get(id)
         .and_then(|h| h.summary.clone())
         .unwrap_or_default();
+
+    // A hop we failed to measure is unknown, not degraded. Falling through to
+    // the arms below would dress a wedged probe up as a diagnosis — "DNS is
+    // slow" for a resolver that was never successfully timed.
+    if path.get(id).and_then(|h| h.fault) == Some(Fault::Unobserved) {
+        return Verdict {
+            status: Status::Warn,
+            headline: "Part of the path couldn't be measured".into(),
+            cause: format!(
+                "{summary}. Everything else reported, so this hop is unknown rather than unhealthy — don't read it either way."
+            ),
+            fix: Some(
+                "Re-run wtfi. If it keeps timing out, the OS tool that probe depends on is wedged."
+                    .into(),
+            ),
+            confidence: Confidence::Certain,
+        };
+    }
+
     let (headline, cause, fix) = match id {
         HopId::Link => {
             // A marginal signal is only half the story; say what it's already
@@ -459,6 +478,32 @@ mod tests {
             ],
         };
         assert!(diagnose(&p).headline.contains("ISP"));
+    }
+
+    /// A probe that overran its deadline observed nothing. Reporting that as
+    /// "DNS is slow" would be a diagnosis invented out of a missing
+    /// measurement — the exact failure mode `Fault` exists to prevent.
+    #[test]
+    fn an_unmeasured_hop_is_not_reported_as_a_degraded_one() {
+        let mut dns = hop(HopId::Dns, Layer::Application, Status::Warn);
+        dns.fault = Some(Fault::Unobserved);
+        dns.summary = Some("The DNS probe didn't finish".into());
+        let p = Path {
+            hops: vec![
+                hop(HopId::Link, Layer::Link, Status::Ok),
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                hop(HopId::Wan, Layer::Internet, Status::Ok),
+                dns,
+            ],
+        };
+        let v = diagnose(&p);
+        assert_eq!(v.status, Status::Warn);
+        assert!(
+            !v.headline.contains("slow"),
+            "an unmeasured resolver was never timed, so don't call it slow: {}",
+            v.headline
+        );
+        assert!(v.cause.contains("unknown rather than unhealthy"));
     }
 
     #[test]

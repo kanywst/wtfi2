@@ -73,10 +73,25 @@ fn failed(label: &'static str) -> Bench {
     }
 }
 
+/// Ceiling for a single resolver, applied to *every* bench.
+///
+/// It has to be one number. Held to hickory's defaults (5 s over 2 attempts,
+/// per configured nameserver) the system bench alone can run past ten seconds
+/// — long enough to outlast every other probe in the sweep and to break the
+/// live dashboard's re-probe cadence during exactly the DNS outage it is meant
+/// to be showing you. And comparing a resolver measured under one deadline
+/// against two measured under a tighter one is not a benchmark.
+const QUERY_WAIT: Duration = Duration::from_secs(3);
+/// One shot per resolver: a retry would double the ceiling, and "it didn't
+/// answer the first time" is already the signal worth reporting.
+const QUERY_ATTEMPTS: usize = 1;
+
 async fn bench_system() -> Bench {
-    let Ok(builder) = TokioResolver::builder_tokio() else {
+    let Ok(mut builder) = TokioResolver::builder_tokio() else {
         return failed("System");
     };
+    builder.options_mut().timeout = QUERY_WAIT;
+    builder.options_mut().attempts = QUERY_ATTEMPTS;
     match builder.build() {
         Ok(resolver) => time_lookup("System", resolver).await,
         Err(_) => failed("System"),
@@ -85,8 +100,8 @@ async fn bench_system() -> Bench {
 
 async fn bench_upstream(label: &'static str, config: ResolverConfig) -> Bench {
     let mut builder = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
-    builder.options_mut().timeout = Duration::from_secs(3);
-    builder.options_mut().attempts = 1;
+    builder.options_mut().timeout = QUERY_WAIT;
+    builder.options_mut().attempts = QUERY_ATTEMPTS;
     match builder.build() {
         Ok(resolver) => time_lookup(label, resolver).await,
         Err(_) => failed(label),

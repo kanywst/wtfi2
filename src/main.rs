@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
         return ui::run().await;
     }
 
-    let path = engine::run_once().await;
+    let path = engine::run_once_within(cli.sweep_deadline()).await;
     let verdict = diagnose::diagnose(&path);
 
     if cli.json {
