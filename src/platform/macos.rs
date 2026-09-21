@@ -87,6 +87,11 @@ impl Platform for MacOs {
             Err(v4_err) => match run("route", &["-n", "get", "-inet6", "default"])
                 .and_then(|t| parse_route(&t))
             {
+                // Deliberately identical whether the IPv4 lookup found nothing
+                // or could not be run: either way an IPv6 default route is a
+                // route, and the host can reach the network. Losing the detail
+                // of *why* v4 produced nothing costs nothing here, because it
+                // changes no conclusion downstream.
                 Ok(i) => i,
                 // Report the IPv4 failure, not the IPv6 one: if `route` could
                 // not run at all, that has to reach the caller as "we could

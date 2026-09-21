@@ -11,7 +11,26 @@ use crate::platform::{Platform, RouteInfo};
 
 pub fn probe(platform: &impl Platform, route: &RouteInfo) -> Hop {
     let mut hop = Hop::new(HopId::Vpn, Layer::Network, "VPN");
-    let info = platform.vpn().unwrap_or_default();
+
+    // A tunnel we couldn't read is not a tunnel that isn't carrying traffic.
+    // `unwrap_or_default()` turned a failed read into `active: false`, which
+    // fell into the unaddressed-tunnel branch below and reported "Tunnel
+    // interface is up but has no address" — a confident claim about a
+    // measurement that never happened. Worse, `iface` falls back to the route
+    // probe's own reading, so the hop could still carry a `Mode: full-tunnel`
+    // metric, and `diagnose::vpn_is_full_tunnel` keys off that metric alone —
+    // turning a real WAN outage into "Internet is down — through your VPN" at
+    // `Confidence::Likely`.
+    let info = match platform.vpn() {
+        Ok(info) => info,
+        Err(e) => {
+            hop.status = Status::Warn;
+            hop.fault = Some(Fault::Unobserved);
+            hop.subtitle = route.tunnel_iface.clone();
+            hop.summary = Some(format!("Couldn't read the tunnel's state — {e}"));
+            return hop;
+        }
+    };
 
     // Prefer the enriched interface; fall back to what the route probe saw in
     // case the tunnel changed between the two reads.
@@ -102,6 +121,39 @@ mod tests {
             .find(|m| m.label == "Mode")
             .map(|m| m.value.as_str())
             .unwrap_or("")
+    }
+
+    struct BlindPlatform;
+    impl Platform for BlindPlatform {
+        fn route(&self) -> Result<RouteInfo, PlatformError> {
+            Ok(RouteInfo::default())
+        }
+        fn link(&self, _: &str) -> Result<LinkInfo, PlatformError> {
+            Ok(LinkInfo::default())
+        }
+        fn resolvers(&self) -> Result<ResolverInfo, PlatformError> {
+            Ok(ResolverInfo::default())
+        }
+        fn vpn(&self) -> Result<VpnInfo, PlatformError> {
+            Err(PlatformError::Command("scutil: refused".into()))
+        }
+    }
+
+    /// A tunnel read that failed must not be reported as a tunnel that isn't
+    /// carrying traffic — and must not leave a `Mode` metric behind, since
+    /// `diagnose::vpn_is_full_tunnel` keys off that metric alone and would
+    /// turn a real WAN outage into "Internet is down — through your VPN".
+    #[test]
+    fn an_unreadable_tunnel_is_unknown_not_down() {
+        let hop = probe(&BlindPlatform, &route_on("en0"));
+        assert_eq!(hop.status, Status::Warn);
+        assert_eq!(hop.fault, Some(Fault::Unobserved));
+        assert_ne!(hop.fault, Some(Fault::TunnelDown));
+        assert!(
+            !hop.metrics.iter().any(|m| m.label == "Mode"),
+            "a failed read must not claim a tunnel mode: {:?}",
+            hop.metrics
+        );
     }
 
     #[test]
