@@ -201,6 +201,11 @@ pub async fn probe() -> Hop {
         }
     }
 
+    hop.evidence = Some(evidence(
+        v4.reached.len() + v6.reached.len(),
+        egress.verified,
+    ));
+
     match (v4.any_up(), v6.any_up()) {
         (true, dual_stack) => {
             // Reachability is settled; the open questions are quality, whether
@@ -390,6 +395,25 @@ fn block_status(blocked: &[&str]) -> Status {
 /// point of the message is *how many independent networks* stayed silent, so
 /// listing the same operator twice for its two address families would inflate
 /// exactly the number that makes the claim credible.
+/// What this probe actually did, for the report's evidence line.
+///
+/// The verified request has to be described by its outcome, not asserted.
+/// `handshake_only` is *defined* by `!verified`, so a fixed "plus one verified
+/// HTTPS request" was guaranteed to contradict the cause printed beside it
+/// whenever `HandshakeOnly` fired — in exactly the case the evidence matters
+/// most.
+fn evidence(addresses: usize, verified: bool) -> String {
+    format!(
+        "{addresses} handshakes to :{PORT} across {} independent networks, and one HTTPS request that {}",
+        operator_count(),
+        if verified {
+            "completed"
+        } else {
+            "did not complete"
+        }
+    )
+}
+
 /// How many distinct operators back the targets. The outage message's whole
 /// weight is "N independent networks went quiet", so this must count networks
 /// and not addresses — two families of one operator are one network.
@@ -720,6 +744,25 @@ mod tests {
             MIN_TRACE < TRACE_BUDGET,
             "the first attempt must get a turn"
         );
+    }
+
+    /// `handshake_only` is *defined* by `!egress.verified`, so an evidence
+    /// line claiming "one verified HTTPS request" was guaranteed to contradict
+    /// the cause printed beside it whenever `HandshakeOnly` fired — in exactly
+    /// the case the evidence matters most.
+    #[test]
+    fn the_evidence_cannot_claim_a_request_that_did_not_complete() {
+        // The state that fires HandshakeOnly is exactly the state below.
+        let v6 = family(&[("Cloudflare v6", None), ("Google v6", None)]);
+        assert!(handshake_only(&all_up(), &v6, &egress(false)));
+
+        let unverified = evidence(5, false);
+        assert!(unverified.contains("did not complete"), "got: {unverified}");
+        assert!(
+            !unverified.contains("verified"),
+            "must not read as a completed request: {unverified}"
+        );
+        assert!(evidence(5, true).contains("completed"));
     }
 
     #[test]

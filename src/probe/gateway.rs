@@ -64,6 +64,11 @@ pub async fn probe(route: &RouteInfo) -> Hop {
     };
 
     let icmp = ping_burst(gw, route.gateway_zone.as_deref(), SAMPLES, INTERVAL, BUDGET).await;
+    hop.evidence = Some(format!(
+        "{} ICMP echoes to {gw}, {}ms apart",
+        icmp.sent,
+        INTERVAL.as_millis()
+    ));
 
     // ICMP said nothing — either every echo was dropped, or `ping` never ran.
     // Ask again over TCP before drawing any conclusion from the silence.
@@ -91,6 +96,10 @@ pub async fn probe(route: &RouteInfo) -> Hop {
                     .push(Metric::new("ICMP", icmp_note).with_status(Status::Warn));
                 hop.metrics
                     .push(Metric::new("Probed", format!("TCP :{port}")));
+                hop.evidence = Some(format!(
+                    "{} ICMP echoes to {gw} (all unanswered), then {} TCP handshakes to :{port}",
+                    icmp.sent, tcp.sent
+                ));
                 tcp
             }
             _ if icmp.is_empty() => {
@@ -98,6 +107,11 @@ pub async fn probe(route: &RouteInfo) -> Hop {
                 // measured anything, so we cannot claim the router is down.
                 hop.status = Status::Warn;
                 hop.fault = Some(Fault::Unobserved);
+                hop.evidence = Some(if tcp_attempted {
+                    format!("ICMP to {gw} never ran, and no TCP handshake completed either")
+                } else {
+                    format!("ICMP to {gw} never ran; a link-local gateway can't be tried over TCP")
+                });
                 hop.summary = Some(if tcp_attempted {
                     "Couldn't probe the gateway over ICMP or TCP — its state is unknown".into()
                 } else {
@@ -112,6 +126,18 @@ pub async fn probe(route: &RouteInfo) -> Hop {
                 // tried: on a link-local IPv6 gateway that is ICMP alone,
                 // because the TCP fallback can't reach `fe80::` without a
                 // scope id and declined rather than guessing.
+                hop.evidence = Some(if tcp_attempted {
+                    format!(
+                        "{} ICMP echoes to {gw}, then TCP :{}",
+                        icmp.sent,
+                        TCP_PORTS.map(|p| p.to_string()).join("/:")
+                    )
+                } else {
+                    format!(
+                        "{} ICMP echoes to {gw}; no TCP cross-check is possible on a link-local gateway",
+                        icmp.sent
+                    )
+                });
                 hop.fail(
                     Fault::GatewaySilent,
                     silent_summary(icmp.sent, tcp_attempted),

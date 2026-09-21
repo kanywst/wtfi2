@@ -96,6 +96,12 @@ pub async fn probe(nameservers: &[IpAddr]) -> Hop {
         hop.metrics.push(Metric::new(b.label, val).with_status(st));
     }
 
+    hop.evidence = Some(format!(
+        "{QUERY} asked of 3 resolvers under a {}s deadline ({} answered), plus one nonexistent-name check",
+        QUERY_WAIT.as_secs(),
+        [&system, &cf, &google].iter().filter(|b| b.ok).count()
+    ));
+
     let hijacked = detect_hijack(&system, &[&cf, &google], synthesised);
     grade(&mut hop, &system, &cf, &google, hijacked);
     hop
