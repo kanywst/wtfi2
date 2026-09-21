@@ -95,12 +95,15 @@ wtfi --no-color   # plain text, no ANSI
 
 The exit code reflects health, so scripts can branch on it:
 
-| Code | Meaning              |
-| ---- | -------------------- |
-| 0    | All good             |
-| 1    | Degraded (warnings)  |
-| 2    | Broken               |
-| 3    | Unsupported platform |
+| Code | Meaning                   |
+| ---- | ------------------------- |
+| 0    | All good                  |
+| 1    | Degraded (warnings)       |
+| 2    | Broken                    |
+| 3    | Unsupported platform      |
+| 4    | Nothing could be measured |
+
+Code 4 is deliberately distinct from 2: it means the OS tools wtfi reads the network through wouldn't run, so nothing was observed either way. A script should retry on 4 rather than treat it as an outage.
 
 ## How it works
 

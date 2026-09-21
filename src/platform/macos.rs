@@ -29,25 +29,70 @@ impl Default for MacOs {
     }
 }
 
+/// Run a read-only system tool and return its stdout.
+///
+/// A tool that *refused to run* says nothing about the network, and reporting
+/// that refusal as an outage is how wtfi ends up blaming a working connection
+/// for its own blindness. So a non-zero exit with nothing on stdout is an
+/// error here, carrying what the tool complained about.
+///
+/// A non-zero exit *with* output is still a success: several of these tools
+/// report a perfectly good answer and then exit non-zero (`route` does it for
+/// a lookup that found nothing), and that answer is one we want.
 fn run(cmd: &str, args: &[&str]) -> Result<String, PlatformError> {
     let out = Command::new(cmd)
         .args(args)
         .output()
         .map_err(|e| PlatformError::Command(format!("{cmd}: {e}")))?;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !out.status.success() && stdout.trim().is_empty() {
+        return Err(classify_failure(cmd, &String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(stdout)
+}
+
+/// Tell "the tool ran and found nothing" apart from "the tool never got going".
+///
+/// Only the first is a fact about the network. The classification is
+/// deliberately narrow: an unrecognised failure becomes [`PlatformError::Command`]
+/// — "we could not see" — because that reads as unknown, while a wrong
+/// [`PlatformError::NoNetwork`] reads as a confident, false outage.
+fn classify_failure(cmd: &str, stderr: &str) -> PlatformError {
+    let low = stderr.to_lowercase();
+    // `route -n get default` with no matching route: it queried the routing
+    // table successfully and the table had nothing.
+    if low.contains("not in table") || low.contains("no such process") {
+        return PlatformError::NoNetwork;
+    }
+    let detail = stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("no output");
+    // These tools already prefix their own name onto their complaints; saying
+    // it twice ("route: route: socket: …") just reads like a bug.
+    let detail = detail
+        .strip_prefix(&format!("{cmd}: "))
+        .unwrap_or(detail)
+        .trim();
+    PlatformError::Command(format!("{cmd}: {detail}"))
 }
 
 impl Platform for MacOs {
     fn route(&self) -> Result<RouteInfo, PlatformError> {
-        let text = run("route", &["-n", "get", "default"])?;
-        let mut info = match parse_route(&text) {
+        let mut info = match run("route", &["-n", "get", "default"]).and_then(|t| parse_route(&t)) {
             Ok(i) => i,
             // No IPv4 default route — fall back to the IPv6 table so an
             // IPv6-only network isn't reported as fully offline.
-            Err(_) => {
-                let v6 = run("route", &["-n", "get", "-inet6", "default"])?;
-                parse_route(&v6)?
-            }
+            Err(v4_err) => match run("route", &["-n", "get", "-inet6", "default"])
+                .and_then(|t| parse_route(&t))
+            {
+                Ok(i) => i,
+                // Report the IPv4 failure, not the IPv6 one: if `route` could
+                // not run at all, that has to reach the caller as "we could
+                // not look" rather than being laundered into "you are offline".
+                Err(_) => return Err(v4_err),
+            },
         };
         if let Ok(tun) = run("scutil", &["--nwi"])
             && let Some(iface) = detect_tunnel(&tun)
@@ -393,6 +438,53 @@ mod tests {
 
     const DNS: &str = "  nameserver[0] : 192.168.0.1
   nameserver[0] : 192.168.0.1";
+
+    /// The bug this guards: a tool that could not run had its empty stdout
+    /// parsed as "no interface", which became `NoNetwork`, which became the
+    /// verdict "your Wi-Fi link is down" on a machine whose `en0` was up the
+    /// whole time. A refusal must read as unknown, never as an outage.
+    #[test]
+    fn a_tool_that_could_not_run_is_unknown_not_an_outage() {
+        let e = classify_failure("route", "route: socket: Operation not permitted\n");
+        assert!(
+            matches!(e, PlatformError::Command(_)),
+            "a denied socket is a failure to observe, got {e:?}"
+        );
+        assert_eq!(
+            e.to_string(),
+            "command failed: route: socket: Operation not permitted",
+            "the tool's own name prefix must not be repeated"
+        );
+    }
+
+    #[test]
+    fn a_lookup_that_found_nothing_is_a_network_fact() {
+        // `route` queried the table successfully; the table was empty. That is
+        // genuinely "you have no route", not "we couldn't look".
+        assert!(matches!(
+            classify_failure("route", "route: writing to routing socket: not in table\n"),
+            PlatformError::NoNetwork
+        ));
+    }
+
+    #[test]
+    fn an_unrecognised_failure_stays_unknown() {
+        // Conservative on purpose: a wrong `Command` reads as "we couldn't
+        // tell", while a wrong `NoNetwork` reads as a confident, false outage.
+        assert!(matches!(
+            classify_failure("scutil", "scutil: something entirely new\n"),
+            PlatformError::Command(_)
+        ));
+    }
+
+    #[test]
+    fn a_failure_with_no_stderr_still_names_the_command() {
+        assert!(
+            classify_failure("system_profiler", "")
+                .to_string()
+                .contains("system_profiler")
+        );
+    }
 
     #[test]
     fn route_parses_gateway_iface_mtu() {
