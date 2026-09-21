@@ -256,12 +256,27 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
     // the arms below would dress a wedged probe up as a diagnosis — "DNS is
     // slow" for a resolver that was never successfully timed.
     if path.get(id).and_then(|h| h.fault) == Some(Fault::Unobserved) {
+        // Count them rather than asserting everything else reported. A
+        // sweep-level deadline takes several hops down at once, and only the
+        // earliest one reaches this arm — so claiming the rest checked in
+        // would contradict the detail panel printed right underneath.
+        let unmeasured: Vec<&str> = path
+            .hops
+            .iter()
+            .filter(|h| h.fault == Some(Fault::Unobserved))
+            .map(|h| h.title.as_str())
+            .collect();
+        let scope = match unmeasured.len() {
+            0 | 1 => "The rest of the path reported, so this hop is unknown rather than unhealthy — don't read it either way.".to_string(),
+            n => format!(
+                "{n} hops went unmeasured ({}), so this is a gap in the evidence rather than a finding about your network.",
+                unmeasured.join(", ")
+            ),
+        };
         return Verdict {
             status: Status::Warn,
             headline: "Part of the path couldn't be measured".into(),
-            cause: format!(
-                "{summary}. Everything else reported, so this hop is unknown rather than unhealthy — don't read it either way."
-            ),
+            cause: format!("{summary}. {scope}"),
             fix: Some(
                 "Re-run wtfi. If it keeps timing out, the OS tool that probe depends on is wedged."
                     .into(),
@@ -504,6 +519,49 @@ mod tests {
             v.headline
         );
         assert!(v.cause.contains("unknown rather than unhealthy"));
+    }
+
+    /// A sweep-level deadline takes several hops down at once, but only the
+    /// earliest reaches `explain_warn`. Claiming "the rest reported" would put
+    /// a false statement in the headline, contradicting the detail panel
+    /// printed right underneath it.
+    #[test]
+    fn several_unmeasured_hops_are_counted_not_waved_away() {
+        let mut hops = Vec::new();
+        for id in [HopId::Link, HopId::Gateway, HopId::Wan] {
+            let mut h = hop(id, Layer::Internet, Status::Warn);
+            h.fault = Some(Fault::Unobserved);
+            h.summary = Some("The sweep ended before this hop reported".into());
+            hops.push(h);
+        }
+        let v = diagnose(&Path { hops });
+        assert!(
+            v.cause.contains("3 hops went unmeasured"),
+            "got: {}",
+            v.cause
+        );
+        assert!(
+            !v.cause.contains("rest of the path reported"),
+            "must not claim hops reported when they did not: {}",
+            v.cause
+        );
+    }
+
+    /// With a single gap the original wording is accurate, and keeping it
+    /// avoids "1 hops went unmeasured".
+    #[test]
+    fn a_lone_unmeasured_hop_still_says_the_rest_reported() {
+        let mut dns = hop(HopId::Dns, Layer::Application, Status::Warn);
+        dns.fault = Some(Fault::Unobserved);
+        dns.summary = Some("The DNS probe didn't finish".into());
+        let p = Path {
+            hops: vec![
+                hop(HopId::Link, Layer::Link, Status::Ok),
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                dns,
+            ],
+        };
+        assert!(diagnose(&p).cause.contains("rest of the path reported"));
     }
 
     #[test]

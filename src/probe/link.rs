@@ -19,8 +19,14 @@ pub fn probe(platform: &dyn Platform, interface: &str) -> Hop {
         Err(PlatformError::NoNetwork) => {
             hop.fail(Fault::NotAssociated, "Not associated with any access point");
         }
+        // The telemetry tool refused to run, so the link's quality is unknown.
+        // Without the fault code this lands in the verdict engine's generic
+        // Link-warning arm, which reads it as a marginal signal and tells you
+        // to "move closer to the AP" — a specific, plausible, wrong fix for a
+        // hop that was never measured.
         Err(e) => {
             hop.status = Status::Warn;
+            hop.fault = Some(Fault::Unobserved);
             hop.summary = Some(format!("Couldn't read link telemetry: {e}"));
         }
     }
