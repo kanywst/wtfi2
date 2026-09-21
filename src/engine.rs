@@ -41,7 +41,7 @@ pub fn skeleton() -> Path {
 /// the scan channel open, which stalls the one-shot report and costs the live
 /// dashboard its re-probe cadence — during exactly the outage it is meant to
 /// be showing you.
-const PROBE_DEADLINE: Duration = Duration::from_secs(8);
+pub(crate) const PROBE_DEADLINE: Duration = Duration::from_secs(8);
 
 /// Ceiling on a whole sweep.
 ///

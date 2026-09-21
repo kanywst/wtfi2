@@ -275,6 +275,23 @@ fn parse_ping_sent(text: &str) -> Option<u32> {
         .ok()
 }
 
+/// RFC 6598 shared address space, `100.64.0.0/10`.
+///
+/// On your own LAN it means the ISP is sharing one public address between
+/// subscribers; as your *public* address it means the same thing seen from the
+/// other side. Either way inbound connections and port forwarding cannot work,
+/// and no amount of router configuration changes that — which is worth saying
+/// once rather than leaving the reader to rediscover it.
+pub fn is_cgnat(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            a == 100 && (64..=127).contains(&b)
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
 /// Measure the time to complete a TCP handshake to `addr`.
 pub async fn tcp_connect(addr: SocketAddr, wait: Duration) -> Probe {
     let start = Instant::now();
