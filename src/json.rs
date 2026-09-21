@@ -25,6 +25,7 @@ pub fn to_value(path: &Path, verdict: &Verdict) -> Value {
                 "title": h.title,
                 "subtitle": h.subtitle,
                 "status": status_str(h.status),
+                "fault": h.fault.map(|f| f.code()),
                 "summary": h.summary,
                 "latency_ms": h.latency_ms,
                 "loss_pct": h.loss_pct,

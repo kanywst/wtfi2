@@ -3,7 +3,7 @@
 //! Benchmarks the system resolver against Cloudflare and Google so we can tell
 //! "DNS is down" from "your ISP's resolver is slow" from "everything's fine".
 
-use crate::model::{Hop, HopId, Layer, Metric, Status};
+use crate::model::{Fault, Hop, HopId, Layer, Metric, Status};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{CLOUDFLARE, GOOGLE, ResolverConfig};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
@@ -43,7 +43,10 @@ pub async fn probe() -> Hop {
         (true, Some(ms)) => latency_status(ms),
         // System resolver is dead either way; the cf/google split only shapes
         // the cause text below.
-        _ => Status::Fail,
+        _ => {
+            hop.fault = Some(Fault::ResolverDead);
+            Status::Fail
+        }
     };
 
     hop.summary = Some(match (system.ok, system.latency) {

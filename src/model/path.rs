@@ -40,7 +40,51 @@ pub enum HopId {
     Wan,
     Dns,
     Captive,
-    Internet,
+}
+
+/// Why a hop is not healthy, as a code rather than as prose.
+///
+/// Probes record *what they observed*; the diagnosis engine turns that into a
+/// human verdict. Without a code the two ends drift, because the engine has to
+/// re-derive a cause the probe already knew — and then the verdict can
+/// contradict the evidence printed right under it. That is exactly how a
+/// missing default route came out as "your machine isn't associated with an
+/// access point", which is a different fault with a different fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// Not associated with any access point at all.
+    NotAssociated,
+    /// Associated, but there is no default route off this machine — typically
+    /// a DHCP lease that never arrived.
+    NoRoute,
+    /// No default gateway in the routing table.
+    NoGateway,
+    /// The gateway is in the routing table but answers nothing.
+    GatewaySilent,
+    /// No transport-layer path to the internet.
+    NoInternet,
+    /// The system resolver returned no answer.
+    ResolverDead,
+    /// A captive portal is intercepting traffic.
+    PortalIntercept,
+    /// A tunnel interface is up but is not carrying traffic.
+    TunnelDown,
+}
+
+impl Fault {
+    /// Stable lowercase code for `--json` consumers.
+    pub fn code(self) -> &'static str {
+        match self {
+            Fault::NotAssociated => "not_associated",
+            Fault::NoRoute => "no_route",
+            Fault::NoGateway => "no_gateway",
+            Fault::GatewaySilent => "gateway_silent",
+            Fault::NoInternet => "no_internet",
+            Fault::ResolverDead => "resolver_dead",
+            Fault::PortalIntercept => "portal_intercept",
+            Fault::TunnelDown => "tunnel_down",
+        }
+    }
 }
 
 /// A named key/value measurement attached to a hop.
@@ -77,6 +121,10 @@ pub struct Hop {
     /// Address / identity subtitle, e.g. `192.168.0.1`.
     pub subtitle: Option<String>,
     pub status: Status,
+    /// What went wrong, as a code the diagnosis engine can match on. `None`
+    /// when the hop is healthy, or when it is degraded in a way the hop's own
+    /// [`Hop::summary`] already describes well enough.
+    pub fault: Option<Fault>,
     /// One-line human summary shown in the detail panel.
     pub summary: Option<String>,
     /// Round-trip latency in milliseconds, when meaningful.
@@ -98,12 +146,22 @@ impl Hop {
             title: title.into(),
             subtitle: None,
             status: Status::Pending,
+            fault: None,
             summary: None,
             latency_ms: None,
             loss_pct: None,
             jitter_ms: None,
             metrics: Vec::new(),
         }
+    }
+
+    /// Mark the hop broken, with the reason recorded both as a code the
+    /// diagnosis engine matches on and as the prose the human reads. Going
+    /// through one call keeps the two from drifting apart.
+    pub fn fail(&mut self, fault: Fault, summary: impl Into<String>) {
+        self.status = Status::Fail;
+        self.fault = Some(fault);
+        self.summary = Some(summary.into());
     }
 }
 
@@ -213,6 +271,37 @@ mod tests {
         p.upsert(updated);
         assert_eq!(p.hops.len(), 1);
         assert_eq!(p.hops[0].status, Status::Ok);
+    }
+
+    /// `fail` is the only way a probe should break a hop, so the code and the
+    /// prose can never be set independently and drift apart.
+    #[test]
+    fn fail_records_the_code_alongside_the_prose() {
+        let mut h = Hop::new(HopId::Gateway, Layer::Network, "Gateway");
+        h.fail(Fault::GatewaySilent, "Router isn't answering");
+        assert_eq!(h.status, Status::Fail);
+        assert_eq!(h.fault, Some(Fault::GatewaySilent));
+        assert_eq!(h.summary.as_deref(), Some("Router isn't answering"));
+    }
+
+    #[test]
+    fn fault_codes_are_stable_and_distinct() {
+        // `--json` consumers branch on these strings.
+        let all = [
+            Fault::NotAssociated,
+            Fault::NoRoute,
+            Fault::NoGateway,
+            Fault::GatewaySilent,
+            Fault::NoInternet,
+            Fault::ResolverDead,
+            Fault::PortalIntercept,
+            Fault::TunnelDown,
+        ];
+        let mut codes: Vec<_> = all.iter().map(|f| f.code()).collect();
+        codes.sort_unstable();
+        let len = codes.len();
+        codes.dedup();
+        assert_eq!(codes.len(), len, "fault codes must be distinct");
     }
 
     #[test]

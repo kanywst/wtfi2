@@ -5,7 +5,7 @@
 //! dies, and turns the surrounding evidence into a single plain verdict plus a
 //! concrete fix — the thing you actually wanted to know.
 
-use crate::model::{HopId, Path, Status};
+use crate::model::{Fault, HopId, Path, Status};
 use crate::probe::net::LOSS_WARN_PCT;
 
 /// Confidence in a verdict, surfaced so the UI can hedge honestly.
@@ -113,14 +113,32 @@ fn vpn_is_full_tunnel(path: &Path) -> bool {
 }
 
 fn explain_break(path: &Path, id: HopId) -> Verdict {
-    let (headline, cause, fix, confidence) = match id {
-        HopId::Link => (
+    // The probe already decided *what* went wrong; this only turns the code
+    // into prose. Re-deriving the cause here is how the verdict used to
+    // contradict the evidence printed underneath it.
+    let fault = path.get(id).and_then(|h| h.fault);
+    let (headline, cause, fix, confidence) = match (id, fault) {
+        (HopId::Link, Some(Fault::NoRoute)) => (
+            "No route off this machine",
+            "The Wi-Fi link is up, but there's no default route — so nothing can leave this Mac. That is almost always a DHCP lease that never arrived, not a signal problem.".to_string(),
+            Some("Renew the DHCP lease (System Settings → Network → Details → TCP/IP → Renew DHCP Lease), or rejoin the network.".to_string()),
+            Confidence::Likely,
+        ),
+        (HopId::Link, _) => (
             "Wi-Fi link is down",
             "Your machine isn't associated with an access point. There's no L2 link to diagnose above.".to_string(),
             Some("Toggle Wi-Fi off/on, or pick a network in the Wi-Fi menu.".to_string()),
             Confidence::Certain,
         ),
-        HopId::Gateway => {
+        // The routing table has no gateway at all — there is no router to
+        // blame for not answering, because nothing was ever asked.
+        (HopId::Gateway, Some(Fault::NoGateway)) => (
+            "You have no default gateway",
+            "The link is up and you have an address, but the routing table has no gateway — so traffic has nowhere to go even inside your own house.".to_string(),
+            Some("Renew the DHCP lease, or check for a static IP configured without a router address.".to_string()),
+            Confidence::Certain,
+        ),
+        (HopId::Gateway, _) => {
             // Link up but the router won't answer.
             let link_note = match path.get(HopId::Link).and_then(|h| h.summary.clone()) {
                 Some(s) => format!(" Link looks like: {s}."),
@@ -133,7 +151,7 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
                 Confidence::Likely,
             )
         }
-        HopId::Wan => {
+        (HopId::Wan, _) => {
             // A full-tunnel VPN carries *all* egress, so a dead tunnel looks
             // exactly like an ISP outage from the WAN probe's point of view.
             // Reframe the verdict instead of blaming the ISP outright.
@@ -153,7 +171,7 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
                 )
             }
         }
-        HopId::Dns => {
+        (HopId::Dns, _) => {
             let wan_ok = hop_status(path, HopId::Wan) == Status::Ok;
             let cause = if wan_ok {
                 "Raw internet works (IPs are reachable) but name resolution fails — a classic DNS-only outage."
@@ -167,7 +185,7 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
                 Confidence::Likely,
             )
         }
-        HopId::Captive => (
+        (HopId::Captive, _) => (
             "A captive portal is blocking you",
             "DNS and routing work, but a hotspot login page is intercepting your traffic — you're not really online yet.".to_string(),
             Some("Open http://captive.apple.com in a browser and sign in.".to_string()),
@@ -177,13 +195,13 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
         // is never itself the `first_break`. A full-tunnel VPN outage instead
         // surfaces through the `HopId::Wan` reframe above. Kept for exhaustive-
         // ness and in case the probe gains a hard-fail signal later.
-        HopId::Vpn => (
+        (HopId::Vpn, _) => (
             "Your VPN tunnel is down",
             "A VPN tunnel is present but isn't carrying traffic, so anything routed through it is cut off.".to_string(),
             Some("Reconnect or quit the VPN client, then re-test.".to_string()),
             Confidence::Likely,
         ),
-        HopId::Internet | HopId::Host => (
+        (HopId::Host, _) => (
             "You're offline",
             "The connectivity chain is broken end-to-end.".to_string(),
             None,
@@ -335,6 +353,56 @@ mod tests {
         // The reason travels from the hop that recorded it, not from a second
         // copy of the platform check living in here.
         assert!(v.cause.contains("no platform module"));
+    }
+
+    /// The regression this whole `Fault` mechanism exists for: the engine
+    /// records "no default route", and the verdict used to answer "you aren't
+    /// associated with an access point" — a different fault, with a fix
+    /// (toggle Wi-Fi) that does nothing for a missing DHCP lease.
+    #[test]
+    fn a_missing_route_is_not_reported_as_a_dead_wifi_link() {
+        let mut link = hop(HopId::Link, Layer::Link, Status::Fail);
+        link.fault = Some(Fault::NoRoute);
+        let p = Path {
+            hops: vec![link, hop(HopId::Gateway, Layer::Network, Status::Skipped)],
+        };
+        let v = diagnose(&p);
+        assert!(
+            !v.headline.contains("link is down"),
+            "a routing fault must not be announced as a link fault, got: {}",
+            v.headline
+        );
+        assert!(v.cause.contains("DHCP"), "got: {}", v.cause);
+        assert!(v.fix.as_deref().unwrap().contains("DHCP"));
+    }
+
+    /// The other side of the same coin: a genuinely disassociated link keeps
+    /// the link verdict.
+    #[test]
+    fn a_disassociated_link_still_reads_as_a_dead_link() {
+        let mut link = hop(HopId::Link, Layer::Link, Status::Fail);
+        link.fault = Some(Fault::NotAssociated);
+        let p = Path { hops: vec![link] };
+        let v = diagnose(&p);
+        assert!(v.headline.contains("Wi-Fi link is down"), "{}", v.headline);
+    }
+
+    /// "The table has no gateway" and "the gateway won't answer" are different
+    /// faults: one has nothing to ping, the other pinged and got silence.
+    #[test]
+    fn a_missing_gateway_is_not_reported_as_a_silent_router() {
+        let mut gw = hop(HopId::Gateway, Layer::Network, Status::Fail);
+        gw.fault = Some(Fault::NoGateway);
+        let p = Path {
+            hops: vec![hop(HopId::Link, Layer::Link, Status::Ok), gw],
+        };
+        let v = diagnose(&p);
+        assert!(v.headline.contains("no default gateway"), "{}", v.headline);
+        assert!(
+            !v.cause.contains("answering pings"),
+            "nothing was pinged, so don't claim it: {}",
+            v.cause
+        );
     }
 
     #[test]
