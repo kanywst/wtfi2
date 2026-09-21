@@ -75,6 +75,9 @@ pub enum Fault {
     GatewaySilent,
     /// No transport-layer path to the internet.
     NoInternet,
+    /// The internet is reachable, but this network filters specific
+    /// destinations. A property of the network you are on, not an outage.
+    TargetBlocked,
     /// The system resolver returned no answer.
     ResolverDead,
     /// The system resolver answers, but not truthfully — it synthesises
@@ -100,6 +103,7 @@ impl Fault {
             Fault::NoGateway => "no_gateway",
             Fault::GatewaySilent => "gateway_silent",
             Fault::NoInternet => "no_internet",
+            Fault::TargetBlocked => "target_blocked",
             Fault::ResolverDead => "resolver_dead",
             Fault::ResolverHijacked => "resolver_hijacked",
             Fault::PortalIntercept => "portal_intercept",
@@ -318,6 +322,7 @@ mod tests {
             Fault::NoGateway,
             Fault::GatewaySilent,
             Fault::NoInternet,
+            Fault::TargetBlocked,
             Fault::ResolverDead,
             Fault::ResolverHijacked,
             Fault::PortalIntercept,

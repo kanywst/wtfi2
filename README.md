@@ -115,7 +115,7 @@ complete:
 2. **L2 Link** — Wi-Fi RSSI, noise, SNR, channel, PHY mode, security and tx
    rate, graded into a signal quality.
 3. **L3 Gateway** — resolves the default route and sends a short ICMP burst to the router, measuring RTT, packet loss and jitter, and flagging VPN/tunnel interfaces and sub-1500 MTU.
-4. **WAN** — real TCP handshakes to anycast resolvers over IPv4 and IPv6 to expose asymmetric blackholing without needing raw ICMP, then repeats the handshake to measure loss and jitter on the uplink itself.
+4. **WAN** — real TCP handshakes to three independent anycast operators (Cloudflare, Google, Quad9) over IPv4 and IPv6, which exposes asymmetric blackholing without needing raw ICMP and separates "the internet is unreachable" from "this network blocks that address". It then repeats the handshake against the quickest one to measure loss and jitter on the uplink itself.
 5. **DNS** — benchmarks the system resolver against Cloudflare and Google to
    separate "DNS is down" from "your resolver is just slow".
 6. **Captive portal** — a plain-HTTP hotspot check that catches login-page
