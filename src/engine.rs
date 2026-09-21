@@ -32,6 +32,51 @@ pub fn skeleton() -> Path {
     Path { hops }
 }
 
+/// Ceiling on any one probe.
+///
+/// Every probe sizes its own sampling to finish well inside this; the deadline
+/// is the backstop for the tool underneath wedging (`system_profiler` has, and
+/// a resolver pointed at a black hole will). Without it one stuck probe holds
+/// the scan channel open, which stalls the one-shot report and costs the live
+/// dashboard its re-probe cadence — during exactly the outage it is meant to
+/// be showing you.
+const PROBE_DEADLINE: Duration = Duration::from_secs(8);
+
+/// Ceiling on a whole sweep.
+///
+/// Each probe is bounded individually, so this only catches a task that never
+/// sends at all: the channel closes when the last sender drops, and one leaked
+/// sender would otherwise hang the CLI forever.
+pub const SWEEP_DEADLINE: Duration = Duration::from_secs(20);
+
+/// The hop a probe leaves behind when it overruns [`PROBE_DEADLINE`].
+///
+/// Graded `Warn`, never `Fail`: a probe that never answered observed nothing,
+/// and "we couldn't measure this" must not be dressed up as "this is broken".
+fn unmeasured(id: HopId, layer: Layer, title: &str, note: &str) -> Hop {
+    let mut hop = Hop::new(id, layer, title);
+    hop.status = Status::Warn;
+    hop.fault = Some(Fault::Unobserved);
+    hop.summary = Some(note.to_string());
+    hop
+}
+
+/// Run a probe under [`PROBE_DEADLINE`] and send whatever it produced, falling
+/// back to `unmeasured` so the hop always reaches a terminal state — otherwise
+/// the dashboard waits forever on a hop that is never coming.
+async fn send_bounded(
+    tx: mpsc::UnboundedSender<Hop>,
+    unmeasured: Hop,
+    probe: impl Future<Output = Option<Hop>>,
+) {
+    let hop = tokio::time::timeout(PROBE_DEADLINE, probe)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(unmeasured);
+    let _ = tx.send(hop);
+}
+
 /// Emit a path that stops at the link: the Link hop carries `status`, `fault`
 /// and `summary`, and everything downstream is skipped because there is
 /// nothing left to measure it over.
@@ -112,45 +157,66 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
             }
         };
 
-        // L2 link telemetry is a blocking `system_profiler` call that can be
-        // slow (multi-second) and has been known to wedge. Bound it so a hung
-        // call degrades the Link hop instead of freezing the whole run.
+        // L2 link telemetry is a blocking platform call that can be slow
+        // (`system_profiler` takes seconds) and has been known to wedge.
         let iface = route.interface.clone();
         let tx_link = tx.clone();
-        tokio::spawn(async move {
-            let handle = tokio::task::spawn_blocking(move || {
-                probe::link::probe(&platform::current(), &iface)
-            });
-            let hop = match tokio::time::timeout(Duration::from_secs(8), handle).await {
-                Ok(Ok(hop)) => hop,
-                _ => {
-                    let mut hop = Hop::new(HopId::Link, Layer::Link, "Wi-Fi");
-                    hop.status = Status::Warn;
-                    hop.summary = Some("Link telemetry timed out (system_profiler slow)".into());
-                    hop
-                }
-            };
-            let _ = tx_link.send(hop);
-        });
+        tokio::spawn(send_bounded(
+            tx_link,
+            unmeasured(
+                HopId::Link,
+                Layer::Link,
+                "Wi-Fi",
+                "Link telemetry timed out — the Wi-Fi state is unknown, not bad",
+            ),
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    probe::link::probe(&platform::current(), &iface)
+                })
+                .await
+                .ok()
+            },
+        ));
 
         // Gateway.
         let tx_gw = tx.clone();
         let route_gw = route.clone();
-        tokio::spawn(async move {
-            let _ = tx_gw.send(probe::gateway::probe(&route_gw).await);
-        });
+        tokio::spawn(send_bounded(
+            tx_gw,
+            unmeasured(
+                HopId::Gateway,
+                Layer::Network,
+                "Gateway",
+                "The gateway probe didn't finish — the router's state is unknown",
+            ),
+            async move { Some(probe::gateway::probe(&route_gw).await) },
+        ));
 
         // WAN.
         let tx_wan = tx.clone();
-        tokio::spawn(async move {
-            let _ = tx_wan.send(probe::wan::probe().await);
-        });
+        tokio::spawn(send_bounded(
+            tx_wan,
+            unmeasured(
+                HopId::Wan,
+                Layer::Internet,
+                "Internet",
+                "The internet probe didn't finish — reachability is unknown",
+            ),
+            async { Some(probe::wan::probe().await) },
+        ));
 
         // DNS.
         let tx_dns = tx.clone();
-        tokio::spawn(async move {
-            let _ = tx_dns.send(probe::dns::probe().await);
-        });
+        tokio::spawn(send_bounded(
+            tx_dns,
+            unmeasured(
+                HopId::Dns,
+                Layer::Application,
+                "DNS",
+                "The DNS probe didn't finish — resolution is unknown",
+            ),
+            async { Some(probe::dns::probe().await) },
+        ));
 
         // VPN / tunnel — conditional: only a hop when a tunnel is active. Seed a
         // pending hop up front so a finished base chain can't run the diagnosis
@@ -178,39 +244,107 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
 
             let tx_vpn = tx.clone();
             let route_vpn = route.clone();
-            tokio::spawn(async move {
-                let handle = tokio::task::spawn_blocking(move || {
-                    probe::vpn::probe(&platform::current(), &route_vpn)
-                });
-                let hop = match tokio::time::timeout(Duration::from_secs(8), handle).await {
-                    Ok(Ok(hop)) => hop,
-                    _ => {
-                        let mut hop = Hop::new(HopId::Vpn, Layer::Network, "VPN");
-                        hop.status = Status::Warn;
-                        hop.summary =
-                            Some("VPN telemetry timed out (scutil/ifconfig/ps slow)".into());
-                        hop
-                    }
-                };
-                let _ = tx_vpn.send(hop);
-            });
+            tokio::spawn(send_bounded(
+                tx_vpn,
+                unmeasured(
+                    HopId::Vpn,
+                    Layer::Network,
+                    "VPN",
+                    "VPN telemetry timed out — the tunnel's state is unknown",
+                ),
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        probe::vpn::probe(&platform::current(), &route_vpn)
+                    })
+                    .await
+                    .ok()
+                },
+            ));
         }
 
         // Captive portal.
         let tx_cap = tx;
-        tokio::spawn(async move {
-            let _ = tx_cap.send(probe::captive::probe().await);
-        });
+        tokio::spawn(send_bounded(
+            tx_cap,
+            unmeasured(
+                HopId::Captive,
+                Layer::Application,
+                "Portal",
+                "The portal probe didn't finish — interception is unknown",
+            ),
+            async { Some(probe::captive::probe().await) },
+        ));
     });
     rx
 }
 
 /// Run every probe and collect the completed path (one-shot mode).
 pub async fn run_once() -> Path {
+    run_once_within(SWEEP_DEADLINE).await
+}
+
+/// [`run_once`] with an explicit ceiling on the whole sweep.
+///
+/// Draining the channel to exhaustion is only safe while every sender is
+/// guaranteed to drop; `deadline` makes the CLI answer *something* even if one
+/// never does. Hops that never landed are reported as unmeasured rather than
+/// left `Pending`, so a truncated sweep can't render as "Scanning your
+/// connection…" in a report that has already stopped scanning.
+pub async fn run_once_within(deadline: Duration) -> Path {
     let mut path = skeleton();
     let mut rx = spawn();
-    while let Some(hop) = rx.recv().await {
-        path.upsert(hop);
+    let sleep = tokio::time::sleep(deadline);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            hop = rx.recv() => match hop {
+                Some(hop) => path.upsert(hop),
+                None => break,
+            },
+            _ = &mut sleep => break,
+        }
+    }
+    for hop in &mut path.hops {
+        if hop.status == Status::Pending {
+            hop.status = Status::Warn;
+            hop.fault = Some(Fault::Unobserved);
+            hop.summary = Some("The sweep ended before this hop reported".into());
+        }
     }
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sweep that gets cut short must still hand back a path whose every hop
+    /// has settled. A leftover `Pending` renders as "Scanning your
+    /// connection…" in a report that has already stopped scanning, and leaves
+    /// the live dashboard waiting on a hop that is never coming.
+    #[tokio::test]
+    async fn a_truncated_sweep_still_settles_every_hop() {
+        let path = run_once_within(Duration::from_millis(1)).await;
+        let unsettled: Vec<_> = path
+            .hops
+            .iter()
+            .filter(|h| !h.status.is_terminal())
+            .map(|h| h.id)
+            .collect();
+        assert!(unsettled.is_empty(), "left pending: {unsettled:?}");
+    }
+
+    /// And what it hands back must say the hops were *unmeasured*, not graded.
+    #[tokio::test]
+    async fn a_truncated_sweep_reports_the_gap_rather_than_a_verdict() {
+        let path = run_once_within(Duration::from_millis(1)).await;
+        assert!(
+            path.hops.iter().any(|h| h.fault == Some(Fault::Unobserved)),
+            "a sweep this short cannot have measured anything"
+        );
+        assert!(
+            !path.hops.iter().any(|h| h.status == Status::Fail),
+            "nothing was observed, so nothing may be called broken"
+        );
+    }
 }
