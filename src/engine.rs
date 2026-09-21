@@ -152,11 +152,29 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
                 // Still measure the host: "no route" and "no lease" look
                 // identical from the routing table, and the host hop is the
                 // only place that can tell them apart.
-                let _ = tx.send(
-                    tokio::task::spawn_blocking(|| probe_host(None, None))
-                        .await
-                        .unwrap_or_else(|_| host_hop()),
-                );
+                //
+                // Bounded like every other probe. It shells out to
+                // `networksetup` and `ifconfig`, and awaiting it unbounded
+                // here would hold the sweep before `send_stalled` ever runs —
+                // leaving every downstream hop Pending, which the one-shot CLI
+                // survives via its outer deadline but the live dashboard does
+                // not: it would sit on "scanning" forever.
+                let host = tokio::time::timeout(
+                    PROBE_DEADLINE,
+                    tokio::task::spawn_blocking(|| probe_host(None, None)),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_else(|| {
+                    unmeasured(
+                        HopId::Host,
+                        Layer::Link,
+                        "You",
+                        "Couldn't read this machine's addresses",
+                    )
+                });
+                let _ = tx.send(host);
                 send_stalled(
                     &tx,
                     Status::Fail,

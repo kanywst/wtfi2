@@ -55,14 +55,23 @@ fn grade(hop: &mut Hop, interface: &str, addrs: &AddrInfo, gateway: Option<IpAdd
         hop.metrics.push(Metric::new("IPv6", v6.to_string()));
     }
 
-    // DHCP never answered, so macOS autoconfigured. The interface looks up and
-    // can reach nothing — and this is the earliest hop in the chain, so saying
-    // it here stops the verdict blaming the router downstream.
+    // DHCPv4 never answered, so macOS autoconfigured. Whether that is a break
+    // depends on IPv6: a routable v6 address means traffic still has a way
+    // out, and failing the earliest hop in the chain would hand the whole
+    // verdict to a fault that isn't stopping anything.
     if addrs.is_self_assigned() {
-        hop.fail(
-            Fault::SelfAssignedAddr,
-            "Self-assigned address — DHCP never answered, so nothing can be reached",
-        );
+        if addrs.v6.is_empty() {
+            hop.fail(
+                Fault::SelfAssignedAddr,
+                "Self-assigned address — DHCP never answered, so nothing can be reached",
+            );
+        } else {
+            hop.status = Status::Warn;
+            hop.fault = Some(Fault::SelfAssignedAddr);
+            hop.summary = Some(
+                "DHCPv4 never answered (self-assigned address), but IPv6 is configured — anything IPv4-only will fail".into(),
+            );
+        }
         return;
     }
 
@@ -134,6 +143,20 @@ mod tests {
         assert_eq!(hop.status, Status::Fail);
         assert_eq!(hop.fault, Some(Fault::SelfAssignedAddr));
         assert!(hop.summary.unwrap().contains("DHCP"));
+    }
+
+    /// …but only when there is no other way out. DHCPv4 glitching while IPv6
+    /// RA/SLAAC keeps working is a real and ordinary state, and failing the
+    /// earliest hop in the chain would hand the whole verdict to a fault that
+    /// isn't stopping anything.
+    #[test]
+    fn a_self_assigned_v4_with_working_v6_degrades_rather_than_breaks() {
+        let hop = graded(&addrs(Some(("169.254.13.7", 16)), &["2001:db8::5"]), None);
+        assert_eq!(hop.status, Status::Warn);
+        assert_eq!(hop.fault, Some(Fault::SelfAssignedAddr));
+        let summary = hop.summary.unwrap();
+        assert!(summary.contains("IPv6 is configured"), "got: {summary}");
+        assert!(summary.contains("IPv4-only will fail"), "got: {summary}");
     }
 
     #[test]
