@@ -129,18 +129,32 @@ pub async fn probe() -> Hop {
 
     let (v4, v6) = tokio::join!(reach(&V4), reach(&V6));
 
-    hop.subtitle = Some(match v4.best() {
+    // Falling back through v6 matters: an IPv6-only network is the case where
+    // the reader most needs to see *which* address is carrying traffic, and it
+    // was the one showing a bare target count.
+    hop.subtitle = Some(match v4.best().or_else(|| v6.best()) {
         Some((label, addr, _)) => format!("{addr} ({label})"),
         None => format!("{} targets", V4.len() + V6.len()),
     });
 
-    for (label, probe) in v4.reached.iter().chain(v6.reached.iter()) {
-        let (value, status) = match probe {
-            Probe::Up(d) => (format!("{:.0} ms", d.as_secs_f64() * 1000.0), Status::Ok),
-            Probe::Timeout => ("unreachable".into(), Status::Warn),
+    // An unreached target is graded by what its family's silence actually
+    // means. With nothing up at all the hop itself fails, and `-v` printing
+    // every measurement under it as a yellow "Warn" would contradict the red
+    // headline in the one scenario this tool is most careful to get right.
+    for family in [&v4, &v6] {
+        let down = if family.any_up() {
+            Status::Warn
+        } else {
+            Status::Fail
         };
-        hop.metrics
-            .push(Metric::new(*label, value).with_status(status));
+        for (label, probe) in &family.reached {
+            let (value, status) = match probe {
+                Probe::Up(d) => (format!("{:.0} ms", d.as_secs_f64() * 1000.0), Status::Ok),
+                Probe::Timeout => ("unreachable".into(), down),
+            };
+            hop.metrics
+                .push(Metric::new(*label, value).with_status(status));
+        }
     }
 
     match (v4.any_up(), v6.any_up()) {
@@ -154,12 +168,13 @@ pub async fn probe() -> Hop {
             let quality = apply_quality(&mut hop, &q, JITTER_WARN_MS);
             let blocked = blocked_targets(&v4, &v6);
             hop.status = quality.max(block_status(&blocked));
-            let summary = summarise(label, avg, dual_stack, &q, &blocked);
-            // Only claim the code the prose actually made. When a quality
-            // complaint takes the summary, the block goes unmentioned, and a
-            // `--json` consumer reading `target_blocked` off a hop whose text
-            // never says so has been told two different things.
-            if !blocked.is_empty() && summary.contains("blocks") {
+            // The code follows the branch `summarise` took, reported by
+            // `summarise` itself. When a quality complaint owns the prose the
+            // block goes unmentioned, and a `--json` consumer reading
+            // `target_blocked` off a hop whose text never says so has been
+            // told two different things.
+            let (summary, reports_block) = summarise(label, avg, dual_stack, &q, &blocked);
+            if reports_block {
                 hop.fault = Some(Fault::TargetBlocked);
             }
             hop.summary = Some(summary);
@@ -238,28 +253,50 @@ fn operators() -> String {
     names.join(", ")
 }
 
-fn summarise(label: &str, avg: f64, dual_stack: bool, q: &Quality, blocked: &[&str]) -> String {
+/// The summary, plus whether it is the one that actually reports the block.
+///
+/// Returned rather than sniffed back out of the rendered English: gating
+/// `Fault::TargetBlocked` on `summary.contains("blocks")` coupled the fault
+/// code to a literal string, so rewording this function — to the fault's own
+/// doc-comment word "filters", say — would silently stop setting the code, the
+/// dedicated verdict arm would never fire, and the reader would fall back to
+/// "check for background traffic" with the filtered operator unmentioned in
+/// both the verdict and `--json`.
+fn summarise(
+    label: &str,
+    avg: f64,
+    dual_stack: bool,
+    q: &Quality,
+    blocked: &[&str],
+) -> (String, bool) {
     let family = if dual_stack { "IPv4 + IPv6" } else { "IPv4" };
     if let Some(c) = q.complaint(JITTER_WARN_MS) {
-        return format!(
-            "Reachable over {family} but the uplink is unhealthy — {c} over {} handshakes",
-            q.sent
+        return (
+            format!(
+                "Reachable over {family} but the uplink is unhealthy — {c} over {} handshakes",
+                q.sent
+            ),
+            false,
         );
     }
     if !blocked.is_empty() {
         // The uplink works, so this is about *this network's* filtering, not
         // about your connection being down. Saying which operator is missing
         // is the whole point of probing more than one.
-        return format!(
-            "Reachable via {label} ({avg:.0} ms), but this network blocks {} — filtered egress, not an outage",
-            blocked.join(" and ")
+        return (
+            format!(
+                "Reachable via {label} ({avg:.0} ms), but this network blocks {} — filtered egress, not an outage",
+                blocked.join(" and ")
+            ),
+            true,
         );
     }
-    if dual_stack {
+    let clean = if dual_stack {
         format!("Reachable over IPv4 + IPv6 ({avg:.0} ms via {label})")
     } else {
         format!("Reachable over IPv4 ({avg:.0} ms via {label}) · no IPv6 on this network")
-    }
+    };
+    (clean, false)
 }
 
 /// Handshake every target in a family at once.
@@ -359,7 +396,7 @@ mod tests {
             sent: 5,
             rtts_ms: vec![10.0, 11.0, 10.5, 11.2, 10.8],
         };
-        let summary = summarise("Google", 10.7, false, &q, &["Cloudflare"]);
+        let (summary, _) = summarise("Google", 10.7, false, &q, &["Cloudflare"]);
         assert!(summary.contains("blocks Cloudflare"), "got: {summary}");
         assert!(
             summary.contains("not an outage"),
@@ -375,7 +412,7 @@ mod tests {
             sent: 5,
             rtts_ms: vec![10.0, 11.0, 10.5, 11.2, 10.8],
         };
-        let summary = summarise("Quad9", 10.7, true, &q, &[]);
+        let (summary, _) = summarise("Quad9", 10.7, true, &q, &[]);
         assert!(summary.contains("Quad9"), "got: {summary}");
         assert!(summary.contains("IPv4 + IPv6"));
     }
@@ -389,7 +426,7 @@ mod tests {
             sent: 5,
             rtts_ms: vec![10.0],
         };
-        let summary = summarise("Google", 10.0, false, &lossy, &["Cloudflare"]);
+        let (summary, _) = summarise("Google", 10.0, false, &lossy, &["Cloudflare"]);
         assert!(summary.contains("unhealthy"), "got: {summary}");
     }
 
@@ -404,6 +441,42 @@ mod tests {
         assert!(
             operator_count() < V4.len() + V6.len(),
             "two families of one operator are one network"
+        );
+    }
+
+    /// The fault code must follow the branch `summarise` took, not the words
+    /// it produced. Gated on `summary.contains("blocks")`, rewording the
+    /// sentence would silently stop setting `TargetBlocked`, the dedicated
+    /// verdict arm would never fire, and the filtered operator would go
+    /// unmentioned in both the verdict and `--json`.
+    #[test]
+    fn the_block_flag_follows_the_branch_not_the_wording() {
+        let clean = Quality {
+            sent: 5,
+            rtts_ms: vec![10.0, 11.0, 10.5, 11.2, 10.8],
+        };
+        let lossy = Quality {
+            sent: 5,
+            rtts_ms: vec![10.0],
+        };
+        assert!(summarise("Google", 10.7, false, &clean, &["Cloudflare"]).1);
+        // A quality complaint owns the prose, so the block goes unmentioned —
+        // and the code must not claim it either.
+        assert!(!summarise("Google", 10.0, false, &lossy, &["Cloudflare"]).1);
+        assert!(!summarise("Google", 10.7, false, &clean, &[]).1);
+    }
+
+    /// In a total outage the hop is `Fail`, so `-v` must not print every
+    /// measurement under it as a yellow `Warn` — the headline and the evidence
+    /// contradicting each other in the one case accuracy matters most.
+    #[test]
+    fn an_unreached_target_is_graded_by_what_its_familys_silence_means() {
+        let dead = family(&[("Cloudflare", None), ("Google", None), ("Quad9", None)]);
+        assert!(!dead.any_up(), "a dead family grades its targets Fail");
+        let partial = family(&[("Cloudflare", None), ("Google", Some(14)), ("Quad9", None)]);
+        assert!(
+            partial.any_up(),
+            "a live family grades its silent targets Warn"
         );
     }
 
