@@ -76,10 +76,16 @@ pub async fn probe() -> Hop {
         }
     }
 
-    hop.evidence = Some(format!(
-        "{}-hop TTL sweep to {TARGET}, {QUERIES} probe per hop, {WAIT_SECS}s wait",
-        MAX_TTL
-    ));
+    // Only describe a sweep that produced something. Built from the config
+    // constants alone, this asserted a completed "6-hop TTL sweep" sitting
+    // right beside `grade()`'s correct "traceroute produced nothing" — the
+    // evidence line contradicting the finding it was meant to support.
+    hop.evidence = (!hops.is_empty()).then(|| {
+        format!(
+            "TTL sweep to {TARGET}, {} of {MAX_TTL} hops reported, {QUERIES} probe per hop, {WAIT_SECS}s wait",
+            hops.iter().filter(|h| h.addr.is_some()).count()
+        )
+    });
 
     let target: IpAddr = TARGET.parse().expect("TARGET is a literal address");
     grade(&mut hop, &hops, target);
@@ -324,6 +330,23 @@ mod tests {
  4  *
  5  198.51.100.9  41.2 ms
  6  *";
+
+    /// The evidence line must describe a sweep that happened. Built from the
+    /// config constants alone it asserted a completed "6-hop TTL sweep" beside
+    /// `grade()`'s correct "traceroute produced nothing" — the evidence
+    /// contradicting the finding it was meant to support.
+    #[tokio::test]
+    async fn a_sweep_that_produced_nothing_claims_no_sweep() {
+        let mut hop = Hop::new(HopId::Uplink, Layer::Internet, "Uplink");
+        grade(&mut hop, &[], "1.1.1.1".parse().unwrap());
+        assert_eq!(hop.fault, Some(Fault::Unobserved));
+        assert!(
+            hop.evidence.is_none(),
+            "got: {:?} beside {:?}",
+            hop.evidence,
+            hop.summary
+        );
+    }
 
     #[test]
     fn traceroute_output_parses_into_ttl_steps() {
