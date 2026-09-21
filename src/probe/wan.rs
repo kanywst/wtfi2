@@ -94,7 +94,19 @@ const TRACE_BY_IP: &str = "https://1.1.1.1/cdn-cgi/trace";
 /// The same endpoint by name, for the case where the IP literal is refused
 /// (a TLS stack that won't match an IP SAN, a proxy that insists on SNI).
 const TRACE_BY_NAME: &str = "https://one.one.one.one/cdn-cgi/trace";
-const TRACE_WAIT: Duration = Duration::from_secs(4);
+/// Ceiling on the *whole* verified-request check, both URLs included.
+///
+/// It has to cover both, not each. Tried sequentially at a full deadline
+/// apiece, this check alone could take as long as the engine's entire
+/// per-probe budget — and then `sample_quality` still runs after the join.
+/// The hop would time out and be replaced by a generic "reachability is
+/// unknown", silently discarding the `HandshakeOnly` finding in exactly the
+/// middlebox scenario it exists to catch, where a stalled HTTPS exchange is
+/// the *expected* shape.
+const TRACE_BUDGET: Duration = Duration::from_millis(3500);
+/// Below this there isn't room for a request worth making, so the by-name
+/// retry is skipped rather than started and cut off.
+const MIN_TRACE: Duration = Duration::from_millis(1200);
 
 /// What one real, complete request through the uplink found.
 struct Egress {
@@ -301,16 +313,26 @@ fn handshake_only(v4: &Family, v6: &Family, egress: &Egress) -> bool {
 /// One complete request through the uplink: the check that makes a green hop
 /// mean something, and the only place a public address can come from.
 async fn verify_egress() -> Egress {
-    let Ok(client) = reqwest::Client::builder().timeout(TRACE_WAIT).build() else {
-        return Egress {
-            public_ip: None,
-            verified: false,
-        };
+    let unverified = Egress {
+        public_ip: None,
+        verified: false,
     };
+    let Ok(client) = reqwest::Client::builder().build() else {
+        return unverified;
+    };
+    let deadline = Instant::now() + TRACE_BUDGET;
     // By IP first, so this keeps working when name resolution doesn't — the
     // case it most needs to see past.
     for url in [TRACE_BY_IP, TRACE_BY_NAME] {
-        let Ok(resp) = client.get(url).send().await else {
+        let left = deadline.saturating_duration_since(Instant::now());
+        // A by-IP attempt that failed because the TLS stack wouldn't match an
+        // IP SAN fails fast, leaving room for the by-name retry. One that
+        // stalled has already spent the budget, and starting a second request
+        // would only push the hop past the deadline that discards its finding.
+        if left < MIN_TRACE {
+            break;
+        }
+        let Ok(resp) = client.get(url).timeout(left).send().await else {
             continue;
         };
         if !resp.status().is_success() {
@@ -328,10 +350,7 @@ async fn verify_egress() -> Egress {
             };
         }
     }
-    Egress {
-        public_ip: None,
-        verified: false,
-    }
+    unverified
 }
 
 /// Pull the `ip=` line out of a `cdn-cgi/trace` response.
@@ -670,6 +689,37 @@ mod tests {
         let dead = family(&[("Cloudflare", None), ("Google", None), ("Quad9", None)]);
         let v6 = family(&[("Cloudflare v6", None), ("Google v6", None)]);
         assert!(!handshake_only(&dead, &v6, &egress(false)));
+    }
+
+    /// The check runs inside the same join as the reachability probes, and
+    /// `sample_quality` runs after it. If the whole probe can outlast the
+    /// engine's per-probe deadline, `send_bounded` replaces the hop with a
+    /// generic "reachability is unknown" — discarding the `HandshakeOnly`
+    /// finding in exactly the middlebox case where a stalled HTTPS exchange is
+    /// the expected shape, and which this check exists to catch.
+    #[test]
+    fn the_whole_probe_fits_the_engine_deadline_in_the_worst_case() {
+        // The join is bounded by its slowest arm; sampling follows it.
+        let worst = TRACE_BUDGET.max(SAMPLE_WAIT) + SAMPLE_BUDGET;
+        assert!(
+            worst < crate::engine::PROBE_DEADLINE,
+            "worst case {worst:?} must fit in {:?}",
+            crate::engine::PROBE_DEADLINE
+        );
+    }
+
+    /// And the budget covers *both* URLs, not one each — otherwise a stalled
+    /// by-IP attempt and a stalled by-name retry would double it.
+    #[test]
+    fn a_spent_trace_budget_leaves_no_room_for_the_retry() {
+        assert!(
+            TRACE_BUDGET - MIN_TRACE < MIN_TRACE + MIN_TRACE,
+            "the retry must not be able to double the budget"
+        );
+        assert!(
+            MIN_TRACE < TRACE_BUDGET,
+            "the first attempt must get a turn"
+        );
     }
 
     #[test]
