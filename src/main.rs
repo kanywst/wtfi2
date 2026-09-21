@@ -30,10 +30,14 @@ async fn main() -> Result<()> {
         print!("{}", render::report(&path, &verdict, cli.verbose, color));
     }
 
-    // Exit code reflects health, so scripts can branch on it.
+    // Exit code reflects health, so scripts can branch on it. "Nothing could
+    // be measured" gets its own code: it is not a clean bill of health, but it
+    // is not an observed outage either, and a script that retries on 4 would
+    // be wrong to give up on 2.
     std::process::exit(match verdict.status {
         wtfi2::model::Status::Ok => 0,
         wtfi2::model::Status::Warn => 1,
+        wtfi2::model::Status::Skipped => 4,
         _ => 2,
     });
 }

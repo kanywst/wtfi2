@@ -6,7 +6,7 @@
 //! one-shot mode simply drains the same channel.
 
 use crate::model::{Fault, Hop, HopId, Layer, Path, Status};
-use crate::platform::{self, Platform};
+use crate::platform::{self, Platform, PlatformError};
 use crate::probe;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -32,6 +32,27 @@ pub fn skeleton() -> Path {
     Path { hops }
 }
 
+/// Emit a path that stops at the link: the Link hop carries `status`, `fault`
+/// and `summary`, and everything downstream is skipped because there is
+/// nothing left to measure it over.
+///
+/// The three arguments travel together so a stalled sweep can never ship a
+/// status without the code and the prose that explain it.
+fn send_stalled(tx: &mpsc::UnboundedSender<Hop>, status: Status, fault: Fault, summary: String) {
+    for mut hop in skeleton().hops {
+        match hop.id {
+            HopId::Host => continue,
+            HopId::Link => {
+                hop.status = status;
+                hop.fault = Some(fault);
+                hop.summary = Some(summary.clone());
+            }
+            _ => hop.status = Status::Skipped,
+        }
+        let _ = tx.send(hop);
+    }
+}
+
 fn host_hop() -> Hop {
     let mut h = Hop::new(HopId::Host, Layer::Link, "You");
     h.status = Status::Ok;
@@ -49,41 +70,46 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
         // hop is unknown rather than broken. Probing anyway would grade every
         // refusal as a network fault.
         if let Some(reason) = platform::UNSUPPORTED_OS {
-            for mut hop in skeleton().hops {
-                if hop.id == HopId::Host {
-                    continue;
-                }
-                hop.status = Status::Skipped;
-                if hop.id == HopId::Link {
-                    hop.summary = Some(reason.into());
-                }
-                let _ = tx.send(hop);
-            }
+            send_stalled(&tx, Status::Skipped, Fault::Unobserved, reason.into());
             return;
         }
 
-        let route = tokio::task::spawn_blocking(|| platform::current().route())
-            .await
-            .ok()
-            .and_then(Result::ok);
-
-        let Some(route) = route else {
-            // No default route: nothing downstream can be measured. Record it
-            // as *no route*, not as "not associated" — you can be perfectly
-            // associated to an AP and still have no lease, and the two faults
-            // have different fixes.
-            for mut hop in skeleton().hops {
-                match hop.id {
-                    HopId::Host => continue,
-                    HopId::Link => hop.fail(
-                        Fault::NoRoute,
-                        "No default route — the link is up but nothing routes off this machine",
-                    ),
-                    _ => hop.status = Status::Skipped,
-                }
-                let _ = tx.send(hop);
+        let route = match tokio::task::spawn_blocking(|| platform::current().route()).await {
+            Ok(Ok(route)) => route,
+            // The routing table was read and had no default route: nothing
+            // downstream can be measured. Record it as *no route*, not as "not
+            // associated" — you can be perfectly associated to an AP and still
+            // have no lease, and the two faults have different fixes.
+            Ok(Err(PlatformError::NoNetwork)) => {
+                send_stalled(
+                    &tx,
+                    Status::Fail,
+                    Fault::NoRoute,
+                    "No default route — the link is up but nothing routes off this machine".into(),
+                );
+                return;
             }
-            return;
+            // The routing table could not be read at all, so the network was
+            // never observed. Grading that as an outage would report a working
+            // connection as broken on the strength of our own blindness.
+            Ok(Err(e)) => {
+                send_stalled(
+                    &tx,
+                    Status::Skipped,
+                    Fault::Unobserved,
+                    format!("Couldn't read the routing table — {e}"),
+                );
+                return;
+            }
+            Err(e) => {
+                send_stalled(
+                    &tx,
+                    Status::Skipped,
+                    Fault::Unobserved,
+                    format!("The route lookup didn't finish — {e}"),
+                );
+                return;
+            }
         };
 
         // L2 link telemetry is a blocking `system_profiler` call that can be
