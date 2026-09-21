@@ -6,7 +6,7 @@
 //! full-tunnel is what makes a VPN outage masquerade as an ISP outage, so the
 //! diagnosis engine keys off the `Mode` metric this hop records.
 
-use crate::model::{Hop, HopId, Layer, Metric, Status};
+use crate::model::{Fault, Hop, HopId, Layer, Metric, Status};
 use crate::platform::{Platform, RouteInfo};
 
 pub fn probe(platform: &impl Platform, route: &RouteInfo) -> Hop {
@@ -61,6 +61,7 @@ pub fn probe(platform: &impl Platform, route: &RouteInfo) -> Hop {
         });
     } else {
         hop.status = Status::Warn;
+        hop.fault = Some(Fault::TunnelDown);
         hop.summary =
             Some("Tunnel interface is up but has no address — not carrying traffic".into());
     }

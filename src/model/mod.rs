@@ -3,5 +3,5 @@
 mod path;
 mod status;
 
-pub use path::{Hop, HopId, Layer, Metric, Path};
+pub use path::{Fault, Hop, HopId, Layer, Metric, Path};
 pub use status::Status;

@@ -4,7 +4,7 @@
 //! A clean network returns `Success`; anything else (a login page body or a
 //! 302 to a portal) means a captive portal is intercepting traffic.
 
-use crate::model::{Hop, HopId, Layer, Metric, Status};
+use crate::model::{Fault, Hop, HopId, Layer, Metric, Status};
 use std::time::Duration;
 
 const ENDPOINT: &str = "http://captive.apple.com/hotspot-detect.html";
@@ -38,8 +38,10 @@ pub async fn probe() -> Hop {
             let body = resp.text().await.unwrap_or_default();
 
             if status.is_redirection() {
-                hop.status = Status::Fail;
-                hop.summary = Some("Captive portal is redirecting you to a login page".into());
+                hop.fail(
+                    Fault::PortalIntercept,
+                    "Captive portal is redirecting you to a login page",
+                );
                 if let Some(url) = redirect_to {
                     hop.metrics
                         .push(Metric::new("Portal", url).with_status(Status::Fail));
@@ -48,8 +50,10 @@ pub async fn probe() -> Hop {
                 hop.status = Status::Ok;
                 hop.summary = Some("No portal — traffic flows clean to the internet".into());
             } else {
-                hop.status = Status::Fail;
-                hop.summary = Some("A portal is intercepting HTTP (unexpected response)".into());
+                hop.fail(
+                    Fault::PortalIntercept,
+                    "A portal is intercepting HTTP (unexpected response)",
+                );
                 hop.metrics.push(
                     Metric::new("HTTP", status.as_u16().to_string()).with_status(Status::Warn),
                 );

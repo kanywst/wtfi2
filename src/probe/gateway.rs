@@ -1,7 +1,7 @@
 //! L3 gateway probe: can we reach the default router, and cleanly?
 
 use super::net::{apply_quality, ping_burst};
-use crate::model::{Hop, HopId, Layer, Metric, Status};
+use crate::model::{Fault, Hop, HopId, Layer, Metric, Status};
 use crate::platform::RouteInfo;
 use std::time::Duration;
 
@@ -34,8 +34,10 @@ pub async fn probe(route: &RouteInfo) -> Hop {
         });
     }
     let Some(gw) = route.gateway else {
-        hop.status = Status::Fail;
-        hop.summary = Some("No default gateway — you have no route off this machine".into());
+        hop.fail(
+            Fault::NoGateway,
+            "No default gateway — you have no route off this machine",
+        );
         return hop;
     };
 
@@ -49,8 +51,10 @@ pub async fn probe(route: &RouteInfo) -> Hop {
 
     let Some(avg) = q.avg_ms() else {
         // Every echo was dropped: the router is silent, not merely lossy.
-        hop.status = Status::Fail;
-        hop.summary = Some("Router isn't answering — LAN is up but the gateway is silent".into());
+        hop.fail(
+            Fault::GatewaySilent,
+            "Router isn't answering — LAN is up but the gateway is silent",
+        );
         apply_quality(&mut hop, &q, JITTER_WARN_MS);
         return hop;
     };

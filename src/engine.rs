@@ -5,7 +5,7 @@
 //! the live dashboard fills in out of order as results arrive, and the
 //! one-shot mode simply drains the same channel.
 
-use crate::model::{Hop, HopId, Layer, Path, Status};
+use crate::model::{Fault, Hop, HopId, Layer, Path, Status};
 use crate::platform::{self, Platform};
 use crate::probe;
 use std::time::Duration;
@@ -68,16 +68,17 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
             .and_then(Result::ok);
 
         let Some(route) = route else {
-            // No default route: link is down, everything downstream is moot.
-            // Source correctly-typed hops from the skeleton; fail the link and
-            // skip everything downstream.
+            // No default route: nothing downstream can be measured. Record it
+            // as *no route*, not as "not associated" — you can be perfectly
+            // associated to an AP and still have no lease, and the two faults
+            // have different fixes.
             for mut hop in skeleton().hops {
                 match hop.id {
                     HopId::Host => continue,
-                    HopId::Link => {
-                        hop.status = Status::Fail;
-                        hop.summary = Some("No active network interface / default route".into());
-                    }
+                    HopId::Link => hop.fail(
+                        Fault::NoRoute,
+                        "No default route — the link is up but nothing routes off this machine",
+                    ),
                     _ => hop.status = Status::Skipped,
                 }
                 let _ = tx.send(hop);

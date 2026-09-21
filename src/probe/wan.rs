@@ -7,7 +7,7 @@
 //! uplink from one that is technically up but dropping traffic.
 
 use super::net::{Probe, Quality, apply_quality, tcp_connect};
-use crate::model::{Hop, HopId, Layer, Metric, Status};
+use crate::model::{Fault, Hop, HopId, Layer, Metric, Status};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -87,9 +87,10 @@ pub async fn probe() -> Hop {
             hop.summary = Some("IPv6-only reachable — IPv4 path is blackholed".into());
         }
         (false, false) => {
-            hop.status = Status::Fail;
-            hop.summary =
-                Some("No TCP path to the internet — the break is past your router".into());
+            hop.fail(
+                Fault::NoInternet,
+                "No TCP path to the internet — the break is past your router",
+            );
         }
     }
     hop

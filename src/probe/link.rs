@@ -1,6 +1,6 @@
 //! L2 link probe: turn raw [`LinkInfo`] into a graded hop.
 
-use crate::model::{Hop, HopId, Layer, Metric, Status};
+use crate::model::{Fault, Hop, HopId, Layer, Metric, Status};
 use crate::platform::{LinkInfo, Platform, PlatformError};
 
 /// Assess the Wi-Fi link for `interface` using the platform layer.
@@ -17,8 +17,7 @@ pub fn probe(platform: &dyn Platform, interface: &str) -> Hop {
             hop.summary = Some("Wired or non-Wi-Fi link is up".into());
         }
         Err(PlatformError::NoNetwork) => {
-            hop.status = Status::Fail;
-            hop.summary = Some("Not associated with any access point".into());
+            hop.fail(Fault::NotAssociated, "Not associated with any access point");
         }
         Err(e) => {
             hop.status = Status::Warn;
