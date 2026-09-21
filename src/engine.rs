@@ -442,6 +442,20 @@ pub async fn run_once_within(deadline: Duration) -> Path {
 mod tests {
     use super::*;
 
+    /// The uplink sweep is spawned *after* the WAN probe reports, so the two
+    /// budgets stack on one sweep clock — each capped at `PROBE_DEADLINE`, but
+    /// in series. Nothing pinned that composition: the uplink probe's own
+    /// tests only cover its two internal sweeps against `PROBE_DEADLINE`, not
+    /// this WAN-then-Uplink chain against the sweep-level one.
+    #[test]
+    fn a_wan_failure_and_its_uplink_sweep_both_fit_one_sweep() {
+        let stacked = PROBE_DEADLINE + PROBE_DEADLINE;
+        assert!(
+            stacked < SWEEP_DEADLINE,
+            "WAN then Uplink is {stacked:?}, which must fit in {SWEEP_DEADLINE:?}"
+        );
+    }
+
     /// A sweep that gets cut short must still hand back a path whose every hop
     /// has settled. A leftover `Pending` renders as "Scanning your
     /// connection…" in a report that has already stopped scanning, and leaves

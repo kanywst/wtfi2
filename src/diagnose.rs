@@ -178,6 +178,18 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
         // The sweep located the break, so the verdict stops guessing. These
         // sit before the WAN arm in the chain, so `first_break` reaches them
         // first and the vaguer "something past your router" never runs.
+        // A full-tunnel VPN owns the default route, so the sweep traces
+        // *through the tunnel*: "hop 1 = your own router" is only true over
+        // the physical WAN. Without this the Uplink arms would tell you to
+        // check your modem, or report an outage to your ISP, for a tunnel
+        // whose own upstream degraded — and because Uplink precedes Wan in the
+        // chain, the Wan arm's existing VPN reframe never gets to run.
+        (HopId::Uplink, _) if vpn_is_full_tunnel(path) => (
+            "The path through your VPN breaks upstream",
+            format!("{} But a full-tunnel VPN owns your default route, so this traced through the tunnel, not your own line — the hops named are the tunnel's path, not your ISP's.", uplink_evidence(path)),
+            Some("Disconnect the VPN and re-run. If the path comes back, the tunnel was the problem — your own line and your ISP aren't involved.".to_string()),
+            Confidence::Likely,
+        ),
         (HopId::Uplink, Some(Fault::UplinkDiesAtModem)) => (
             "The break is on your line, not inside your ISP",
             format!("Your router answers, but nothing past it does — and the trace stops at the very first step outside your house. {} That points at the modem/ONU, the WAN cable, or the line itself rather than at your provider's network.", uplink_evidence(path)),
@@ -943,6 +955,53 @@ mod tests {
     fn the_uplink_hop_precedes_the_wan_hop_in_the_chain() {
         assert!((HopId::Uplink as usize) < (HopId::Wan as usize));
         assert!((HopId::Gateway as usize) < (HopId::Uplink as usize));
+    }
+
+    /// The Wan arm has checked `vpn_is_full_tunnel` since the VPN hop landed,
+    /// but Uplink sits *before* Wan in the chain, so `first_break` reaches it
+    /// first and that reframe never runs. The sweep traces over whatever owns
+    /// the default route — the tunnel — so "hop 1 is your own router" is
+    /// simply untrue, and the verdict would send you to your modem or your
+    /// ISP for a VPN fault.
+    #[test]
+    fn a_full_tunnel_vpn_reframes_the_uplink_verdict_too() {
+        let mut vpn = hop(HopId::Vpn, Layer::Network, Status::Ok);
+        vpn.metrics
+            .push(crate::model::Metric::new("Mode", "full-tunnel"));
+        let mut uplink = hop(HopId::Uplink, Layer::Internet, Status::Fail);
+        uplink.fault = Some(Fault::UplinkDiesInIsp);
+        uplink.summary = Some("Dies past hop 2 — the last reply came from 100.64.0.1".into());
+        let p = Path {
+            hops: vec![
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                vpn,
+                uplink,
+                hop(HopId::Wan, Layer::Internet, Status::Fail),
+            ],
+        };
+        let v = diagnose(&p);
+        assert!(v.headline.contains("VPN"), "got: {}", v.headline);
+        assert!(
+            !v.fix.as_deref().unwrap().contains("modem"),
+            "a VPN fault must not send the reader to their modem"
+        );
+        assert!(v.cause.contains("through the tunnel"), "got: {}", v.cause);
+    }
+
+    /// A split-tunnel VPN does not own the default route, so the sweep really
+    /// did trace your own line and the located verdict stands.
+    #[test]
+    fn a_split_tunnel_vpn_leaves_the_uplink_verdict_alone() {
+        let mut vpn = hop(HopId::Vpn, Layer::Network, Status::Ok);
+        vpn.metrics
+            .push(crate::model::Metric::new("Mode", "split-tunnel"));
+        let mut uplink = hop(HopId::Uplink, Layer::Internet, Status::Fail);
+        uplink.fault = Some(Fault::UplinkDiesInIsp);
+        uplink.summary = Some("Dies past hop 2".into());
+        let p = Path {
+            hops: vec![hop(HopId::Gateway, Layer::Network, Status::Ok), vpn, uplink],
+        };
+        assert!(diagnose(&p).headline.contains("inside your ISP"));
     }
 
     #[test]
