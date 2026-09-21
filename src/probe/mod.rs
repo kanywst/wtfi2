@@ -8,6 +8,7 @@
 pub mod captive;
 pub mod dns;
 pub mod gateway;
+pub mod host;
 pub mod link;
 pub mod net;
 pub mod vpn;

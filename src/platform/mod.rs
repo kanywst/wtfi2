@@ -85,6 +85,48 @@ pub struct RouteInfo {
     pub tunnel_unreadable: bool,
 }
 
+/// Addresses configured on an interface.
+///
+/// Separate from [`RouteInfo`] because it answers a different question: the
+/// route says where traffic goes, this says whether you were given a place to
+/// send it *from*. A machine with a self-assigned `169.254` address has an
+/// interface, a link and often a gateway entry, and still cannot talk to
+/// anything — a state the route alone cannot describe.
+#[derive(Debug, Clone, Default)]
+pub struct AddrInfo {
+    /// IPv4 address and its prefix length, e.g. `192.168.0.15/24`.
+    pub v4: Option<(std::net::Ipv4Addr, u8)>,
+    /// Routable IPv6 addresses. Link-local `fe80::` is excluded: every
+    /// interface has one whether or not the network works.
+    pub v6: Vec<std::net::Ipv6Addr>,
+}
+
+impl AddrInfo {
+    /// True when IPv4 autoconfiguration took over because DHCP never answered
+    /// (RFC 3927, `169.254.0.0/16`). The interface looks configured and can
+    /// reach nothing.
+    pub fn is_self_assigned(&self) -> bool {
+        self.v4.is_some_and(|(ip, _)| ip.is_link_local())
+    }
+
+    /// Whether `other` falls inside the configured IPv4 subnet. A gateway that
+    /// doesn't is unreachable no matter how healthy it is.
+    pub fn v4_contains(&self, other: IpAddr) -> Option<bool> {
+        let (ip, prefix) = self.v4?;
+        let IpAddr::V4(other) = other else {
+            return None;
+        };
+        // A /0 would shift by 32, which is UB-adjacent in Rust (it panics in
+        // debug). Treat it as "everything is inside", which is what /0 means.
+        let mask = if prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix.min(32))
+        };
+        Some(u32::from(ip) & mask == u32::from(other) & mask)
+    }
+}
+
 /// Resolver configuration facts.
 #[derive(Debug, Clone, Default)]
 pub struct ResolverInfo {
@@ -141,6 +183,12 @@ pub trait Platform: Send + Sync {
     fn route(&self) -> Result<RouteInfo, PlatformError>;
     /// Gather link-layer telemetry for the given interface.
     fn link(&self, interface: &str) -> Result<LinkInfo, PlatformError>;
+    /// Read the addresses configured on an interface.
+    fn addrs(&self, interface: &str) -> Result<AddrInfo, PlatformError>;
+    /// The interface to inspect when there is no default route to name one.
+    /// Without this, the state worth diagnosing most — a link that came up but
+    /// never got an address — would be the state wtfi cannot look at.
+    fn primary_interface(&self) -> Result<String, PlatformError>;
     /// Read the configured DNS resolvers.
     fn resolvers(&self) -> Result<ResolverInfo, PlatformError>;
     /// Describe the active VPN/overlay tunnel, if any. An inactive result

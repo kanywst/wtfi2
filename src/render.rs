@@ -112,12 +112,11 @@ fn verdict_block(v: &Verdict, p: &Palette) -> String {
 }
 
 fn detail(path: &Path, p: &Palette, verbose: bool) -> String {
-    use crate::model::HopId;
     let mut s = String::new();
+    // The host hop is listed like any other: it carries this machine's address,
+    // subnet and DHCP state now, which is the first thing you want when the
+    // question is "is it me?".
     for hop in &path.hops {
-        if hop.id == HopId::Host {
-            continue;
-        }
         let head = format!(
             "  {} {:<9} {}",
             hop.status.glyph(),

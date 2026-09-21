@@ -3,7 +3,7 @@
 //! Exists so the crate compiles off macOS — crates.io and docs.rs both build
 //! there. Every query refuses rather than inventing a reading.
 
-use super::{LinkInfo, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo};
+use super::{AddrInfo, LinkInfo, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo};
 
 pub struct Unsupported;
 
@@ -13,6 +13,14 @@ impl Platform for Unsupported {
     }
 
     fn link(&self, _interface: &str) -> Result<LinkInfo, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    fn addrs(&self, _interface: &str) -> Result<AddrInfo, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    fn primary_interface(&self) -> Result<String, PlatformError> {
         Err(PlatformError::Unsupported)
     }
 
@@ -34,6 +42,11 @@ mod tests {
         let p = Unsupported;
         assert!(matches!(p.route(), Err(PlatformError::Unsupported)));
         assert!(matches!(p.link("en0"), Err(PlatformError::Unsupported)));
+        assert!(matches!(p.addrs("en0"), Err(PlatformError::Unsupported)));
+        assert!(matches!(
+            p.primary_interface(),
+            Err(PlatformError::Unsupported)
+        ));
         assert!(matches!(p.resolvers(), Err(PlatformError::Unsupported)));
         assert!(matches!(p.vpn(), Err(PlatformError::Unsupported)));
     }

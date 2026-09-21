@@ -11,7 +11,7 @@
 //! Location permission, so those fields are best-effort. RSSI/noise are not
 //! redacted, which is what actually matters for signal diagnosis.
 
-use super::{LinkInfo, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo};
+use super::{AddrInfo, LinkInfo, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo};
 use std::net::IpAddr;
 use std::process::Command;
 
@@ -140,6 +140,15 @@ impl Platform for MacOs {
         let mut info = parse_airport(&text);
         info.interface = interface.to_string();
         Ok(info)
+    }
+
+    fn addrs(&self, interface: &str) -> Result<AddrInfo, PlatformError> {
+        Ok(parse_ifconfig_addrs(&run("ifconfig", &[interface])?))
+    }
+
+    fn primary_interface(&self) -> Result<String, PlatformError> {
+        let text = run("networksetup", &["-listallhardwareports"])?;
+        wifi_device(&text).ok_or_else(|| PlatformError::Parse("no Wi-Fi hardware port".into()))
     }
 
     fn resolvers(&self) -> Result<ResolverInfo, PlatformError> {
@@ -407,6 +416,65 @@ fn vendor_from_processes(ps: &str) -> Option<&'static str> {
         .map(|&(_, vendor)| vendor)
 }
 
+/// Pull the configured addresses out of `ifconfig <iface>`.
+///
+/// ```text
+/// en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+///     inet6 fe80::1859:1d30:acf0:1c1%en0 prefixlen 64 secured scopeid 0xb
+///     inet 192.168.0.15 netmask 0xffffff00 broadcast 192.168.0.255
+/// ```
+///
+/// The IPv6 link-local every interface carries is dropped: it is present
+/// whether or not the network works, so counting it would make an interface
+/// that got nothing look addressed.
+fn parse_ifconfig_addrs(text: &str) -> AddrInfo {
+    let mut info = AddrInfo::default();
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("inet ") {
+            let toks: Vec<&str> = rest.split_whitespace().collect();
+            let Some(Ok(ip)) = toks.first().map(|s| s.parse()) else {
+                continue;
+            };
+            // Keep the first address: macOS lists the primary one first, and a
+            // manually-added alias should not displace it.
+            if info.v4.is_none() {
+                // No readable netmask means no claim about the subnet, so /32
+                // — which contains only the host itself and makes
+                // `v4_contains` answer "no" rather than guessing "yes".
+                let prefix = toks
+                    .iter()
+                    .position(|w| *w == "netmask")
+                    .and_then(|i| toks.get(i + 1))
+                    .and_then(|m| parse_netmask_prefix(m))
+                    .unwrap_or(32);
+                info.v4 = Some((ip, prefix));
+            }
+        } else if let Some(rest) = t.strip_prefix("inet6 ")
+            && let Some(ip) = rest.split_whitespace().next().and_then(parse_addr)
+            && !is_link_local(ip)
+            && let IpAddr::V6(v6) = ip
+        {
+            info.v6.push(v6);
+        }
+    }
+    info
+}
+
+/// `0xffffff00` (or the dotted form) to a prefix length.
+///
+/// The mask is rejected unless its set bits are contiguous from the top: a
+/// non-contiguous mask has no prefix length, and inventing one would silently
+/// misjudge which addresses share the subnet.
+fn parse_netmask_prefix(tok: &str) -> Option<u8> {
+    let mask = match tok.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => u32::from(tok.parse::<std::net::Ipv4Addr>().ok()?),
+    };
+    let ones = mask.leading_ones();
+    (mask.count_ones() == ones).then_some(ones as u8)
+}
+
 fn parse_resolvers(text: &str) -> ResolverInfo {
     let mut ns = Vec::new();
     for line in text.lines() {
@@ -518,6 +586,64 @@ mod tests {
         assert_eq!(l.tx_rate_mbps, Some(585));
         assert!(l.is_wifi);
         assert!(l.ssid.is_none(), "redacted SSID must stay None");
+    }
+
+    /// Real `ifconfig en0` output from this machine.
+    const IFCONFIG: &str = "en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+	ether de:f9:c5:de:6e:4f
+	inet6 fe80::1859:1d30:acf0:1c1%en0 prefixlen 64 secured scopeid 0xb
+	inet 192.168.0.15 netmask 0xffffff00 broadcast 192.168.0.255
+	nd6 options=201<PERFORMNUD,DAD>";
+
+    #[test]
+    fn ifconfig_addrs_parse_v4_with_prefix() {
+        let a = parse_ifconfig_addrs(IFCONFIG);
+        let (ip, prefix) = a.v4.unwrap();
+        assert_eq!(ip.to_string(), "192.168.0.15");
+        assert_eq!(prefix, 24, "0xffffff00 is a /24");
+        assert!(
+            a.v6.is_empty(),
+            "the fe80:: every interface carries is not an address the network gave you"
+        );
+    }
+
+    #[test]
+    fn ifconfig_addrs_keep_routable_v6() {
+        let text = "en0: flags=8863 mtu 1500\n\
+                    \tinet6 fe80::1%en0 prefixlen 64 scopeid 0xb\n\
+                    \tinet6 2001:db8::5 prefixlen 64 autoconf";
+        let a = parse_ifconfig_addrs(text);
+        assert_eq!(a.v6.len(), 1);
+        assert_eq!(a.v6[0].to_string(), "2001:db8::5");
+    }
+
+    #[test]
+    fn ifconfig_addrs_detect_a_self_assigned_lease() {
+        let text = "en0: flags=8863 mtu 1500\n\tinet 169.254.13.7 netmask 0xffff0000";
+        assert!(parse_ifconfig_addrs(text).is_self_assigned());
+        assert!(!parse_ifconfig_addrs(IFCONFIG).is_self_assigned());
+    }
+
+    #[test]
+    fn netmask_prefixes_parse_in_both_forms() {
+        assert_eq!(parse_netmask_prefix("0xffffff00"), Some(24));
+        assert_eq!(parse_netmask_prefix("255.255.0.0"), Some(16));
+        assert_eq!(parse_netmask_prefix("0xffffffff"), Some(32));
+        assert_eq!(parse_netmask_prefix("0x00000000"), Some(0));
+        // Non-contiguous: there is no prefix length, and inventing one would
+        // silently misjudge which addresses share the subnet.
+        assert_eq!(parse_netmask_prefix("0xff00ff00"), None);
+        assert_eq!(parse_netmask_prefix("nonsense"), None);
+    }
+
+    #[test]
+    fn a_missing_netmask_claims_nothing_about_the_subnet() {
+        // /32 contains only the host, so `v4_contains` answers "no" rather
+        // than guessing that the gateway is reachable.
+        let a = parse_ifconfig_addrs("en0: flags=8863\n\tinet 192.168.0.15");
+        assert_eq!(a.v4.unwrap().1, 32);
+        assert_eq!(a.v4_contains("192.168.0.1".parse().unwrap()), Some(false));
     }
 
     #[test]
