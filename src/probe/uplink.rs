@@ -80,13 +80,6 @@ pub async fn probe() -> Hop {
     // constants alone, this asserted a completed "6-hop TTL sweep" sitting
     // right beside `grade()`'s correct "traceroute produced nothing" — the
     // evidence line contradicting the finding it was meant to support.
-    hop.evidence = (!hops.is_empty()).then(|| {
-        format!(
-            "TTL sweep to {TARGET}, {} of {MAX_TTL} hops reported, {QUERIES} probe per hop, {WAIT_SECS}s wait",
-            hops.iter().filter(|h| h.addr.is_some()).count()
-        )
-    });
-
     let target: IpAddr = TARGET.parse().expect("TARGET is a literal address");
     grade(&mut hop, &hops, target);
     hop
@@ -95,6 +88,20 @@ pub async fn probe() -> Hop {
 /// Turn the sweep into a verdict about where the path stops. Pure, so the
 /// reasoning is testable without a network to break.
 fn grade(hop: &mut Hop, hops: &[TtlHop], target: IpAddr) {
+    // Described from the sweep that happened, not from the config. The
+    // denominator is what was actually queried: `traceroute` stops as soon as
+    // the target replies, so an intact 3-hop path produces three lines, and
+    // "3 of 6 hops reported" would read as three failures where no fourth hop
+    // was ever asked. Omitted entirely when nothing came back, so the line
+    // can't assert a completed sweep beside "traceroute produced nothing".
+    hop.evidence = (!hops.is_empty()).then(|| {
+        format!(
+            "TTL sweep to {TARGET}, {} of {} hops queried replied, {QUERIES} probe per hop, {WAIT_SECS}s wait",
+            hops.iter().filter(|h| h.addr.is_some()).count(),
+            hops.len()
+        )
+    });
+
     for h in hops {
         let value = match (h.addr, h.rtt_ms) {
             (Some(addr), Some(ms)) => format!("{addr}  {ms:.1} ms"),
@@ -335,6 +342,26 @@ mod tests {
     /// config constants alone it asserted a completed "6-hop TTL sweep" beside
     /// `grade()`'s correct "traceroute produced nothing" — the evidence
     /// contradicting the finding it was meant to support.
+    /// `traceroute` stops at the target, so an intact 3-hop path produces
+    /// three lines rather than six. Reporting them against `MAX_TTL` read as
+    /// "3 replied, 3 didn't" when no fourth hop was ever queried — and this
+    /// hop only runs after a WAN failure, so the intact-path branch is a real
+    /// outcome whose evidence prints in `-v`.
+    #[test]
+    fn the_evidence_counts_hops_queried_not_the_configured_ceiling() {
+        let hop = graded(&[
+            (1, Some("192.168.0.1")),
+            (2, Some("203.0.113.1")),
+            (3, Some("1.1.1.1")),
+        ]);
+        let evidence = hop.evidence.expect("an intact sweep has evidence");
+        assert!(evidence.contains("3 of 3"), "got: {evidence}");
+        assert!(
+            !evidence.contains(&format!("of {MAX_TTL}")),
+            "the ceiling is not the denominator: {evidence}"
+        );
+    }
+
     #[tokio::test]
     async fn a_sweep_that_produced_nothing_claims_no_sweep() {
         let mut hop = Hop::new(HopId::Uplink, Layer::Internet, "Uplink");
