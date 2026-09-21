@@ -70,24 +70,30 @@ pub async fn probe(route: &RouteInfo) -> Hop {
     let q = if icmp.avg_ms().is_some() {
         icmp
     } else {
-        // Whether the fallback actually ran. It declines outright for a
-        // link-local IPv6 gateway, and the summary below must not then claim
-        // handshakes that were never attempted — reporting a measurement that
-        // did not happen is the bug this whole probe exists to avoid.
-        let tcp_attempted = route.gateway_zone.is_none();
-        match tcp_fallback(gw, route.gateway_zone.as_deref(), &TCP_PORTS).await {
-            Some((port, tcp)) => {
-                // The router is alive; ICMP is simply filtered. Grade it on
-                // the TCP round trips, which are a fair measure of the same
-                // path, and record why the numbers came from there.
-                hop.metrics.push(
-                    Metric::new("ICMP", "filtered (no echo reply)").with_status(Status::Warn),
-                );
+        let fallback = tcp_fallback(gw, route.gateway_zone.as_deref(), &TCP_PORTS).await;
+        // Asked of the fallback rather than recomputed here, so the summary
+        // can't drift from what was actually attempted.
+        let tcp_attempted = !matches!(fallback, TcpFallback::Declined);
+        match fallback {
+            TcpFallback::Answered(port, tcp) => {
+                // The router is alive over TCP. *Why* ICMP said nothing
+                // depends on whether any echo left the machine: "filtered"
+                // asserts the router saw one and dropped it, which a `ping`
+                // that never ran tells us nothing about. Reporting a local
+                // tool failure as router behaviour is the same bug class
+                // `ping_burst` was written to avoid, one layer up.
+                let icmp_note = if icmp.is_empty() {
+                    "no reply (the ping tool didn't run)"
+                } else {
+                    "filtered (echoes sent, none answered)"
+                };
+                hop.metrics
+                    .push(Metric::new("ICMP", icmp_note).with_status(Status::Warn));
                 hop.metrics
                     .push(Metric::new("Probed", format!("TCP :{port}")));
                 tcp
             }
-            None if icmp.is_empty() => {
+            _ if icmp.is_empty() => {
                 // No echoes went out *and* no handshake completed. We never
                 // measured anything, so we cannot claim the router is down.
                 hop.status = Status::Warn;
@@ -101,7 +107,7 @@ pub async fn probe(route: &RouteInfo) -> Hop {
                 });
                 return hop;
             }
-            None => {
+            _ => {
                 // Echoes went out and none came back. Say what was actually
                 // tried: on a link-local IPv6 gateway that is ICMP alone,
                 // because the TCP fallback can't reach `fe80::` without a
@@ -159,6 +165,23 @@ fn silent_summary(pings: u32, tcp_attempted: bool) -> String {
     }
 }
 
+/// What the TCP fallback did — reported by the fallback itself rather than
+/// re-derived at the call site.
+///
+/// The caller used to recompute the decline condition (`zone.is_none()`)
+/// independently, which is two sources of truth about what was tried: a second
+/// decline reason added here would have left the summary quietly claiming TCP
+/// was attempted when it wasn't — the exact bug the summary fix addressed.
+enum TcpFallback {
+    /// A port answered, and here is a burst measured against it.
+    Answered(u16, Quality),
+    /// Every port was tried and none answered.
+    Silent,
+    /// Nothing was sent: a link-local IPv6 gateway can't be reached without
+    /// the scope id `SocketAddr` cannot carry.
+    Declined,
+}
+
 /// Ask the router over TCP when it won't answer ICMP.
 ///
 /// Returns the port that answered and a burst measured against it, or `None`
@@ -166,9 +189,9 @@ fn silent_summary(pings: u32, tcp_attempted: bool) -> String {
 /// needs the scope id that [`SocketAddr`] cannot carry, and a handshake sent
 /// without it fails for a reason that has nothing to do with the router — a
 /// false "silent" is exactly what this function exists to prevent.
-async fn tcp_fallback(gw: IpAddr, zone: Option<&str>, ports: &[u16]) -> Option<(u16, Quality)> {
+async fn tcp_fallback(gw: IpAddr, zone: Option<&str>, ports: &[u16]) -> TcpFallback {
     if zone.is_some() {
-        return None;
+        return TcpFallback::Declined;
     }
     // Try the candidates at once rather than in series: the ports that aren't
     // open cost a full TCP_WAIT each, and three of those in a row would not
@@ -180,7 +203,9 @@ async fn tcp_fallback(gw: IpAddr, zone: Option<&str>, ports: &[u16]) -> Option<(
     .into_iter()
     .find_map(|(port, probe)| probe.is_up().then_some((port, probe)));
 
-    let (port, first) = found?;
+    let Some((port, first)) = found else {
+        return TcpFallback::Silent;
+    };
     // Reuse the handshake that found the port as sample one, the way the WAN
     // probe does — it already happened, under the same deadline as the rest.
     let mut samples = vec![first];
@@ -188,7 +213,7 @@ async fn tcp_fallback(gw: IpAddr, zone: Option<&str>, ports: &[u16]) -> Option<(
         tokio::time::sleep(TCP_INTERVAL).await;
         samples.push(tcp_connect(SocketAddr::new(gw, port), TCP_WAIT).await);
     }
-    Some((port, Quality::from_samples(&samples)))
+    TcpFallback::Answered(port, Quality::from_samples(&samples))
 }
 
 #[cfg(test)]
@@ -206,9 +231,11 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        let (found, q) = tcp_fallback("127.0.0.1".parse().unwrap(), None, &[port])
-            .await
-            .expect("an open port must be found");
+        let TcpFallback::Answered(found, q) =
+            tcp_fallback("127.0.0.1".parse().unwrap(), None, &[port]).await
+        else {
+            panic!("an open port must be found");
+        };
         assert_eq!(found, port);
         assert_eq!(q.sent, TCP_SAMPLES as u32);
         assert_eq!(q.loss_pct(), Some(0.0), "a local listener drops nothing");
@@ -222,11 +249,10 @@ mod tests {
         // expecting it to stay closed races against a concurrent test being
         // handed the same number. Nothing binds :1, and loopback refuses
         // instantly rather than making the test wait out TCP_WAIT.
-        assert!(
-            tcp_fallback("127.0.0.1".parse().unwrap(), None, &[1])
-                .await
-                .is_none()
-        );
+        assert!(matches!(
+            tcp_fallback("127.0.0.1".parse().unwrap(), None, &[1]).await,
+            TcpFallback::Silent
+        ));
     }
 
     /// A handshake to `fe80::1` without its scope id fails for a reason that
@@ -235,7 +261,12 @@ mod tests {
     #[tokio::test]
     async fn a_link_local_gateway_declines_the_tcp_fallback() {
         let gw: IpAddr = "fe80::1".parse().unwrap();
-        assert!(tcp_fallback(gw, Some("en0"), &TCP_PORTS).await.is_none());
+        // Declined, not Silent: the difference is what stops the summary
+        // claiming handshakes that were never sent.
+        assert!(matches!(
+            tcp_fallback(gw, Some("en0"), &TCP_PORTS).await,
+            TcpFallback::Declined
+        ));
     }
 
     /// The summary must only claim what was tried. `tcp_fallback` declines
