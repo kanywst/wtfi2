@@ -76,6 +76,11 @@ pub async fn probe() -> Hop {
         }
     }
 
+    hop.evidence = Some(format!(
+        "{}-hop TTL sweep to {TARGET}, {QUERIES} probe per hop, {WAIT_SECS}s wait",
+        MAX_TTL
+    ));
+
     let target: IpAddr = TARGET.parse().expect("TARGET is a literal address");
     grade(&mut hop, &hops, target);
     hop

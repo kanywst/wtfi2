@@ -66,6 +66,9 @@ pub async fn probe() -> Hop {
         check_hotspot(&client),
         check_interception(&client, UNROUTABLE)
     );
+    hop.evidence = Some(format!(
+        "hotspot check against {HOTSPOT}, plus a DNS-free port-80 probe to {UNROUTABLE}"
+    ));
     grade(&mut hop, hotspot, intercepted);
     hop
 }

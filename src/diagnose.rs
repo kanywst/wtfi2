@@ -28,6 +28,11 @@ pub struct Verdict {
     /// A concrete next action, when we have one.
     pub fix: Option<String>,
     pub confidence: Confidence,
+    /// The hop this conclusion came from, so the report can show what that hop
+    /// actually measured. A verdict the reader can't check is one they have to
+    /// take on trust, and "your ISP is down" is far too strong a claim to hand
+    /// over without the method behind it.
+    pub source: Option<HopId>,
 }
 
 /// Derive a verdict from a (ideally complete) path.
@@ -40,6 +45,7 @@ pub fn diagnose(path: &Path) -> Verdict {
             cause: "Probing each hop from your Wi-Fi link out to the internet.".into(),
             fix: None,
             confidence: Confidence::Guess,
+            source: None,
         };
     }
 
@@ -67,6 +73,7 @@ pub fn diagnose(path: &Path) -> Verdict {
                 .unwrap_or_else(|| "No hop reported a result.".into()),
             fix: None,
             confidence: Confidence::Certain,
+            source: Some(HopId::Link),
         };
     }
 
@@ -101,6 +108,7 @@ pub fn diagnose(path: &Path) -> Verdict {
         cause: "Every hop from your Wi-Fi to the internet is healthy.".into(),
         fix: None,
         confidence: Confidence::Certain,
+        source: None,
     }
 }
 
@@ -326,6 +334,7 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
         cause,
         fix,
         confidence,
+        source: Some(id),
     }
 }
 
@@ -374,6 +383,7 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
                     .into(),
             ),
             confidence: Confidence::Certain,
+            source: Some(id),
         };
     }
 
@@ -515,6 +525,7 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
         cause: format!("{cause}{gap}"),
         fix,
         confidence: Confidence::Likely,
+        source: Some(id),
     }
 }
 

@@ -201,6 +201,12 @@ pub async fn probe() -> Hop {
         }
     }
 
+    hop.evidence = Some(format!(
+        "{} handshakes to :{PORT} across {} independent operators, plus one verified HTTPS request",
+        v4.reached.len() + v6.reached.len(),
+        operators().split(", ").count()
+    ));
+
     match (v4.any_up(), v6.any_up()) {
         (true, dual_stack) => {
             // Reachability is settled; the open questions are quality, whether

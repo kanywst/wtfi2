@@ -168,6 +168,14 @@ pub struct Hop {
     pub fault: Option<Fault>,
     /// One-line human summary shown in the detail panel.
     pub summary: Option<String>,
+    /// What this hop actually did to reach its conclusion — how many probes,
+    /// to where, over how long.
+    ///
+    /// A verdict without this is an assertion: the reader has to take "your
+    /// ISP is down" on trust, with no way to tell a thorough measurement from
+    /// a single timed-out packet. Stating the method is what turns it into a
+    /// diagnosis they can check, argue with, or quote to someone else.
+    pub evidence: Option<String>,
     /// Round-trip latency in milliseconds, when meaningful.
     pub latency_ms: Option<f64>,
     /// Share of probe samples that never came back, when the hop was measured
@@ -189,6 +197,7 @@ impl Hop {
             status: Status::Pending,
             fault: None,
             summary: None,
+            evidence: None,
             latency_ms: None,
             loss_pct: None,
             jitter_ms: None,

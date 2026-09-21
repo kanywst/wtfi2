@@ -48,7 +48,7 @@ pub fn report(path: &Path, verdict: &Verdict, verbose: bool, color: bool) -> Str
 
     out.push_str(&topology(path, &p));
     out.push_str("\n\n");
-    out.push_str(&verdict_block(verdict, &p));
+    out.push_str(&verdict_block(path, verdict, &p));
     out.push('\n');
     out.push_str(&detail(path, &p, verbose));
 
@@ -79,7 +79,12 @@ fn topology(path: &Path, p: &Palette) -> String {
     line
 }
 
-fn verdict_block(v: &Verdict, p: &Palette) -> String {
+/// What the hop behind the verdict actually measured, when it recorded it.
+fn verdict_evidence(path: &Path, v: &Verdict) -> Option<String> {
+    path.get(v.source?)?.evidence.clone()
+}
+
+fn verdict_block(path: &Path, v: &Verdict, p: &Palette) -> String {
     let mut s = String::new();
     let tag = match v.status {
         Status::Ok => "  ALL GOOD ",
@@ -98,6 +103,15 @@ fn verdict_block(v: &Verdict, p: &Palette) -> String {
             "            {} {}\n",
             p.status(Status::Ok, "→"),
             fix
+        ));
+    }
+    // What the claim rests on. Without it the reader has no way to tell a
+    // thorough measurement from a single timed-out packet.
+    if let Some(evidence) = verdict_evidence(path, v) {
+        s.push_str(&format!(
+            "            {} {}\n",
+            p.dim("evidence:"),
+            p.dim(&evidence)
         ));
     }
     let conf = match v.confidence {
@@ -129,6 +143,12 @@ fn detail(path: &Path, p: &Palette, verbose: bool) -> String {
             s.push_str(&format!("      {}\n", p.dim(sum)));
         }
         if verbose {
+            // Every hop's method, not just the one that owns the verdict: in
+            // verbose mode the reader is checking the working, and a metric
+            // means little without knowing how it was taken.
+            if let Some(evidence) = &hop.evidence {
+                s.push_str(&format!("      {}\n", p.dim(&format!("↳ {evidence}"))));
+            }
             for m in &hop.metrics {
                 let v = match m.status {
                     Some(st) => p.status(st, &m.value),
@@ -184,6 +204,64 @@ mod tests {
         assert!(out.contains("dropping packets"));
         assert!(out.contains("40%"));
         assert!(!out.contains("─✗─"), "nothing is broken, so no break glyph");
+    }
+
+    /// A verdict the reader can't check is one they have to take on trust,
+    /// and "your ISP is down" is far too strong a claim to hand over without
+    /// the method behind it.
+    #[test]
+    fn the_verdict_shows_what_the_owning_hop_measured() {
+        let mut wan = ok(HopId::Wan, Layer::Internet, "Internet");
+        wan.status = Status::Fail;
+        wan.fault = Some(crate::model::Fault::NoInternet);
+        wan.summary = Some("No TCP path to the internet".into());
+        wan.evidence = Some("5 handshakes to :443 across 3 independent operators".into());
+        let path = Path {
+            hops: vec![
+                ok(HopId::Link, Layer::Link, "Wi-Fi"),
+                ok(HopId::Gateway, Layer::Network, "Gateway"),
+                wan,
+            ],
+        };
+        let out = report(&path, &diagnose(&path), false, false);
+        assert!(out.contains("evidence:"), "no evidence line:\n{out}");
+        assert!(
+            out.contains("3 independent operators"),
+            "the method must be quoted:\n{out}"
+        );
+    }
+
+    /// A hop with nothing to say about its method must not print an empty
+    /// label — a bare "evidence:" is worse than none.
+    #[test]
+    fn a_hop_without_evidence_prints_no_evidence_line() {
+        let mut gw = ok(HopId::Gateway, Layer::Network, "Gateway");
+        gw.status = Status::Fail;
+        gw.fault = Some(crate::model::Fault::GatewaySilent);
+        let path = Path {
+            hops: vec![ok(HopId::Link, Layer::Link, "Wi-Fi"), gw],
+        };
+        let out = report(&path, &diagnose(&path), false, false);
+        assert!(!out.contains("evidence:"), "got:\n{out}");
+    }
+
+    /// In verbose mode the reader is checking the working, so every hop's
+    /// method is shown — not just the one that owns the verdict.
+    #[test]
+    fn verbose_shows_the_method_for_every_hop() {
+        let mut gw = ok(HopId::Gateway, Layer::Network, "Gateway");
+        gw.evidence = Some("5 ICMP echoes to 192.168.0.1".into());
+        let mut dns = ok(HopId::Dns, Layer::Application, "DNS");
+        dns.evidence = Some("3 resolvers queried".into());
+        let path = Path {
+            hops: vec![ok(HopId::Link, Layer::Link, "Wi-Fi"), gw, dns],
+        };
+        let out = report(&path, &diagnose(&path), true, false);
+        assert!(out.contains("5 ICMP echoes"), "got:\n{out}");
+        assert!(out.contains("3 resolvers queried"), "got:\n{out}");
+        // …and stays out of the way when it isn't asked for.
+        let terse = report(&path, &diagnose(&path), false, false);
+        assert!(!terse.contains("5 ICMP echoes"), "got:\n{terse}");
     }
 
     #[test]

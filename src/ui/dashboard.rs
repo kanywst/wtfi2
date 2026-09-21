@@ -168,7 +168,7 @@ fn draw(f: &mut Frame, app: &App) {
     let rows = Layout::vertical([
         Constraint::Length(1), // header
         Constraint::Length(6), // topology
-        Constraint::Length(5), // verdict
+        Constraint::Length(6), // verdict (headline, cause, fix, evidence)
         Constraint::Min(6),    // detail + telemetry
         Constraint::Length(1), // footer
     ])
@@ -311,6 +311,14 @@ fn verdict(f: &mut Frame, area: Rect, app: &App) {
             Span::styled("→ ", Style::new().fg(Color::Green).bold()),
             Span::raw(fix.clone()),
         ]));
+    }
+    // The method behind the claim, so a live verdict can be checked rather
+    // than taken on trust.
+    if let Some(evidence) = v.source.and_then(|id| app.path.get(id)?.evidence.clone()) {
+        lines.push(Line::from(Span::styled(
+            format!("evidence: {evidence}"),
+            Style::new().dim(),
+        )));
     }
     let block = Block::default()
         .borders(Borders::ALL)

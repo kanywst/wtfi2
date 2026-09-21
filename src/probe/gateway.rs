@@ -64,6 +64,11 @@ pub async fn probe(route: &RouteInfo) -> Hop {
     };
 
     let icmp = ping_burst(gw, route.gateway_zone.as_deref(), SAMPLES, INTERVAL, BUDGET).await;
+    hop.evidence = Some(format!(
+        "{} ICMP echoes to {gw}, {}ms apart",
+        icmp.sent,
+        INTERVAL.as_millis()
+    ));
 
     // ICMP said nothing — either every echo was dropped, or `ping` never ran.
     // Ask again over TCP before drawing any conclusion from the silence.
@@ -91,6 +96,10 @@ pub async fn probe(route: &RouteInfo) -> Hop {
                     .push(Metric::new("ICMP", icmp_note).with_status(Status::Warn));
                 hop.metrics
                     .push(Metric::new("Probed", format!("TCP :{port}")));
+                hop.evidence = Some(format!(
+                    "{} ICMP echoes to {gw} (all unanswered), then {} TCP handshakes to :{port}",
+                    icmp.sent, tcp.sent
+                ));
                 tcp
             }
             _ if icmp.is_empty() => {
