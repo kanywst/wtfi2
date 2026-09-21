@@ -8,6 +8,7 @@
 use crate::model::{Fault, Hop, HopId, Layer, Path, Status};
 use crate::platform::{self, Platform, PlatformError};
 use crate::probe;
+use std::net::IpAddr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -98,23 +99,45 @@ fn send_stalled(tx: &mpsc::UnboundedSender<Hop>, status: Status, fault: Fault, s
     }
 }
 
+/// The unmeasured `You` hop the skeleton starts from, before the host probe
+/// has said what address this machine actually holds.
 fn host_hop() -> Hop {
     let mut h = Hop::new(HopId::Host, Layer::Link, "You");
-    h.status = Status::Ok;
     h.subtitle = Some("this Mac".into());
     h
+}
+
+/// Measure local addressing, falling back to the primary interface when there
+/// is no default route to name one. That fallback is the point: a link that
+/// came up and never got a lease has no route *because* of the fault, and it
+/// is the state most worth reporting.
+fn probe_host(iface: Option<String>, gateway: Option<IpAddr>) -> Hop {
+    let platform = platform::current();
+    let iface = iface.or_else(|| platform.primary_interface().ok());
+    match iface {
+        Some(iface) => probe::host::probe(&platform, &iface, gateway),
+        None => {
+            let mut hop = host_hop();
+            hop.status = Status::Warn;
+            hop.fault = Some(Fault::Unobserved);
+            hop.summary = Some("Couldn't tell which interface to inspect".into());
+            hop
+        }
+    }
 }
 
 /// Spawn all probes; returns a receiver of hops as they complete.
 pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        let _ = tx.send(host_hop());
-
         // Nothing can be measured without a platform module, and an unmeasured
         // hop is unknown rather than broken. Probing anyway would grade every
         // refusal as a network fault.
         if let Some(reason) = platform::UNSUPPORTED_OS {
+            let mut host = host_hop();
+            host.status = Status::Skipped;
+            host.fault = Some(Fault::Unobserved);
+            let _ = tx.send(host);
             send_stalled(&tx, Status::Skipped, Fault::Unobserved, reason.into());
             return;
         }
@@ -126,6 +149,32 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
             // associated" — you can be perfectly associated to an AP and still
             // have no lease, and the two faults have different fixes.
             Ok(Err(PlatformError::NoNetwork)) => {
+                // Still measure the host: "no route" and "no lease" look
+                // identical from the routing table, and the host hop is the
+                // only place that can tell them apart.
+                //
+                // Bounded like every other probe. It shells out to
+                // `networksetup` and `ifconfig`, and awaiting it unbounded
+                // here would hold the sweep before `send_stalled` ever runs —
+                // leaving every downstream hop Pending, which the one-shot CLI
+                // survives via its outer deadline but the live dashboard does
+                // not: it would sit on "scanning" forever.
+                let host = tokio::time::timeout(
+                    PROBE_DEADLINE,
+                    tokio::task::spawn_blocking(|| probe_host(None, None)),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_else(|| {
+                    unmeasured(
+                        HopId::Host,
+                        Layer::Link,
+                        "You",
+                        "Couldn't read this machine's addresses",
+                    )
+                });
+                let _ = tx.send(host);
                 send_stalled(
                     &tx,
                     Status::Fail,
@@ -138,6 +187,10 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
             // never observed. Grading that as an outage would report a working
             // connection as broken on the strength of our own blindness.
             Ok(Err(e)) => {
+                let mut host = host_hop();
+                host.status = Status::Skipped;
+                host.fault = Some(Fault::Unobserved);
+                let _ = tx.send(host);
                 send_stalled(
                     &tx,
                     Status::Skipped,
@@ -147,6 +200,10 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
                 return;
             }
             Err(e) => {
+                let mut host = host_hop();
+                host.status = Status::Skipped;
+                host.fault = Some(Fault::Unobserved);
+                let _ = tx.send(host);
                 send_stalled(
                     &tx,
                     Status::Skipped,
@@ -156,6 +213,25 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
                 return;
             }
         };
+
+        // Host addressing.
+        let iface_host = route.interface.clone();
+        let gw_host = route.gateway;
+        let tx_host = tx.clone();
+        tokio::spawn(send_bounded(
+            tx_host,
+            unmeasured(
+                HopId::Host,
+                Layer::Link,
+                "You",
+                "Couldn't read this machine's addresses",
+            ),
+            async move {
+                tokio::task::spawn_blocking(move || probe_host(Some(iface_host), gw_host))
+                    .await
+                    .ok()
+            },
+        ));
 
         // L2 link telemetry is a blocking platform call that can be slow
         // (`system_profiler` takes seconds) and has been known to wedge.

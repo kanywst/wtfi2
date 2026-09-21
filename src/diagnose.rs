@@ -46,10 +46,17 @@ pub fn diagnose(path: &Path) -> Verdict {
     // 1. Nothing was measured: every hop skipped. Absence of evidence is not
     //    health, so this must not fall through to the clean bill below. The
     //    reason, when there is one, is whatever the Link hop recorded.
+    //
+    //    The host hop is exempt only while it is *not* a finding. It used to be
+    //    a static "you exist" stub and so was excluded wholesale; now that it
+    //    is a real measurement, a failed one has to own the verdict rather than
+    //    be read as an absence of evidence.
     if path
         .hops
         .iter()
-        .all(|h| h.id == HopId::Host || h.status == Status::Skipped)
+        .filter(|h| h.id != HopId::Host)
+        .all(|h| h.status == Status::Skipped)
+        && path.get(HopId::Host).is_none_or(|h| h.status <= Status::Ok)
     {
         return Verdict {
             status: Status::Skipped,
@@ -220,6 +227,27 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
             Some("Reconnect or quit the VPN client, then re-test.".to_string()),
             Confidence::Likely,
         ),
+        // DHCP never answered, so macOS autoconfigured. Every hop downstream
+        // will fail too, but they are all collateral: nothing can be reached
+        // from an address nothing else shares.
+        (HopId::Host, Some(Fault::SelfAssignedAddr)) => (
+            "DHCP never gave you an address",
+            "Your Mac fell back to a self-assigned 169.254 address, which can't reach anything beyond this machine. The Wi-Fi link is fine; the lease is what's missing.".to_string(),
+            Some("Renew the DHCP lease (System Settings → Network → Details → TCP/IP → Renew DHCP Lease). If that fails, the router's DHCP server is the problem, not your Mac.".to_string()),
+            Confidence::Certain,
+        ),
+        (HopId::Host, Some(Fault::NoAddress)) => (
+            "This machine has no IP address",
+            "The interface is up but unconfigured — no IPv4 lease and no routable IPv6.".to_string(),
+            Some("Renew the DHCP lease, or check for a static configuration that was left half-filled.".to_string()),
+            Confidence::Certain,
+        ),
+        (HopId::Host, Some(Fault::GatewayOffSubnet)) => (
+            "Your address and your router don't match",
+            "Your machine and its default gateway are configured on different subnets, so they can't reach each other at all — the router will look unresponsive because nothing you send can arrive.".to_string(),
+            Some("Renew the DHCP lease, or clear a static IP left over from a different network.".to_string()),
+            Confidence::Certain,
+        ),
         (HopId::Host, _) => (
             "You're offline",
             "The connectivity chain is broken end-to-end.".to_string(),
@@ -382,6 +410,11 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
             "DNS is slow",
             format!("Resolution works but is sluggish — {summary}."),
             Some("Try a faster resolver like 1.1.1.1.".to_string()),
+        ),
+        HopId::Host => (
+            "Your addressing is off",
+            summary.clone(),
+            Some("Check the interface's IP configuration — a static address left over from another network does this.".to_string()),
         ),
         _ => ("Minor degradation", summary, None),
     };
@@ -613,6 +646,81 @@ mod tests {
             hops: vec![link, hop(HopId::Gateway, Layer::Network, Status::Ok)],
         };
         assert!(!diagnose(&p).cause.contains("went unmeasured"));
+    }
+
+    /// A lease that never arrived is a break at the *host*, earlier in the
+    /// chain than anything downstream. Before the host hop measured anything,
+    /// this network read as "your router isn't responding" — sending you to
+    /// reboot a router that was answering everyone else just fine.
+    #[test]
+    fn a_self_assigned_address_owns_the_verdict_over_the_router() {
+        let mut host = hop(HopId::Host, Layer::Link, Status::Fail);
+        host.fault = Some(Fault::SelfAssignedAddr);
+        let p = Path {
+            hops: vec![
+                host,
+                hop(HopId::Link, Layer::Link, Status::Ok),
+                hop(HopId::Gateway, Layer::Network, Status::Fail),
+                hop(HopId::Wan, Layer::Internet, Status::Fail),
+            ],
+        };
+        let v = diagnose(&p);
+        assert!(v.headline.contains("DHCP"), "got: {}", v.headline);
+        assert!(!v.headline.contains("router"), "got: {}", v.headline);
+        assert_eq!(v.confidence, Confidence::Certain);
+    }
+
+    /// The host hop is a real measurement now, so a failed one must not be
+    /// swallowed by the "nothing was measured" guard that used to exempt it.
+    #[test]
+    fn a_failed_host_hop_is_not_read_as_an_absence_of_evidence() {
+        let mut host = hop(HopId::Host, Layer::Link, Status::Fail);
+        host.fault = Some(Fault::NoAddress);
+        let p = Path {
+            hops: vec![
+                host,
+                hop(HopId::Link, Layer::Link, Status::Skipped),
+                hop(HopId::Gateway, Layer::Network, Status::Skipped),
+            ],
+        };
+        let v = diagnose(&p);
+        assert_eq!(v.status, Status::Fail);
+        assert_ne!(v.headline, "Nothing was measured");
+    }
+
+    /// …while a healthy host hop still lets that guard do its job.
+    #[test]
+    fn a_healthy_host_hop_does_not_block_the_nothing_measured_verdict() {
+        let p = Path {
+            hops: vec![
+                hop(HopId::Host, Layer::Link, Status::Ok),
+                hop(HopId::Link, Layer::Link, Status::Skipped),
+                hop(HopId::Gateway, Layer::Network, Status::Skipped),
+            ],
+        };
+        assert_eq!(diagnose(&p).headline, "Nothing was measured");
+    }
+
+    /// The gateway's own probe fails as collateral here, and its arm says
+    /// "reboot the router" at `Likely` — while the host hop already holds the
+    /// certain, specific cause. `Host` sorts before `Gateway`, so grading this
+    /// as a break is what lets the right evidence win.
+    #[test]
+    fn a_gateway_off_subnet_beats_the_routers_collateral_failure() {
+        let mut host = hop(HopId::Host, Layer::Link, Status::Fail);
+        host.fault = Some(Fault::GatewayOffSubnet);
+        let mut gw = hop(HopId::Gateway, Layer::Network, Status::Fail);
+        gw.fault = Some(Fault::GatewaySilent);
+        let p = Path {
+            hops: vec![host, hop(HopId::Link, Layer::Link, Status::Ok), gw],
+        };
+        let v = diagnose(&p);
+        assert!(v.headline.contains("don't match"), "got: {}", v.headline);
+        assert!(
+            !v.fix.as_deref().unwrap().contains("Reboot"),
+            "the router is fine; it just can't be reached"
+        );
+        assert_eq!(v.confidence, Confidence::Certain);
     }
 
     #[test]

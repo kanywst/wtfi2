@@ -111,13 +111,14 @@ Code 4 is deliberately distinct from 2: it means the OS tools wtfi reads the net
 Probes fan out concurrently and stream their results into the path as they
 complete:
 
-1. **L2 Link** — Wi-Fi RSSI, noise, SNR, channel, PHY mode, security and tx
+1. **Host** — what address this machine actually holds: IPv4 and prefix, routable IPv6, whether DHCP answered at all or IPv4 autoconfiguration took over, whether the gateway is even inside your subnet, and whether your lease is behind carrier-grade NAT.
+2. **L2 Link** — Wi-Fi RSSI, noise, SNR, channel, PHY mode, security and tx
    rate, graded into a signal quality.
-2. **L3 Gateway** — resolves the default route and sends a short ICMP burst to the router, measuring RTT, packet loss and jitter, and flagging VPN/tunnel interfaces and sub-1500 MTU.
-3. **WAN** — real TCP handshakes to anycast resolvers over IPv4 and IPv6 to expose asymmetric blackholing without needing raw ICMP, then repeats the handshake to measure loss and jitter on the uplink itself.
-4. **DNS** — benchmarks the system resolver against Cloudflare and Google to
+3. **L3 Gateway** — resolves the default route and sends a short ICMP burst to the router, measuring RTT, packet loss and jitter, and flagging VPN/tunnel interfaces and sub-1500 MTU.
+4. **WAN** — real TCP handshakes to anycast resolvers over IPv4 and IPv6 to expose asymmetric blackholing without needing raw ICMP, then repeats the handshake to measure loss and jitter on the uplink itself.
+5. **DNS** — benchmarks the system resolver against Cloudflare and Google to
    separate "DNS is down" from "your resolver is just slow".
-5. **Captive portal** — a plain-HTTP hotspot check that catches login-page
+6. **Captive portal** — a plain-HTTP hotspot check that catches login-page
    interception before you think you're online.
 
 The diagnosis engine then walks the completed chain, finds the *first* break (everything downstream is collateral), and turns it into the verdict. With no break at all it moves on to quality: a hop that answers but loses ≥ 25% of a burst counts as degradation, and where that loss starts decides whether the verdict blames your Wi-Fi, your router or your ISP.

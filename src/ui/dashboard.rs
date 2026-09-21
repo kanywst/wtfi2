@@ -330,9 +330,6 @@ fn bottom(f: &mut Frame, area: Rect, app: &App) {
 fn detail(f: &mut Frame, area: Rect, app: &App) {
     let mut lines = Vec::new();
     for hop in &app.path.hops {
-        if hop.id == HopId::Host {
-            continue;
-        }
         let c = color(hop.status);
         let mut spans = vec![
             Span::styled(format!("{} ", hop.status.glyph()), Style::new().fg(c)),

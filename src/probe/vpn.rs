@@ -90,7 +90,7 @@ pub fn probe(platform: &impl Platform, route: &RouteInfo) -> Hop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::{LinkInfo, PlatformError, ResolverInfo, VpnInfo};
+    use crate::platform::{AddrInfo, LinkInfo, PlatformError, ResolverInfo, VpnInfo};
 
     struct MockPlatform(VpnInfo);
     impl Platform for MockPlatform {
@@ -99,6 +99,12 @@ mod tests {
         }
         fn link(&self, _: &str) -> Result<LinkInfo, PlatformError> {
             Ok(LinkInfo::default())
+        }
+        fn addrs(&self, _: &str) -> Result<AddrInfo, PlatformError> {
+            Ok(AddrInfo::default())
+        }
+        fn primary_interface(&self) -> Result<String, PlatformError> {
+            Ok("en0".into())
         }
         fn resolvers(&self) -> Result<ResolverInfo, PlatformError> {
             Ok(ResolverInfo::default())
@@ -130,6 +136,12 @@ mod tests {
         }
         fn link(&self, _: &str) -> Result<LinkInfo, PlatformError> {
             Ok(LinkInfo::default())
+        }
+        fn addrs(&self, _: &str) -> Result<AddrInfo, PlatformError> {
+            Ok(AddrInfo::default())
+        }
+        fn primary_interface(&self) -> Result<String, PlatformError> {
+            Ok("en0".into())
         }
         fn resolvers(&self) -> Result<ResolverInfo, PlatformError> {
             Ok(ResolverInfo::default())
