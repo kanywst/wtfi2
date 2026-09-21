@@ -190,6 +190,19 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
             Some("Disconnect the VPN and re-run. If the path comes back, the tunnel was the problem — your own line and your ISP aren't involved.".to_string()),
             Confidence::Likely,
         ),
+        // Same hedge the Wan arm makes, for the same reason. The VPN probe and
+        // the WAN failure are independent events, so both can time out in one
+        // run — and `vpn_is_full_tunnel` needs a `Mode` metric that an
+        // unmeasured VPN hop doesn't have. Without this the verdict says
+        // "report the outage to your ISP" at `Likely` for a trace that may
+        // have gone through a dead tunnel still owning the default route, and
+        // because `Uplink` precedes `Wan` the Wan arm's own hedge never runs.
+        (HopId::Uplink, _) if vpn_state_unknown(path) => (
+            "The path past your router breaks, but a VPN may be in the way",
+            format!("{} wtfi couldn't read whether a VPN is carrying your traffic, and a tunnel that owns the default route would have been traced instead of your own line — so the hops named may not be your ISP's at all.", uplink_evidence(path)),
+            Some("If you're on a VPN, disconnect it and re-run before reporting anything to your ISP.".to_string()),
+            Confidence::Guess,
+        ),
         (HopId::Uplink, Some(Fault::UplinkDiesAtModem)) => (
             "The break is on your line, not inside your ISP",
             format!("Your router answers, but nothing past it does — and the trace stops at the very first step outside your house. {} That points at the modem/ONU, the WAN cable, or the line itself rather than at your provider's network.", uplink_evidence(path)),
@@ -1002,6 +1015,37 @@ mod tests {
             hops: vec![hop(HopId::Gateway, Layer::Network, Status::Ok), vpn, uplink],
         };
         assert!(diagnose(&p).headline.contains("inside your ISP"));
+    }
+
+    /// The VPN probe and the WAN failure are independent events, so both can
+    /// time out in one run. `vpn_is_full_tunnel` needs a `Mode` metric an
+    /// unmeasured VPN hop doesn't have, so without a hedge the verdict says
+    /// "report the outage to your ISP" at `Likely` for a trace that may have
+    /// gone through a dead tunnel — and `Uplink` preceding `Wan` means that
+    /// arm's own hedge never gets to run.
+    #[test]
+    fn an_unknown_vpn_state_hedges_the_uplink_verdict_too() {
+        let mut vpn = hop(HopId::Vpn, Layer::Network, Status::Warn);
+        vpn.fault = Some(Fault::Unobserved);
+        let mut uplink = hop(HopId::Uplink, Layer::Internet, Status::Fail);
+        uplink.fault = Some(Fault::UplinkDiesInIsp);
+        uplink.summary = Some("Dies past hop 2.".into());
+        let p = Path {
+            hops: vec![
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                vpn,
+                uplink,
+                hop(HopId::Wan, Layer::Internet, Status::Fail),
+            ],
+        };
+        let v = diagnose(&p);
+        assert_eq!(v.confidence, Confidence::Guess);
+        assert!(
+            !v.fix.as_deref().unwrap().contains("Report the outage"),
+            "don't send the reader to their ISP on an unread tunnel: {:?}",
+            v.fix
+        );
+        assert!(v.cause.contains("may not be your ISP"), "got: {}", v.cause);
     }
 
     #[test]
