@@ -104,6 +104,8 @@ The exit code reflects health, so scripts can branch on it:
 | 3    | Unsupported platform      |
 | 4    | Nothing could be measured |
 
+The codes and the `--json` shape are the only things scripts are told they can depend on, so `tests/cli.rs` drives the real binary and pins both: the code is always one of the five above, it always agrees with the reported status, every hop has settled, and `first_break` / `verdict.source` always name a hop that is really in the path.
+
 Code 4 is deliberately distinct from 2: it means the OS tools wtfi reads the network through wouldn't run, so nothing was observed either way. A script should retry on 4 rather than treat it as an outage.
 
 ## How it works

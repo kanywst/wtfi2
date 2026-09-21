@@ -47,6 +47,10 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-core-wlan = { version = "0.3", default-features = false, features = ["std", "CWInterface", "CWWiFiClient", "CWChannel", "CoreWLANTypes"] }
 
 [dev-dependencies]
+# The integration tests parse the binary's --json output. serde_json is already
+# a runtime dependency, but tests/ links only against the crate and its dev
+# dependencies, so it has to be named again here.
+serde_json = "1"
 
 [profile.release]
 lto = "thin"
