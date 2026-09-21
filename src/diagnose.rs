@@ -197,6 +197,16 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
                 )
             }
         }
+        // Resolution succeeds — it just lies. Reporting that as "name
+        // resolution is failing … a classic DNS-only outage" describes the
+        // opposite symptom, and sends the reader chasing an outage that isn't
+        // happening while the interception goes unmentioned.
+        (HopId::Dns, Some(Fault::ResolverHijacked)) => (
+            "Your DNS answers are being substituted",
+            "Name resolution works, but your resolver returns a private address for a public name — something on this network is redirecting your traffic to itself.".to_string(),
+            Some("If this is a hotel or public network, sign in first. Otherwise set your resolver to 1.1.1.1 or 8.8.8.8 and re-test.".to_string()),
+            Confidence::Likely,
+        ),
         (HopId::Dns, _) => {
             let wan_ok = hop_status(path, HopId::Wan) == Status::Ok;
             let cause = if wan_ok {
@@ -406,6 +416,14 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
                 Some("Check for background traffic or a congested uplink.".to_string()),
             ),
         },
+        // Synthesised NXDOMAIN. The hop's own summary says "invents answers";
+        // the headline used to say "DNS is slow", which is a different
+        // complaint about a resolver that may well be fast.
+        HopId::Dns if path.get(id).and_then(|h| h.fault) == Some(Fault::ResolverHijacked) => (
+            "Your resolver invents answers",
+            format!("{summary}. Nothing is down, but anything relying on a name genuinely not existing — VPN split-horizon checks, some installers, search fallbacks — will misbehave."),
+            Some("Set your resolver to 1.1.1.1 or 9.9.9.9 if the redirection gets in your way.".to_string()),
+        ),
         HopId::Dns => (
             "DNS is slow",
             format!("Resolution works but is sluggish — {summary}."),
@@ -721,6 +739,47 @@ mod tests {
             "the router is fine; it just can't be reached"
         );
         assert_eq!(v.confidence, Confidence::Certain);
+    }
+
+    /// A hijacked resolver *answers* — it just lies. Reporting that as "name
+    /// resolution is failing … a classic DNS-only outage" describes the
+    /// opposite symptom and never mentions the interception the hop detected.
+    #[test]
+    fn a_hijacked_resolver_is_not_reported_as_an_outage() {
+        let mut dns = hop(HopId::Dns, Layer::Application, Status::Fail);
+        dns.fault = Some(Fault::ResolverHijacked);
+        let p = Path {
+            hops: vec![
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                hop(HopId::Wan, Layer::Internet, Status::Ok),
+                dns,
+            ],
+        };
+        let v = diagnose(&p);
+        assert!(v.headline.contains("substituted"), "got: {}", v.headline);
+        assert!(!v.cause.contains("resolution fails"), "got: {}", v.cause);
+    }
+
+    /// And the Warn side: synthesised NXDOMAIN is dishonesty, not slowness.
+    #[test]
+    fn nxdomain_hijacking_is_not_reported_as_slowness() {
+        let mut dns = hop(HopId::Dns, Layer::Application, Status::Warn);
+        dns.fault = Some(Fault::ResolverHijacked);
+        dns.summary = Some("Your resolver invents answers for names that don't exist".into());
+        let p = Path {
+            hops: vec![
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                hop(HopId::Wan, Layer::Internet, Status::Ok),
+                dns,
+            ],
+        };
+        let v = diagnose(&p);
+        assert!(
+            v.headline.contains("invents answers"),
+            "got: {}",
+            v.headline
+        );
+        assert!(!v.headline.contains("slow"), "got: {}", v.headline);
     }
 
     #[test]

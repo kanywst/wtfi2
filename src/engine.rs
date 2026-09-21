@@ -291,7 +291,19 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
                 "DNS",
                 "The DNS probe didn't finish — resolution is unknown",
             ),
-            async { Some(probe::dns::probe().await) },
+            async {
+                // The configured resolvers come from a blocking platform call;
+                // read them here rather than in the fan-out so a slow `scutil`
+                // delays only the DNS hop.
+                let nameservers = tokio::task::spawn_blocking(|| {
+                    platform::current().resolvers().map(|r| r.nameservers)
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+                Some(probe::dns::probe(&nameservers).await)
+            },
         ));
 
         // VPN / tunnel — conditional: only a hop when a tunnel is active. Seed a

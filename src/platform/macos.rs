@@ -475,19 +475,42 @@ fn parse_netmask_prefix(tok: &str) -> Option<u8> {
     (mask.count_ones() == ones).then_some(ones as u8)
 }
 
+/// Pull the *default* resolvers out of `scutil --dns`.
+///
+/// The output is a series of `resolver #N` blocks, and only the unscoped ones
+/// answer arbitrary names. A VPN's split-DNS resolver or a per-search-domain
+/// entry carries its own `nameserver[0]` alongside a `domain` or `flags:
+/// Scoped` line, and answers only for names beneath that domain — never for
+/// `cloudflare.com`. Folding those in would let the DNS hop confidently name a
+/// resolver the bench never queried, which is worse than the vague "system
+/// resolver" string it replaced: specific and wrong beats vague and safe only
+/// when it is right.
 fn parse_resolvers(text: &str) -> ResolverInfo {
     let mut ns = Vec::new();
-    for line in text.lines() {
-        let t = line.trim();
-        if let Some(rest) = t.split_once(':')
-            && rest.0.trim().starts_with("nameserver[")
-            && let Ok(ip) = rest.1.trim().parse()
-            && !ns.contains(&ip)
-        {
-            ns.push(ip);
+    for block in text.split("resolver #").skip(1) {
+        if block.lines().any(is_scoped) {
+            continue;
+        }
+        for line in block.lines() {
+            let t = line.trim();
+            if let Some((key, value)) = t.split_once(':')
+                && key.trim().starts_with("nameserver[")
+                && let Ok(ip) = value.trim().parse()
+                && !ns.contains(&ip)
+            {
+                ns.push(ip);
+            }
         }
     }
     ResolverInfo { nameservers: ns }
+}
+
+/// Whether a `scutil --dns` block only answers for a particular domain.
+fn is_scoped(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("domain ")
+        || t.starts_with("search domain[")
+        || (t.starts_with("flags ") || t.starts_with("flags:")) && t.contains("Scoped")
 }
 
 #[cfg(test)]
@@ -515,8 +538,20 @@ mod tests {
               MCS Index: 7
           Other Local Wi-Fi Networks:";
 
-    const DNS: &str = "  nameserver[0] : 192.168.0.1
-  nameserver[0] : 192.168.0.1";
+    /// Real `scutil --dns` shape: a default block, then a scoped one that a
+    /// VPN or a search domain installs.
+    const DNS: &str = "DNS configuration
+
+resolver #1
+  nameserver[0] : 192.168.0.1
+  nameserver[1] : 192.168.0.1
+  flags    : Request A records
+  reach    : 0x00020002 (Reachable,Directly Reachable Address)
+
+resolver #2
+  domain   : corp.internal
+  nameserver[0] : 10.99.0.53
+  flags    : Scoped, Request A records";
 
     /// The bug this guards: a tool that could not run had its empty stdout
     /// parsed as "no interface", which became `NoNetwork`, which became the
@@ -651,6 +686,30 @@ mod tests {
         let r = parse_resolvers(DNS);
         assert_eq!(r.nameservers.len(), 1);
         assert_eq!(r.nameservers[0].to_string(), "192.168.0.1");
+    }
+
+    /// A scoped resolver only answers for names under its own domain, never
+    /// for the public name the bench queries. Naming it would let the DNS hop
+    /// confidently report a resolver that was never measured.
+    #[test]
+    fn scoped_resolvers_are_not_named_as_the_system_resolver() {
+        let r = parse_resolvers(DNS);
+        assert!(
+            !r.nameservers
+                .iter()
+                .any(|ip| ip.to_string() == "10.99.0.53"),
+            "a domain-scoped resolver must not be listed: {:?}",
+            r.nameservers
+        );
+    }
+
+    #[test]
+    fn a_scoped_flag_alone_is_enough_to_exclude_a_block() {
+        let text = "resolver #1\n  nameserver[0] : 1.1.1.1\n\n\
+                    resolver #2\n  nameserver[0] : 10.0.0.53\n  flags    : Scoped";
+        let r = parse_resolvers(text);
+        assert_eq!(r.nameservers.len(), 1);
+        assert_eq!(r.nameservers[0].to_string(), "1.1.1.1");
     }
 
     #[test]
