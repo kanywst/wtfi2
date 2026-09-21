@@ -11,5 +11,6 @@ pub mod gateway;
 pub mod host;
 pub mod link;
 pub mod net;
+pub mod uplink;
 pub mod vpn;
 pub mod wan;
