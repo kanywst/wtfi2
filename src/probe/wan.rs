@@ -137,23 +137,22 @@ pub async fn probe() -> Hop {
         None => format!("{} targets", V4.len() + V6.len()),
     });
 
-    // An unreached target is graded by what its family's silence actually
-    // means. With nothing up at all the hop itself fails, and `-v` printing
-    // every measurement under it as a yellow "Warn" would contradict the red
-    // headline in the one scenario this tool is most careful to get right.
+    // An unreached target is graded by what its silence contributes to *this
+    // hop*, which is not the same as what it means for its own family.
+    let any_reachable = v4.any_up() || v6.any_up();
     for family in [&v4, &v6] {
-        let down = if family.any_up() {
-            Status::Warn
-        } else {
-            Status::Fail
-        };
         for (label, probe) in &family.reached {
-            let (value, status) = match probe {
-                Probe::Up(d) => (format!("{:.0} ms", d.as_secs_f64() * 1000.0), Status::Ok),
-                Probe::Timeout => ("unreachable".into(), down),
+            let value = match probe {
+                Probe::Up(d) => format!("{:.0} ms", d.as_secs_f64() * 1000.0),
+                Probe::Timeout => "unreachable".to_string(),
             };
-            hop.metrics
-                .push(Metric::new(*label, value).with_status(status));
+            let metric = Metric::new(*label, value);
+            hop.metrics.push(
+                match target_status(probe.is_up(), family.any_up(), any_reachable) {
+                    Some(status) => metric.with_status(status),
+                    None => metric,
+                },
+            );
         }
     }
 
@@ -203,6 +202,34 @@ pub async fn probe() -> Hop {
         }
     }
     hop
+}
+
+/// How an individual target's result should read next to the hop's own status.
+///
+/// `-v` and `--json` both render per-metric status, so this has to agree with
+/// the headline above it in both directions:
+///
+/// - nothing reachable anywhere: the hop fails, so its measurements are
+///   `Fail` too — five yellow "Warn" lines under a red headline is the
+///   evidence contradicting the verdict in the case this tool is most careful
+///   about;
+/// - a family that works but is missing an operator: `Warn`, the filtering
+///   this probe exists to surface;
+/// - a family this network simply doesn't carry while another one works: no
+///   status at all. An IPv4-only home LAN is the most common config there is,
+///   and marking its two IPv6 lines red under a green `Ok` hop is the same
+///   contradiction reversed. It mirrors `blocked_targets`, which for the same
+///   reason declines to call an absent family "filtered".
+fn target_status(up: bool, family_any_up: bool, any_reachable: bool) -> Option<Status> {
+    if up {
+        Some(Status::Ok)
+    } else if !any_reachable {
+        Some(Status::Fail)
+    } else if family_any_up {
+        Some(Status::Warn)
+    } else {
+        None
+    }
 }
 
 /// Which targets look filtered rather than simply absent.
@@ -466,18 +493,22 @@ mod tests {
         assert!(!summarise("Google", 10.7, false, &clean, &[]).1);
     }
 
-    /// In a total outage the hop is `Fail`, so `-v` must not print every
-    /// measurement under it as a yellow `Warn` — the headline and the evidence
-    /// contradicting each other in the one case accuracy matters most.
+    /// A per-target metric has to agree with the headline above it, in both
+    /// directions — `-v` and `--json` render each one's own status.
     #[test]
-    fn an_unreached_target_is_graded_by_what_its_familys_silence_means() {
-        let dead = family(&[("Cloudflare", None), ("Google", None), ("Quad9", None)]);
-        assert!(!dead.any_up(), "a dead family grades its targets Fail");
-        let partial = family(&[("Cloudflare", None), ("Google", Some(14)), ("Quad9", None)]);
-        assert!(
-            partial.any_up(),
-            "a live family grades its silent targets Warn"
-        );
+    fn a_target_reads_as_what_its_silence_means_for_the_hop() {
+        // Nothing reachable anywhere: the hop fails, so five yellow "Warn"
+        // lines under a red headline would be evidence contradicting it.
+        assert_eq!(target_status(false, false, false), Some(Status::Fail));
+        // A working family missing one operator: the filtering this exists to
+        // surface.
+        assert_eq!(target_status(false, true, true), Some(Status::Warn));
+        // A family this network doesn't carry while another works — an
+        // IPv4-only home LAN, the most common config there is. Marking its
+        // IPv6 lines red under a green `Ok` hop is the same contradiction
+        // reversed, so it gets no status at all.
+        assert_eq!(target_status(false, false, true), None);
+        assert_eq!(target_status(true, true, true), Some(Status::Ok));
     }
 
     #[test]
