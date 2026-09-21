@@ -389,6 +389,16 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
                 Some("Check for a saturated LAN or a router that needs a restart.".to_string()),
             ),
         },
+        // Filtered egress is a property of the network you're on, not a
+        // quality problem with your connection. Without this arm the headline
+        // feature of the multi-operator probe never reached the verdict: it
+        // fell through to "Internet is up but degraded ... check for
+        // background traffic", the wrong complaint with the wrong remedy.
+        HopId::Wan if path.get(id).and_then(|h| h.fault) == Some(Fault::TargetBlocked) => (
+            "This network filters where you can go",
+            format!("{summary}. Your uplink itself is fine — it reaches the internet, just not everything on it."),
+            Some("Expected on corporate or guest Wi-Fi. If it isn't, check for a filtering appliance or a DNS/firewall policy on the router.".to_string()),
+        ),
         HopId::Wan => match loss_at(path, HopId::Wan) {
             Some(l) => {
                 // Chain order means the gateway wasn't an earlier warning, so
@@ -780,6 +790,32 @@ mod tests {
             v.headline
         );
         assert!(!v.headline.contains("slow"), "got: {}", v.headline);
+    }
+
+    /// The headline feature of the multi-operator probe has to reach the
+    /// verdict. Without its own arm it fell through to "Internet is up but
+    /// degraded … check for background traffic" — the wrong complaint, with a
+    /// remedy that does nothing about filtered egress.
+    #[test]
+    fn a_filtered_target_gets_its_own_verdict() {
+        let mut wan = hop(HopId::Wan, Layer::Internet, Status::Warn);
+        wan.fault = Some(Fault::TargetBlocked);
+        wan.summary =
+            Some("Reachable via Google (12 ms), but this network blocks Cloudflare".into());
+        let p = Path {
+            hops: vec![
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                wan,
+                hop(HopId::Dns, Layer::Application, Status::Ok),
+            ],
+        };
+        let v = diagnose(&p);
+        assert!(v.headline.contains("filters"), "got: {}", v.headline);
+        assert!(v.cause.contains("Cloudflare"), "got: {}", v.cause);
+        assert!(
+            !v.fix.as_deref().unwrap().contains("background traffic"),
+            "filtered egress is not a congestion problem"
+        );
     }
 
     #[test]

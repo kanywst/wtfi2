@@ -154,10 +154,15 @@ pub async fn probe() -> Hop {
             let quality = apply_quality(&mut hop, &q, JITTER_WARN_MS);
             let blocked = blocked_targets(&v4, &v6);
             hop.status = quality.max(block_status(&blocked));
-            if !blocked.is_empty() {
+            let summary = summarise(label, avg, dual_stack, &q, &blocked);
+            // Only claim the code the prose actually made. When a quality
+            // complaint takes the summary, the block goes unmentioned, and a
+            // `--json` consumer reading `target_blocked` off a hop whose text
+            // never says so has been told two different things.
+            if !blocked.is_empty() && summary.contains("blocks") {
                 hop.fault = Some(Fault::TargetBlocked);
             }
-            hop.summary = Some(summarise(label, avg, dual_stack, &q, &blocked));
+            hop.summary = Some(summary);
         }
         (false, true) => {
             hop.status = Status::Warn;
@@ -174,9 +179,10 @@ pub async fn probe() -> Hop {
             hop.fail(
                 Fault::NoInternet,
                 format!(
-                    "No TCP path to the internet — {} independent targets ({}) all refused, so the break is past your router",
-                    V4.len() + V6.len(),
-                    operators()
+                    "No TCP path to the internet — {} independent networks ({}) all refused across {} addresses, so the break is past your router",
+                    operator_count(),
+                    operators(),
+                    V4.len() + V6.len()
                 ),
             );
         }
@@ -214,6 +220,13 @@ fn block_status(blocked: &[&str]) -> Status {
 /// point of the message is *how many independent networks* stayed silent, so
 /// listing the same operator twice for its two address families would inflate
 /// exactly the number that makes the claim credible.
+/// How many distinct operators back the targets. The outage message's whole
+/// weight is "N independent networks went quiet", so this must count networks
+/// and not addresses — two families of one operator are one network.
+fn operator_count() -> usize {
+    operators().split(", ").count()
+}
+
 fn operators() -> String {
     let mut names: Vec<&str> = Vec::new();
     for t in V4.iter().chain(V6.iter()) {
@@ -378,6 +391,20 @@ mod tests {
         };
         let summary = summarise("Google", 10.0, false, &lossy, &["Cloudflare"]);
         assert!(summary.contains("unhealthy"), "got: {summary}");
+    }
+
+    /// The outage message's weight is "N independent networks went quiet", so
+    /// it must count networks, not addresses. Counting both families of the
+    /// same operator inflates exactly the number that makes the claim
+    /// credible — the inflation the operator-dedup test already guards.
+    #[test]
+    fn the_outage_count_matches_the_operators_it_lists() {
+        assert_eq!(operator_count(), operators().split(", ").count());
+        assert_eq!(operator_count(), 3);
+        assert!(
+            operator_count() < V4.len() + V6.len(),
+            "two families of one operator are one network"
+        );
     }
 
     #[test]
