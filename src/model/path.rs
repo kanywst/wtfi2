@@ -77,6 +77,10 @@ pub enum Fault {
     NoInternet,
     /// The system resolver returned no answer.
     ResolverDead,
+    /// The system resolver answers, but not truthfully — it synthesises
+    /// results for names that don't exist, or substitutes its own address for
+    /// a public one.
+    ResolverHijacked,
     /// A captive portal is intercepting traffic.
     PortalIntercept,
     /// A tunnel interface is up but is not carrying traffic.
@@ -97,6 +101,7 @@ impl Fault {
             Fault::GatewaySilent => "gateway_silent",
             Fault::NoInternet => "no_internet",
             Fault::ResolverDead => "resolver_dead",
+            Fault::ResolverHijacked => "resolver_hijacked",
             Fault::PortalIntercept => "portal_intercept",
             Fault::TunnelDown => "tunnel_down",
         }
@@ -314,6 +319,7 @@ mod tests {
             Fault::GatewaySilent,
             Fault::NoInternet,
             Fault::ResolverDead,
+            Fault::ResolverHijacked,
             Fault::PortalIntercept,
             Fault::TunnelDown,
         ];
