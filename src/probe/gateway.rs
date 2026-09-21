@@ -192,13 +192,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_genuinely_silent_router_still_reports_nothing() {
-        // Port 0 is never listening, and loopback refuses instantly rather
-        // than making the test wait out TCP_WAIT.
-        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = closed.local_addr().unwrap().port();
-        drop(closed);
+        // Port 1 rather than a freed ephemeral port: the ephemeral range is
+        // exactly what the other tests in this file bind, so releasing one and
+        // expecting it to stay closed races against a concurrent test being
+        // handed the same number. Nothing binds :1, and loopback refuses
+        // instantly rather than making the test wait out TCP_WAIT.
         assert!(
-            tcp_fallback("127.0.0.1".parse().unwrap(), None, &[port])
+            tcp_fallback("127.0.0.1".parse().unwrap(), None, &[1])
                 .await
                 .is_none()
         );
