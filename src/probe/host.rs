@@ -45,7 +45,7 @@ fn grade(hop: &mut Hop, interface: &str, addrs: &AddrInfo, gateway: Option<IpAdd
         // A CGNAT address on your own LAN means the ISP is sharing one public
         // address between subscribers: inbound connections and port forwarding
         // will not work, and no amount of router fiddling changes that.
-        if is_cgnat(ip) {
+        if super::net::is_cgnat(IpAddr::V4(ip)) {
             hop.metrics.push(
                 Metric::new("NAT", "carrier-grade (100.64.0.0/10)").with_status(Status::Warn),
             );
@@ -121,12 +121,6 @@ fn grade(hop: &mut Hop, interface: &str, addrs: &AddrInfo, gateway: Option<IpAdd
     if addrs.v4.is_none() {
         hop.subtitle = Some("IPv6 only".into());
     }
-}
-
-/// RFC 6598 shared address space, handed out by carrier-grade NAT.
-fn is_cgnat(ip: std::net::Ipv4Addr) -> bool {
-    let [a, b, ..] = ip.octets();
-    a == 100 && (64..=127).contains(&b)
 }
 
 #[cfg(test)]

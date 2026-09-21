@@ -13,7 +13,7 @@
 //! provider vanish while the internet is fine; reporting that as "your ISP is
 //! down", confidently, is a lie the reader has no way to catch.
 
-use super::net::{Probe, Quality, apply_quality, tcp_connect};
+use super::net::{Probe, Quality, apply_quality, is_cgnat, tcp_connect};
 use crate::model::{Fault, Hop, HopId, Layer, Metric, Status};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -86,6 +86,29 @@ const _: () = assert!(
 /// spike of `S` into roughly `2S/(n-1)`, i.e. `S/2` at five samples.
 const JITTER_WARN_MS: f64 = 120.0;
 
+/// Cloudflare's trace endpoint, reached by IP so no name has to resolve —
+/// which keeps this check working during exactly the DNS failures it needs to
+/// see past. It answers in `key=value` lines, one of which is the address the
+/// far end saw the request come from.
+const TRACE_BY_IP: &str = "https://1.1.1.1/cdn-cgi/trace";
+/// The same endpoint by name, for the case where the IP literal is refused
+/// (a TLS stack that won't match an IP SAN, a proxy that insists on SNI).
+const TRACE_BY_NAME: &str = "https://one.one.one.one/cdn-cgi/trace";
+const TRACE_WAIT: Duration = Duration::from_secs(4);
+
+/// What one real, complete request through the uplink found.
+struct Egress {
+    /// The address the far end saw — your public IP.
+    public_ip: Option<IpAddr>,
+    /// A full HTTPS exchange completed: TLS negotiated against a certificate
+    /// that chains, and a body came back in the shape it should be.
+    ///
+    /// This is the difference between "a SYN was answered" and "the internet
+    /// works". A middlebox can complete a handshake to anything; it cannot
+    /// produce Cloudflare's certificate.
+    verified: bool,
+}
+
 /// One family's results: which targets answered, and how fast.
 struct Family {
     reached: Vec<(&'static str, Probe)>,
@@ -127,7 +150,7 @@ fn addr_of(label: &str) -> Option<IpAddr> {
 pub async fn probe() -> Hop {
     let mut hop = Hop::new(HopId::Wan, Layer::Internet, "Internet");
 
-    let (v4, v6) = tokio::join!(reach(&V4), reach(&V6));
+    let (v4, v6, egress) = tokio::join!(reach(&V4), reach(&V6), verify_egress());
 
     // Falling back through v6 matters: an IPv6-only network is the case where
     // the reader most needs to see *which* address is carrying traffic, and it
@@ -156,27 +179,53 @@ pub async fn probe() -> Hop {
         }
     }
 
+    if let Some(ip) = egress.public_ip {
+        hop.metrics.push(Metric::new("Public IP", ip.to_string()));
+        if is_cgnat(ip) {
+            hop.metrics.push(
+                Metric::new("NAT", "carrier-grade — inbound connections can't reach you")
+                    .with_status(Status::Warn),
+            );
+        }
+    }
+
     match (v4.any_up(), v6.any_up()) {
         (true, dual_stack) => {
-            // Reachability is settled; the open questions are quality and
-            // whether any *individual* operator is being filtered.
+            // Reachability is settled; the open questions are quality, whether
+            // any *individual* operator is being filtered, and whether those
+            // handshakes actually mean anything.
             let (label, addr, first) = v4.best().expect("any_up means a target answered");
             let q = sample_quality(addr, first).await;
             let avg = q.avg_ms().unwrap_or_default();
             hop.latency_ms = Some(avg);
             let quality = apply_quality(&mut hop, &q, JITTER_WARN_MS);
             let blocked = blocked_targets(&v4, &v6);
-            hop.status = quality.max(block_status(&blocked));
-            // The code follows the branch `summarise` took, reported by
-            // `summarise` itself. When a quality complaint owns the prose the
-            // block goes unmentioned, and a `--json` consumer reading
-            // `target_blocked` off a hop whose text never says so has been
-            // told two different things.
-            let (summary, reports_block) = summarise(label, avg, dual_stack, &q, &blocked);
-            if reports_block {
-                hop.fault = Some(Fault::TargetBlocked);
+            let handshake_only = handshake_only(&v4, &v6, &egress);
+            hop.status = quality.max(block_status(&blocked)).max(if handshake_only {
+                Status::Warn
+            } else {
+                Status::Ok
+            });
+            // Whichever finding is the more serious owns the code; a path that
+            // answers handshakes but carries nothing is worse news than one
+            // operator being filtered.
+            if handshake_only {
+                hop.fault = Some(Fault::HandshakeOnly);
+                hop.summary = Some(
+                    "Every handshake completes but no real request does — something is answering connections on the path without carrying them".into(),
+                );
+            } else {
+                // The code follows the branch `summarise` took, reported by
+                // `summarise` itself. When a quality complaint owns the prose
+                // the block goes unmentioned, and a `--json` consumer reading
+                // `target_blocked` off a hop whose text never says so has been
+                // told two different things.
+                let (summary, reports_block) = summarise(label, avg, dual_stack, &q, &blocked);
+                if reports_block {
+                    hop.fault = Some(Fault::TargetBlocked);
+                }
+                hop.summary = Some(summary);
             }
-            hop.summary = Some(summary);
         }
         (false, true) => {
             hop.status = Status::Warn;
@@ -230,6 +279,66 @@ fn target_status(up: bool, family_any_up: bool, any_reachable: bool) -> Option<S
     } else {
         None
     }
+}
+
+/// Whether the uplink answers handshakes without carrying traffic.
+///
+/// A TCP handshake proves only that *something* on the path replied to a SYN.
+/// Interception appliances and some portals reply to everything, so a hop can
+/// be entirely green while nothing works — the failure a topology diagram is
+/// least able to show you.
+///
+/// The claim is only made when **every** target answered and the verified
+/// request still didn't complete. A partial failure has a simpler explanation
+/// already reported (filtering), and one request can fail on its own for
+/// reasons that say nothing about the path; demanding unanimity on one side
+/// and silence on the other keeps this from crying wolf.
+fn handshake_only(v4: &Family, v6: &Family, egress: &Egress) -> bool {
+    let all_answered = v4.down().next().is_none() && (!v6.any_up() || v6.down().next().is_none());
+    v4.any_up() && all_answered && !egress.verified
+}
+
+/// One complete request through the uplink: the check that makes a green hop
+/// mean something, and the only place a public address can come from.
+async fn verify_egress() -> Egress {
+    let Ok(client) = reqwest::Client::builder().timeout(TRACE_WAIT).build() else {
+        return Egress {
+            public_ip: None,
+            verified: false,
+        };
+    };
+    // By IP first, so this keeps working when name resolution doesn't — the
+    // case it most needs to see past.
+    for url in [TRACE_BY_IP, TRACE_BY_NAME] {
+        let Ok(resp) = client.get(url).send().await else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(body) = resp.text().await else {
+            continue;
+        };
+        // The body has to be the shape it should be. A captive portal can
+        // return 200 to anything; it cannot return this.
+        if let Some(ip) = parse_trace(&body) {
+            return Egress {
+                public_ip: Some(ip),
+                verified: true,
+            };
+        }
+    }
+    Egress {
+        public_ip: None,
+        verified: false,
+    }
+}
+
+/// Pull the `ip=` line out of a `cdn-cgi/trace` response.
+fn parse_trace(body: &str) -> Option<IpAddr> {
+    body.lines()
+        .find_map(|l| l.trim().strip_prefix("ip="))
+        .and_then(|v| v.trim().parse().ok())
 }
 
 /// Which targets look filtered rather than simply absent.
@@ -509,6 +618,84 @@ mod tests {
         // reversed, so it gets no status at all.
         assert_eq!(target_status(false, false, true), None);
         assert_eq!(target_status(true, true, true), Some(Status::Ok));
+    }
+
+    fn egress(verified: bool) -> Egress {
+        Egress {
+            public_ip: None,
+            verified,
+        }
+    }
+
+    fn all_up() -> Family {
+        family(&[
+            ("Cloudflare", Some(12)),
+            ("Google", Some(14)),
+            ("Quad9", Some(13)),
+        ])
+    }
+
+    /// The failure a topology diagram is least able to show: every node green,
+    /// nothing works. A handshake proves only that *something* answered a SYN,
+    /// and interception appliances answer everything.
+    #[test]
+    fn handshakes_without_a_real_request_are_caught() {
+        let v6 = family(&[("Cloudflare v6", None), ("Google v6", None)]);
+        assert!(handshake_only(&all_up(), &v6, &egress(false)));
+    }
+
+    #[test]
+    fn a_verified_request_clears_the_suspicion() {
+        let v6 = family(&[("Cloudflare v6", None), ("Google v6", None)]);
+        assert!(!handshake_only(&all_up(), &v6, &egress(true)));
+    }
+
+    /// One request can fail on its own for reasons that say nothing about the
+    /// path, so the claim needs every target to have answered. A partial
+    /// failure already has a simpler explanation — filtering — and reporting
+    /// both would be two verdicts for one observation.
+    #[test]
+    fn a_partial_block_is_filtering_not_a_fake_uplink() {
+        let v4 = family(&[
+            ("Cloudflare", None),
+            ("Google", Some(14)),
+            ("Quad9", Some(13)),
+        ]);
+        let v6 = family(&[("Cloudflare v6", None), ("Google v6", None)]);
+        assert!(!handshake_only(&v4, &v6, &egress(false)));
+    }
+
+    #[test]
+    fn nothing_reachable_is_an_outage_not_a_fake_uplink() {
+        let dead = family(&[("Cloudflare", None), ("Google", None), ("Quad9", None)]);
+        let v6 = family(&[("Cloudflare v6", None), ("Google v6", None)]);
+        assert!(!handshake_only(&dead, &v6, &egress(false)));
+    }
+
+    #[test]
+    fn the_trace_response_yields_the_public_address() {
+        let body =
+            "fl=123abc\nh=one.one.one.one\nip=203.0.113.7\nts=1700000000\nvisit_scheme=https\n";
+        assert_eq!(
+            parse_trace(body).map(|ip| ip.to_string()),
+            Some("203.0.113.7".to_string())
+        );
+    }
+
+    /// A portal can return 200 to anything; it cannot return this. Anything
+    /// that isn't the expected shape must leave `verified` false rather than
+    /// being taken as proof the uplink carries traffic.
+    #[test]
+    fn a_body_that_is_not_a_trace_response_yields_nothing() {
+        assert_eq!(parse_trace("<html>Sign in to continue</html>"), None);
+        assert_eq!(parse_trace(""), None);
+        assert_eq!(parse_trace("ip=not-an-address"), None);
+    }
+
+    #[test]
+    fn a_cgnat_public_address_is_recognised() {
+        assert!(is_cgnat("100.80.4.9".parse().unwrap()));
+        assert!(!is_cgnat("203.0.113.7".parse().unwrap()));
     }
 
     #[test]

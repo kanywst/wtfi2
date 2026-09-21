@@ -389,6 +389,15 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
                 Some("Check for a saturated LAN or a router that needs a restart.".to_string()),
             ),
         },
+        // Every hop is green and nothing works — the exact failure a topology
+        // diagram cannot show you, so the verdict has to say it in words.
+        // Ahead of both arms below: "the path carries nothing" outranks "the
+        // path is lossy" and "the path is filtered".
+        HopId::Wan if path.get(id).and_then(|h| h.fault) == Some(Fault::HandshakeOnly) => (
+            "Something is answering for the internet",
+            "Every connection completes, but no real request does. A device on the path is replying to handshakes without carrying the traffic — an interception appliance, a misbehaving proxy, or a portal you haven't signed in to.".to_string(),
+            Some("If this is a hotel or public network, open a browser and look for a sign-in page. Otherwise check for a proxy or filtering appliance between you and the internet.".to_string()),
+        ),
         // Filtered egress is a property of the network you're on, not a
         // quality problem with your connection. Without this arm the headline
         // feature of the multi-operator probe never reached the verdict: it
@@ -816,6 +825,33 @@ mod tests {
             !v.fix.as_deref().unwrap().contains("background traffic"),
             "filtered egress is not a congestion problem"
         );
+    }
+
+    /// Every hop green and nothing working is the one failure the topology
+    /// diagram cannot show, so the verdict has to say it in words — and it has
+    /// to outrank the lossy-uplink arm, because a path that carries nothing is
+    /// worse news than a path that carries most things.
+    #[test]
+    fn a_path_that_only_answers_handshakes_is_named_as_such() {
+        let mut wan = hop(HopId::Wan, Layer::Internet, Status::Warn);
+        wan.fault = Some(Fault::HandshakeOnly);
+        wan.loss_pct = Some(40.0);
+        let p = Path {
+            hops: vec![
+                hop(HopId::Host, Layer::Link, Status::Ok),
+                hop(HopId::Link, Layer::Link, Status::Ok),
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                wan,
+            ],
+        };
+        let v = diagnose(&p);
+        assert!(
+            v.headline.contains("answering for the internet"),
+            "{}",
+            v.headline
+        );
+        assert!(!v.headline.contains("dropping packets"), "{}", v.headline);
+        assert!(v.fix.as_deref().unwrap().contains("sign-in page"));
     }
 
     #[test]
