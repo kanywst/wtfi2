@@ -128,7 +128,15 @@ async fn check_hotspot(client: &reqwest::Client) -> Hotspot {
             redirect_to.map(|url| Metric::new("Portal", url).with_status(Status::Fail)),
         );
     }
-    let body = resp.text().await.unwrap_or_default();
+    // A body we couldn't read is not a body that said the wrong thing. Both
+    // used to land on `Portal`, so a connection dropping mid-read on a
+    // portal-free network reported "sign in to the Wi-Fi" — and because a
+    // detected portal outranks every upstream break, that verdict took over
+    // the whole report, sending the reader to look for a login page that
+    // doesn't exist.
+    let Ok(body) = resp.text().await else {
+        return Hotspot::Unreachable;
+    };
     if body.trim() == EXPECTED {
         Hotspot::Clean
     } else {
