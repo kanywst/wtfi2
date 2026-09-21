@@ -74,6 +74,15 @@ pub struct RouteInfo {
     /// True when a VPN/tunnel interface (utun/tailscale) owns a route.
     pub tunnel_active: bool,
     pub tunnel_iface: Option<String>,
+    /// True when the tunnel lookup itself failed, so `tunnel_active == false`
+    /// means "we couldn't tell" rather than "there is no tunnel".
+    ///
+    /// The distinction matters downstream: a dead full-tunnel VPN looks
+    /// exactly like an ISP outage, and the only thing that stops wtfi blaming
+    /// the ISP for it is knowing the tunnel is there. Silently treating an
+    /// unreadable tunnel as an absent one hands back the confident wrong
+    /// answer the fault codes exist to prevent.
+    pub tunnel_unreadable: bool,
 }
 
 /// Resolver configuration facts.

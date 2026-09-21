@@ -94,11 +94,17 @@ impl Platform for MacOs {
                 Err(_) => return Err(v4_err),
             },
         };
-        if let Ok(tun) = run("scutil", &["--nwi"])
-            && let Some(iface) = detect_tunnel(&tun)
-        {
-            info.tunnel_active = true;
-            info.tunnel_iface = Some(iface);
+        // A failed lookup is not the same as "no tunnel". Record which it was,
+        // so a dead full-tunnel VPN can't be silently reclassified as an ISP
+        // outage on the strength of a `scutil` that never ran.
+        match run("scutil", &["--nwi"]) {
+            Err(_) => info.tunnel_unreadable = true,
+            Ok(tun) => {
+                if let Some(iface) = detect_tunnel(&tun) {
+                    info.tunnel_active = true;
+                    info.tunnel_iface = Some(iface);
+                }
+            }
         }
         Ok(info)
     }

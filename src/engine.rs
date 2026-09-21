@@ -158,6 +158,19 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
         // VPN result lands. The blocking platform calls (scutil/ifconfig/ps) are
         // bounded like the link probe so a hung tool can't hold the scan channel
         // open forever — on timeout we still emit a terminal (warn) hop.
+        // The tunnel lookup failed, so we cannot say whether a VPN is carrying
+        // this traffic. Emit the hop anyway, marked unobserved: a silently
+        // absent VPN hop reads as "no VPN", which is what lets a dead
+        // full-tunnel outage get reported as the ISP's fault.
+        if route.tunnel_unreadable {
+            let mut hop = Hop::new(HopId::Vpn, Layer::Network, "VPN");
+            hop.status = Status::Warn;
+            hop.fault = Some(Fault::Unobserved);
+            hop.summary =
+                Some("Couldn't tell whether a VPN is active — the tunnel lookup failed".into());
+            let _ = tx.send(hop);
+        }
+
         if route.tunnel_active {
             let mut pending = Hop::new(HopId::Vpn, Layer::Network, "VPN");
             pending.subtitle = route.tunnel_iface.clone();
