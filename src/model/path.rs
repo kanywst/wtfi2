@@ -37,6 +37,11 @@ pub enum HopId {
     /// between the local gateway and the WAN because traffic is encapsulated
     /// here before it egresses to the internet.
     Vpn,
+    /// The path between the local gateway and the internet — your modem, your
+    /// ISP's access network, transit. Only present when something upstream is
+    /// already broken, because that is the only time it is worth the seconds
+    /// it costs to sweep.
+    Uplink,
     Wan,
     Dns,
     Captive,
@@ -73,6 +78,11 @@ pub enum Fault {
     NoGateway,
     /// The gateway is in the routing table but answers nothing.
     GatewaySilent,
+    /// The trace stops immediately past your own router: the break is on the
+    /// link between it and your provider — modem/ONU, WAN cable, or the line.
+    UplinkDiesAtModem,
+    /// The trace gets into the provider's network and stops there.
+    UplinkDiesInIsp,
     /// No transport-layer path to the internet.
     NoInternet,
     /// The internet is reachable, but this network filters specific
@@ -105,6 +115,8 @@ impl Fault {
             Fault::NoRoute => "no_route",
             Fault::NoGateway => "no_gateway",
             Fault::GatewaySilent => "gateway_silent",
+            Fault::UplinkDiesAtModem => "uplink_dies_at_modem",
+            Fault::UplinkDiesInIsp => "uplink_dies_in_isp",
             Fault::NoInternet => "no_internet",
             Fault::TargetBlocked => "target_blocked",
             Fault::HandshakeOnly => "handshake_only",
@@ -325,6 +337,8 @@ mod tests {
             Fault::NoRoute,
             Fault::NoGateway,
             Fault::GatewaySilent,
+            Fault::UplinkDiesAtModem,
+            Fault::UplinkDiesInIsp,
             Fault::NoInternet,
             Fault::TargetBlocked,
             Fault::HandshakeOnly,

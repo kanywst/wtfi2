@@ -78,6 +78,18 @@ async fn send_bounded(
     let _ = tx.send(hop);
 }
 
+/// Whether the WAN result is worth spending a TTL sweep on.
+///
+/// The sweep costs seconds, so it is not part of every run. It earns them only
+/// when the question it answers — *where* past your router does this stop? —
+/// is actually open: when nothing is reachable, or when the path answers
+/// handshakes without carrying traffic. A merely slow or lossy uplink is
+/// already described by the WAN probe, which measures quality properly; a
+/// one-probe-per-hop sweep would add nothing.
+fn needs_uplink_sweep(wan: &Hop) -> bool {
+    wan.status == Status::Fail || wan.fault == Some(Fault::HandshakeOnly)
+}
+
 /// Emit a path that stops at the link: the Link hop carries `status`, `fault`
 /// and `summary`, and everything downstream is skipped because there is
 /// nothing left to measure it over.
@@ -268,18 +280,42 @@ pub fn spawn() -> mpsc::UnboundedReceiver<Hop> {
             async move { Some(probe::gateway::probe(&route_gw).await) },
         ));
 
-        // WAN.
+        // WAN, and — only if it finds trouble — the TTL sweep that says where
+        // in the uplink the trouble is.
         let tx_wan = tx.clone();
-        tokio::spawn(send_bounded(
-            tx_wan,
-            unmeasured(
-                HopId::Wan,
-                Layer::Internet,
-                "Internet",
-                "The internet probe didn't finish — reachability is unknown",
-            ),
-            async { Some(probe::wan::probe().await) },
-        ));
+        tokio::spawn(async move {
+            let hop = tokio::time::timeout(PROBE_DEADLINE, probe::wan::probe())
+                .await
+                .unwrap_or_else(|_| {
+                    unmeasured(
+                        HopId::Wan,
+                        Layer::Internet,
+                        "Internet",
+                        "The internet probe didn't finish — reachability is unknown",
+                    )
+                });
+
+            if needs_uplink_sweep(&hop) {
+                // Seed the pending hop *before* the WAN result lands. The
+                // dashboard renders a verdict as soon as every hop is
+                // terminal, so sending the WAN failure first would flash
+                // "your ISP is down" and only then narrow it down — the same
+                // reason the VPN hop is seeded up front.
+                let _ = tx_wan.send(Hop::new(HopId::Uplink, Layer::Internet, "Uplink"));
+                let tx_up = tx_wan.clone();
+                tokio::spawn(send_bounded(
+                    tx_up,
+                    unmeasured(
+                        HopId::Uplink,
+                        Layer::Internet,
+                        "Uplink",
+                        "Couldn't trace the path past your router",
+                    ),
+                    async { Some(probe::uplink::probe().await) },
+                ));
+            }
+            let _ = tx_wan.send(hop);
+        });
 
         // DNS.
         let tx_dns = tx.clone();
@@ -405,6 +441,20 @@ pub async fn run_once_within(deadline: Duration) -> Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The uplink sweep is spawned *after* the WAN probe reports, so the two
+    /// budgets stack on one sweep clock — each capped at `PROBE_DEADLINE`, but
+    /// in series. Nothing pinned that composition: the uplink probe's own
+    /// tests only cover its two internal sweeps against `PROBE_DEADLINE`, not
+    /// this WAN-then-Uplink chain against the sweep-level one.
+    #[test]
+    fn a_wan_failure_and_its_uplink_sweep_both_fit_one_sweep() {
+        let stacked = PROBE_DEADLINE + PROBE_DEADLINE;
+        assert!(
+            stacked < SWEEP_DEADLINE,
+            "WAN then Uplink is {stacked:?}, which must fit in {SWEEP_DEADLINE:?}"
+        );
+    }
 
     /// A sweep that gets cut short must still hand back a path whose every hop
     /// has settled. A leftover `Pending` renders as "Scanning your

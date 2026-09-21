@@ -20,7 +20,7 @@ cause** so the answer is one line, not ten.
 ## What makes it different
 
 - **Topology, not a checklist.** Your connection is rendered as a chain —
-  `You → Wi-Fi → Gateway → Internet → DNS → Portal` — with the break marked
+  `You → Wi-Fi → Gateway → Uplink → Internet → DNS → Portal` — with the break marked
   where it actually happens.
 - **Root-cause reasoning.** It correlates the hops ("IPs reachable but names
   aren't → DNS-only outage") into a single verdict plus a concrete fix, and it
@@ -115,10 +115,11 @@ complete:
 2. **L2 Link** — Wi-Fi RSSI, noise, SNR, channel, PHY mode, security and tx
    rate, graded into a signal quality.
 3. **L3 Gateway** — resolves the default route and sends a short ICMP burst to the router, measuring RTT, packet loss and jitter, and flagging VPN/tunnel interfaces and sub-1500 MTU.
-4. **WAN** — real TCP handshakes to three independent anycast operators (Cloudflare, Google, Quad9) over IPv4 and IPv6, which exposes asymmetric blackholing without needing raw ICMP and separates "the internet is unreachable" from "this network blocks that address". It then repeats the handshake against the quickest one to measure loss and jitter on the uplink itself.
-5. **DNS** — benchmarks the system resolver against Cloudflare and Google to
+4. **Uplink** — when, and only when, something upstream is already broken, a bounded ICMP TTL sweep turns the single edge between your gateway and the internet back into hops. Where the replies stop decides whether the break is on your own line (modem/ONU, WAN cable) or inside your ISP's network — and names the last address that answered, so you have something to quote.
+5. **WAN** — real TCP handshakes to three independent anycast operators (Cloudflare, Google, Quad9) over IPv4 and IPv6, which exposes asymmetric blackholing without needing raw ICMP and separates "the internet is unreachable" from "this network blocks that address". It then repeats the handshake against the quickest one to measure loss and jitter on the uplink itself.
+6. **DNS** — benchmarks the system resolver against Cloudflare and Google to
    separate "DNS is down" from "your resolver is just slow".
-6. **Captive portal** — a plain-HTTP hotspot check that catches login-page
+7. **Captive portal** — a plain-HTTP hotspot check that catches login-page
    interception before you think you're online.
 
 The diagnosis engine then walks the completed chain, finds the *first* break (everything downstream is collateral), and turns it into the verdict. With no break at all it moves on to quality: a hop that answers but loses ≥ 25% of a burst counts as degradation, and where that loss starts decides whether the verdict blames your Wi-Fi, your router or your ISP.

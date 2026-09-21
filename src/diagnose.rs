@@ -128,6 +128,14 @@ fn vpn_state_unknown(path: &Path) -> bool {
         .is_some_and(|h| h.fault == Some(Fault::Unobserved))
 }
 
+/// What the TTL sweep actually saw, quoted into the verdict so the claim
+/// carries its evidence rather than asking to be trusted.
+fn uplink_evidence(path: &Path) -> String {
+    path.get(HopId::Uplink)
+        .and_then(|h| h.summary.clone())
+        .unwrap_or_default()
+}
+
 fn explain_break(path: &Path, id: HopId) -> Verdict {
     // The probe already decided *what* went wrong; this only turns the code
     // into prose. Re-deriving the cause here is how the verdict used to
@@ -167,6 +175,52 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
                 Confidence::Likely,
             )
         }
+        // The sweep located the break, so the verdict stops guessing. These
+        // sit before the WAN arm in the chain, so `first_break` reaches them
+        // first and the vaguer "something past your router" never runs.
+        // A full-tunnel VPN owns the default route, so the sweep traces
+        // *through the tunnel*: "hop 1 = your own router" is only true over
+        // the physical WAN. Without this the Uplink arms would tell you to
+        // check your modem, or report an outage to your ISP, for a tunnel
+        // whose own upstream degraded — and because Uplink precedes Wan in the
+        // chain, the Wan arm's existing VPN reframe never gets to run.
+        (HopId::Uplink, _) if vpn_is_full_tunnel(path) => (
+            "The path through your VPN breaks upstream",
+            format!("{} But a full-tunnel VPN owns your default route, so this traced through the tunnel, not your own line — the hops named are the tunnel's path, not your ISP's.", uplink_evidence(path)),
+            Some("Disconnect the VPN and re-run. If the path comes back, the tunnel was the problem — your own line and your ISP aren't involved.".to_string()),
+            Confidence::Likely,
+        ),
+        // Same hedge the Wan arm makes, for the same reason. The VPN probe and
+        // the WAN failure are independent events, so both can time out in one
+        // run — and `vpn_is_full_tunnel` needs a `Mode` metric that an
+        // unmeasured VPN hop doesn't have. Without this the verdict says
+        // "report the outage to your ISP" at `Likely` for a trace that may
+        // have gone through a dead tunnel still owning the default route, and
+        // because `Uplink` precedes `Wan` the Wan arm's own hedge never runs.
+        (HopId::Uplink, _) if vpn_state_unknown(path) => (
+            "The path past your router breaks, but a VPN may be in the way",
+            format!("{} wtfi couldn't read whether a VPN is carrying your traffic, and a tunnel that owns the default route would have been traced instead of your own line — so the hops named may not be your ISP's at all.", uplink_evidence(path)),
+            Some("If you're on a VPN, disconnect it and re-run before reporting anything to your ISP.".to_string()),
+            Confidence::Guess,
+        ),
+        (HopId::Uplink, Some(Fault::UplinkDiesAtModem)) => (
+            "The break is on your line, not inside your ISP",
+            format!("Your router answers, but nothing past it does — and the trace stops at the very first step outside your house. {} That points at the modem/ONU, the WAN cable, or the line itself rather than at your provider's network.", uplink_evidence(path)),
+            Some("Check the modem/ONU lights and reseat the WAN cable. If the lights say the line is down, that is what to report.".to_string()),
+            Confidence::Likely,
+        ),
+        (HopId::Uplink, Some(Fault::UplinkDiesInIsp)) => (
+            "The break is inside your ISP's network",
+            format!("Your equipment is forwarding fine — the trace gets out of your house and then stops. {} Nothing you own is between you and that point.", uplink_evidence(path)),
+            Some("Not your Mac and not your router. Report the outage to your ISP and quote the last hop that answered, from the Uplink detail below.".to_string()),
+            Confidence::Likely,
+        ),
+        (HopId::Uplink, _) => (
+            "The path past your router is broken",
+            uplink_evidence(path),
+            None,
+            Confidence::Guess,
+        ),
         (HopId::Wan, _) => {
             // A full-tunnel VPN carries *all* egress, so a dead tunnel looks
             // exactly like an ISP outage from the WAN probe's point of view.
@@ -852,6 +906,146 @@ mod tests {
         );
         assert!(!v.headline.contains("dropping packets"), "{}", v.headline);
         assert!(v.fix.as_deref().unwrap().contains("sign-in page"));
+    }
+
+    /// The verdict this whole hop exists to replace. "Your ISP / uplink is
+    /// down — check the modem lights" is the part the reader already knew;
+    /// once the sweep has located the break, the verdict has to use it.
+    #[test]
+    fn a_located_break_replaces_the_vague_isp_verdict() {
+        let mut uplink = hop(HopId::Uplink, Layer::Internet, Status::Fail);
+        uplink.fault = Some(Fault::UplinkDiesInIsp);
+        uplink.summary = Some(
+            "Dies past hop 2 — the last reply came from 203.0.113.1, then 4 hops of silence".into(),
+        );
+        let p = Path {
+            hops: vec![
+                hop(HopId::Host, Layer::Link, Status::Ok),
+                hop(HopId::Link, Layer::Link, Status::Ok),
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                uplink,
+                hop(HopId::Wan, Layer::Internet, Status::Fail),
+            ],
+        };
+        let v = diagnose(&p);
+        assert!(
+            v.headline.contains("inside your ISP"),
+            "got: {}",
+            v.headline
+        );
+        assert!(
+            !v.headline.contains("uplink is down"),
+            "got: {}",
+            v.headline
+        );
+        // The claim has to carry its evidence, not ask to be trusted.
+        assert!(v.cause.contains("203.0.113.1"), "got: {}", v.cause);
+    }
+
+    /// Dying at the first step outside the house is a different call to make
+    /// than dying inside the provider's network — one is your modem, the
+    /// other is theirs.
+    #[test]
+    fn a_break_at_the_modem_gets_its_own_verdict() {
+        let mut uplink = hop(HopId::Uplink, Layer::Internet, Status::Fail);
+        uplink.fault = Some(Fault::UplinkDiesAtModem);
+        uplink.summary = Some("Dies immediately past your router".into());
+        let p = Path {
+            hops: vec![
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                uplink,
+                hop(HopId::Wan, Layer::Internet, Status::Fail),
+            ],
+        };
+        let v = diagnose(&p);
+        assert!(v.headline.contains("on your line"), "got: {}", v.headline);
+        assert!(v.fix.as_deref().unwrap().contains("modem"));
+    }
+
+    /// The sweep sits before the WAN hop in the chain, so `first_break` must
+    /// reach it first — that ordering is what makes the located verdict win.
+    #[test]
+    fn the_uplink_hop_precedes_the_wan_hop_in_the_chain() {
+        assert!((HopId::Uplink as usize) < (HopId::Wan as usize));
+        assert!((HopId::Gateway as usize) < (HopId::Uplink as usize));
+    }
+
+    /// The Wan arm has checked `vpn_is_full_tunnel` since the VPN hop landed,
+    /// but Uplink sits *before* Wan in the chain, so `first_break` reaches it
+    /// first and that reframe never runs. The sweep traces over whatever owns
+    /// the default route — the tunnel — so "hop 1 is your own router" is
+    /// simply untrue, and the verdict would send you to your modem or your
+    /// ISP for a VPN fault.
+    #[test]
+    fn a_full_tunnel_vpn_reframes_the_uplink_verdict_too() {
+        let mut vpn = hop(HopId::Vpn, Layer::Network, Status::Ok);
+        vpn.metrics
+            .push(crate::model::Metric::new("Mode", "full-tunnel"));
+        let mut uplink = hop(HopId::Uplink, Layer::Internet, Status::Fail);
+        uplink.fault = Some(Fault::UplinkDiesInIsp);
+        uplink.summary = Some("Dies past hop 2 — the last reply came from 100.64.0.1".into());
+        let p = Path {
+            hops: vec![
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                vpn,
+                uplink,
+                hop(HopId::Wan, Layer::Internet, Status::Fail),
+            ],
+        };
+        let v = diagnose(&p);
+        assert!(v.headline.contains("VPN"), "got: {}", v.headline);
+        assert!(
+            !v.fix.as_deref().unwrap().contains("modem"),
+            "a VPN fault must not send the reader to their modem"
+        );
+        assert!(v.cause.contains("through the tunnel"), "got: {}", v.cause);
+    }
+
+    /// A split-tunnel VPN does not own the default route, so the sweep really
+    /// did trace your own line and the located verdict stands.
+    #[test]
+    fn a_split_tunnel_vpn_leaves_the_uplink_verdict_alone() {
+        let mut vpn = hop(HopId::Vpn, Layer::Network, Status::Ok);
+        vpn.metrics
+            .push(crate::model::Metric::new("Mode", "split-tunnel"));
+        let mut uplink = hop(HopId::Uplink, Layer::Internet, Status::Fail);
+        uplink.fault = Some(Fault::UplinkDiesInIsp);
+        uplink.summary = Some("Dies past hop 2".into());
+        let p = Path {
+            hops: vec![hop(HopId::Gateway, Layer::Network, Status::Ok), vpn, uplink],
+        };
+        assert!(diagnose(&p).headline.contains("inside your ISP"));
+    }
+
+    /// The VPN probe and the WAN failure are independent events, so both can
+    /// time out in one run. `vpn_is_full_tunnel` needs a `Mode` metric an
+    /// unmeasured VPN hop doesn't have, so without a hedge the verdict says
+    /// "report the outage to your ISP" at `Likely` for a trace that may have
+    /// gone through a dead tunnel — and `Uplink` preceding `Wan` means that
+    /// arm's own hedge never gets to run.
+    #[test]
+    fn an_unknown_vpn_state_hedges_the_uplink_verdict_too() {
+        let mut vpn = hop(HopId::Vpn, Layer::Network, Status::Warn);
+        vpn.fault = Some(Fault::Unobserved);
+        let mut uplink = hop(HopId::Uplink, Layer::Internet, Status::Fail);
+        uplink.fault = Some(Fault::UplinkDiesInIsp);
+        uplink.summary = Some("Dies past hop 2.".into());
+        let p = Path {
+            hops: vec![
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                vpn,
+                uplink,
+                hop(HopId::Wan, Layer::Internet, Status::Fail),
+            ],
+        };
+        let v = diagnose(&p);
+        assert_eq!(v.confidence, Confidence::Guess);
+        assert!(
+            !v.fix.as_deref().unwrap().contains("Report the outage"),
+            "don't send the reader to their ISP on an unread tunnel: {:?}",
+            v.fix
+        );
+        assert!(v.cause.contains("may not be your ISP"), "got: {}", v.cause);
     }
 
     #[test]
