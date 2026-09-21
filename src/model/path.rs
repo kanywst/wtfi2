@@ -52,6 +52,10 @@ pub enum HopId {
 /// access point", which is a different fault with a different fix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
+    /// The OS tools wtfi reads the network through could not be run, so
+    /// nothing about the network was observed. Emphatically not the same as
+    /// observing that the network is down.
+    Unobserved,
     /// Not associated with any access point at all.
     NotAssociated,
     /// Associated, but there is no default route off this machine — typically
@@ -75,6 +79,7 @@ impl Fault {
     /// Stable lowercase code for `--json` consumers.
     pub fn code(self) -> &'static str {
         match self {
+            Fault::Unobserved => "unobserved",
             Fault::NotAssociated => "not_associated",
             Fault::NoRoute => "no_route",
             Fault::NoGateway => "no_gateway",
@@ -288,6 +293,7 @@ mod tests {
     fn fault_codes_are_stable_and_distinct() {
         // `--json` consumers branch on these strings.
         let all = [
+            Fault::Unobserved,
             Fault::NotAssociated,
             Fault::NoRoute,
             Fault::NoGateway,

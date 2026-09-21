@@ -112,6 +112,15 @@ fn vpn_is_full_tunnel(path: &Path) -> bool {
     })
 }
 
+/// Whether the tunnel lookup failed, leaving us unable to say if a VPN is
+/// carrying this traffic. Not the same as "there is no VPN", and the
+/// difference decides whether an outage past the router can be pinned on the
+/// ISP at all.
+fn vpn_state_unknown(path: &Path) -> bool {
+    path.get(HopId::Vpn)
+        .is_some_and(|h| h.fault == Some(Fault::Unobserved))
+}
+
 fn explain_break(path: &Path, id: HopId) -> Verdict {
     // The probe already decided *what* went wrong; this only turns the code
     // into prose. Re-deriving the cause here is how the verdict used to
@@ -161,6 +170,16 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
                     "The router answers locally, but nothing beyond it is reachable. A full-tunnel VPN is active, so this is most likely the tunnel, not your ISP.".to_string(),
                     Some("Disconnect the VPN and re-test — if it comes back, the tunnel was the problem.".to_string()),
                     Confidence::Likely,
+                )
+            } else if vpn_state_unknown(path) {
+                // We couldn't read the tunnel state, and a dead full-tunnel
+                // VPN is indistinguishable from an ISP outage from here. Name
+                // both rather than picking the one we can't rule out.
+                (
+                    "Nothing past your router is reachable",
+                    "The router answers locally but nothing beyond it does. wtfi couldn't read whether a VPN is carrying your traffic, and a dead full-tunnel VPN looks exactly like this — so the ISP is not the only candidate.".to_string(),
+                    Some("If you're on a VPN, disconnect it and re-test. If not, check the modem/ONU lights.".to_string()),
+                    Confidence::Guess,
                 )
             } else {
                 (
@@ -403,6 +422,43 @@ mod tests {
             "nothing was pinged, so don't claim it: {}",
             v.cause
         );
+    }
+
+    /// A `scutil` that wouldn't run used to leave the VPN hop absent, which
+    /// reads as "no VPN" — and that is the only thing standing between a dead
+    /// full-tunnel VPN and a verdict blaming the ISP for it.
+    #[test]
+    fn an_unreadable_tunnel_stops_the_isp_being_blamed_outright() {
+        let mut vpn = hop(HopId::Vpn, Layer::Network, Status::Warn);
+        vpn.fault = Some(Fault::Unobserved);
+        let p = Path {
+            hops: vec![
+                hop(HopId::Link, Layer::Link, Status::Ok),
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                vpn,
+                hop(HopId::Wan, Layer::Internet, Status::Fail),
+            ],
+        };
+        let v = diagnose(&p);
+        assert!(
+            !v.headline.contains("ISP"),
+            "the ISP can't be named while the tunnel is unreadable: {}",
+            v.headline
+        );
+        assert_eq!(v.confidence, Confidence::Guess);
+        assert!(v.fix.as_deref().unwrap().contains("VPN"));
+    }
+
+    /// …but a readable, absent VPN still lets the ISP verdict stand.
+    #[test]
+    fn a_readable_absence_of_vpn_leaves_the_isp_verdict_intact() {
+        let p = Path {
+            hops: vec![
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                hop(HopId::Wan, Layer::Internet, Status::Fail),
+            ],
+        };
+        assert!(diagnose(&p).headline.contains("ISP"));
     }
 
     #[test]
