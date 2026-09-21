@@ -285,6 +285,28 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
         };
     }
 
+    // Hops other than the one being explained may also have gone unmeasured.
+    // `diagnose` only ever hands over the earliest Warn hop, so without this
+    // the headline would describe a genuine degradation while silently
+    // dropping the fact that part of the path was never looked at — the same
+    // headline/detail contradiction as the branch above, in the omission
+    // direction.
+    let elsewhere: Vec<&str> = path
+        .hops
+        .iter()
+        .filter(|h| h.id != id && h.fault == Some(Fault::Unobserved))
+        .map(|h| h.title.as_str())
+        .collect();
+    let gap = if elsewhere.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Separately, {} went unmeasured, so this verdict doesn't account for {}.",
+            elsewhere.join(" and "),
+            if elsewhere.len() == 1 { "it" } else { "them" }
+        )
+    };
+
     let (headline, cause, fix) = match id {
         HopId::Link => {
             // A marginal signal is only half the story; say what it's already
@@ -366,7 +388,7 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
     Verdict {
         status: Status::Warn,
         headline: headline.to_string(),
-        cause,
+        cause: format!("{cause}{gap}"),
         fix,
         confidence: Confidence::Likely,
     }
@@ -562,6 +584,35 @@ mod tests {
             ],
         };
         assert!(diagnose(&p).cause.contains("rest of the path reported"));
+    }
+
+    /// `diagnose` only hands `explain_warn` the earliest Warn hop, so an
+    /// unmeasured hop further along used to vanish from the headline entirely
+    /// while still showing as unmeasured in the detail panel below. Same
+    /// headline/detail contradiction, in the omission direction.
+    #[test]
+    fn a_degraded_hop_still_reports_a_gap_further_along() {
+        let mut link = hop(HopId::Link, Layer::Link, Status::Warn);
+        link.summary = Some("Weak · -82 dBm".into());
+        let mut dns = hop(HopId::Dns, Layer::Application, Status::Warn);
+        dns.fault = Some(Fault::Unobserved);
+        let p = Path {
+            hops: vec![link, hop(HopId::Gateway, Layer::Network, Status::Ok), dns],
+        };
+        let v = diagnose(&p);
+        assert!(v.headline.contains("Weak Wi-Fi"), "got: {}", v.headline);
+        assert!(v.cause.contains("went unmeasured"), "got: {}", v.cause);
+    }
+
+    /// With nothing unmeasured the cause stays clean — no trailing clause.
+    #[test]
+    fn a_fully_measured_path_adds_no_gap_note() {
+        let mut link = hop(HopId::Link, Layer::Link, Status::Warn);
+        link.summary = Some("Weak · -82 dBm".into());
+        let p = Path {
+            hops: vec![link, hop(HopId::Gateway, Layer::Network, Status::Ok)],
+        };
+        assert!(!diagnose(&p).cause.contains("went unmeasured"));
     }
 
     #[test]

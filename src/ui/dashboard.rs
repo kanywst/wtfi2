@@ -88,10 +88,15 @@ fn push(hist: &mut VecDeque<f64>, v: Option<f64>) {
 }
 
 /// Entry point for `wtfi -w`.
-pub async fn run() -> Result<()> {
+///
+/// `sweep_deadline` only reaches the non-TTY fallback, which is the one path
+/// here that runs a bounded one-shot sweep. Threading it through matters
+/// because `wtfi -w --timeout 3 > out.txt` used to accept the flag and then
+/// silently wait out the 20s default instead.
+pub async fn run(sweep_deadline: Duration) -> Result<()> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         // No TTY (piped/CI): fall back to a single report instead of failing.
-        let path = engine::run_once().await;
+        let path = engine::run_once_within(sweep_deadline).await;
         let verdict = diagnose(&path);
         print!("{}", crate::render::report(&path, &verdict, true, false));
         return Ok(());

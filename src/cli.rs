@@ -25,7 +25,7 @@ pub struct Cli {
     /// Give up on the whole sweep after this many seconds and report what
     /// landed. Individual probes are bounded well below this already; raise it
     /// only on a network so slow that whole probes are timing out.
-    #[arg(long = "timeout", value_name = "SECS", default_value_t = 20)]
+    #[arg(long = "timeout", value_name = "SECS", default_value_t = crate::engine::SWEEP_DEADLINE.as_secs())]
     pub timeout_secs: u64,
 }
 

@@ -52,9 +52,14 @@ pub async fn probe() -> Hop {
     hop.summary = Some(match (system.ok, system.latency) {
         (true, Some(ms)) if ms <= 50.0 => format!("Resolving fast ({ms:.0} ms)"),
         (true, Some(ms)) => format!("Resolving but slow ({ms:.0} ms)"),
-        _ if cf.ok || google.ok => {
-            "System resolver is dead, but public DNS works — misconfigured resolver".into()
-        }
+        // "No answer in time" rather than "dead": with several nameservers
+        // configured, the budget can expire on a resolver that would have
+        // answered from a later one. Slow past the point of usefulness is
+        // still the honest description of that.
+        _ if cf.ok || google.ok => format!(
+            "Your resolver gave no answer within {}s, but public DNS works — misconfigured or unreachable resolver",
+            SYSTEM_BENCH_BUDGET.as_secs()
+        ),
         _ => "Name resolution is failing everywhere".into(),
     });
 
@@ -85,6 +90,18 @@ const QUERY_WAIT: Duration = Duration::from_secs(3);
 /// One shot per resolver: a retry would double the ceiling, and "it didn't
 /// answer the first time" is already the signal worth reporting.
 const QUERY_ATTEMPTS: usize = 1;
+/// Ceiling on the system bench *as a whole*, not per nameserver.
+///
+/// hickory applies `QUERY_WAIT` to each configured nameserver in turn, so a
+/// host with three or more — a VPN-pushed resolver plus two ISP fallbacks, or
+/// dual-stack pairs — can still outrun the engine's per-probe deadline. The
+/// engine would then report the whole hop as unmeasured, which is the worse
+/// of the two wrong answers: a resolver that is merely slow becomes a gap in
+/// the evidence rather than the finding it actually is.
+///
+/// Sized so the probe (whose benches all run concurrently) stays inside
+/// `PROBE_DEADLINE` with room to spare.
+const SYSTEM_BENCH_BUDGET: Duration = Duration::from_secs(6);
 
 async fn bench_system() -> Bench {
     let Ok(mut builder) = TokioResolver::builder_tokio() else {
@@ -92,10 +109,15 @@ async fn bench_system() -> Bench {
     };
     builder.options_mut().timeout = QUERY_WAIT;
     builder.options_mut().attempts = QUERY_ATTEMPTS;
-    match builder.build() {
-        Ok(resolver) => time_lookup("System", resolver).await,
-        Err(_) => failed("System"),
-    }
+    let Ok(resolver) = builder.build() else {
+        return failed("System");
+    };
+    // Bounded here rather than left to the engine: a hop reporting "the
+    // resolver gave no answer in time" is a finding, while one the engine
+    // times out is just a hole where a finding should be.
+    tokio::time::timeout(SYSTEM_BENCH_BUDGET, time_lookup("System", resolver))
+        .await
+        .unwrap_or_else(|_| failed("System"))
 }
 
 async fn bench_upstream(label: &'static str, config: ResolverConfig) -> Bench {

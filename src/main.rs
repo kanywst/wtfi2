@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
     }
 
     if cli.watch {
-        return ui::run().await;
+        return ui::run(cli.sweep_deadline()).await;
     }
 
     let path = engine::run_once_within(cli.sweep_deadline()).await;
