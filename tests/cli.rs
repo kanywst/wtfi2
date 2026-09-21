@@ -17,6 +17,20 @@ use std::process::{Command, Output};
 /// be silently mishandling a state it was told could not happen.
 const DOCUMENTED_EXIT_CODES: [i32; 5] = [0, 1, 2, 3, 4];
 
+/// "No platform module for this OS". `main` prints one line to stderr and
+/// exits with this *before* reading `--json` or probing anything, so stdout is
+/// empty and every assertion about a report has to stand down.
+///
+/// That path is real in CI: `ci.yml`'s `package` job runs `cargo test
+/// --all-features` on `ubuntu-latest`. Guarding per test rather than putting
+/// `#![cfg(target_os = "macos")]` on the file keeps the Linux leg exercising
+/// the refusal contract, which is documented behaviour in its own right.
+const EXIT_UNSUPPORTED: i32 = 3;
+
+fn refused(out: &Output) -> bool {
+    out.status.code() == Some(EXIT_UNSUPPORTED)
+}
+
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_wtfi"))
         .args(args)
@@ -27,15 +41,40 @@ fn run(args: &[&str]) -> Output {
         .expect("the binary under test should run")
 }
 
-fn json(args: &[&str]) -> serde_json::Value {
+/// `None` when the platform refused before probing — the caller then has
+/// nothing to assert about and returns.
+fn json(args: &[&str]) -> Option<serde_json::Value> {
     let out = run(args);
-    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+    if refused(&out) {
+        return None;
+    }
+    Some(serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
         panic!(
             "--json must emit parseable JSON on stdout: {e}\nstdout: {}\nstderr: {}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         )
-    })
+    }))
+}
+
+/// The refusal itself is a contract: nothing on stdout (so a `--json`
+/// consumer never sees half a document), a reason on stderr, and the
+/// documented code.
+#[test]
+fn an_unsupported_platform_refuses_before_probing() {
+    let out = run(&["--json"]);
+    if !refused(&out) {
+        return;
+    }
+    assert!(
+        out.stdout.is_empty(),
+        "a refusal must not emit a partial report: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).trim().is_empty(),
+        "a refusal must say why"
+    );
 }
 
 #[test]
@@ -56,6 +95,9 @@ fn the_exit_code_is_one_the_readme_documents() {
 #[test]
 fn the_exit_code_agrees_with_the_reported_status() {
     let out = run(&["--json"]);
+    if refused(&out) {
+        return;
+    }
     let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     let expected = match doc["status"].as_str().expect("status is a string") {
         "ok" => 0,
@@ -73,7 +115,9 @@ fn the_exit_code_agrees_with_the_reported_status() {
 
 #[test]
 fn json_output_carries_the_documented_shape() {
-    let doc = json(&["--json"]);
+    let Some(doc) = json(&["--json"]) else {
+        return;
+    };
 
     for key in ["status", "verdict", "first_break", "path"] {
         assert!(doc.get(key).is_some(), "missing top-level key `{key}`");
@@ -109,7 +153,9 @@ fn json_output_carries_the_documented_shape() {
 #[test]
 fn every_status_in_json_is_a_known_variant() {
     const KNOWN: [&str; 5] = ["ok", "warn", "fail", "pending", "skipped"];
-    let doc = json(&["--json"]);
+    let Some(doc) = json(&["--json"]) else {
+        return;
+    };
     let mut seen: Vec<String> = vec![doc["status"].as_str().unwrap().to_string()];
     for hop in doc["path"].as_array().unwrap() {
         seen.push(hop["status"].as_str().unwrap().to_string());
@@ -132,7 +178,9 @@ fn every_status_in_json_is_a_known_variant() {
 /// as "Scanning your connection…" in a report that has stopped scanning.
 #[test]
 fn a_one_shot_run_leaves_no_hop_pending() {
-    let doc = json(&["--json"]);
+    let Some(doc) = json(&["--json"]) else {
+        return;
+    };
     let pending: Vec<_> = doc["path"]
         .as_array()
         .unwrap()
@@ -149,7 +197,9 @@ fn a_one_shot_run_leaves_no_hop_pending() {
 /// lands on nothing, or on a healthy hop.
 #[test]
 fn first_break_points_at_a_hop_that_really_failed() {
-    let doc = json(&["--json"]);
+    let Some(doc) = json(&["--json"]) else {
+        return;
+    };
     let Some(id) = doc["first_break"].as_str() else {
         return; // Nothing broken on this machine right now; nothing to check.
     };
@@ -169,7 +219,9 @@ fn first_break_points_at_a_hop_that_really_failed() {
 /// so a dangling pointer would silently drop the basis for the claim.
 #[test]
 fn the_verdict_source_names_a_hop_in_the_path() {
-    let doc = json(&["--json"]);
+    let Some(doc) = json(&["--json"]) else {
+        return;
+    };
     let Some(id) = doc["verdict"]["source"].as_str() else {
         return;
     };
@@ -186,6 +238,9 @@ fn the_verdict_source_names_a_hop_in_the_path() {
 #[test]
 fn no_color_emits_no_ansi_escapes() {
     let out = run(&["--no-color", "-v"]);
+    if refused(&out) {
+        return;
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(!text.contains('\u{1b}'), "ANSI escape in --no-color output");
     assert!(!text.is_empty(), "the report should not be empty");
