@@ -113,9 +113,18 @@ fn describe(nameservers: &[IpAddr]) -> String {
 /// Decide what the hop reports. Pure, so every branch is testable without a
 /// resolver to lie to us.
 fn grade(hop: &mut Hop, system: &Bench, cf: &Bench, google: &Bench, hijacked: Option<Hijack>) {
-    // A hijacked resolver is checked before latency, because it is fast: it
-    // answers from a table instead of doing the work, and grading on the clock
-    // alone marks the one resolver you must not trust as the healthiest.
+    // A dead resolver outranks a dishonest one: "it answers wrongly" is not a
+    // finding you can make about a resolver that didn't answer. The NXDOMAIN
+    // check is a *separate* query from the bench, so with one attempt and no
+    // retry the bench can time out while the bogus-name query still gets a
+    // synthesised reply — which used to report a wholly dead resolver as
+    // merely "sluggish but dishonest".
+    let hijacked = hijacked.filter(|_| system.ok);
+
+    // Otherwise hijacking is checked before latency, because a hijacked
+    // resolver is fast: it answers from a table instead of doing the work, and
+    // grading on the clock alone marks the one resolver you must not trust as
+    // the healthiest thing in the report.
     if let Some(kind) = hijacked {
         match kind {
             // Answers substituted for a public name: you are being intercepted,
@@ -365,6 +374,23 @@ mod tests {
         let google = bench("Google", true, &["104.16.133.229"]);
         // Different CDN edges are normal; only a *private* answer is damning.
         assert_eq!(detect_hijack(&system, &[&cf, &google], false), None);
+    }
+
+    /// The NXDOMAIN check is a separate query from the bench, so with one
+    /// attempt and no retry the bench can time out while the bogus-name query
+    /// still gets a synthesised reply. Reporting that as "sluggish but
+    /// dishonest" hides a resolver that is wholly dead — and "it answers
+    /// wrongly" is not a finding you can make about one that didn't answer.
+    #[test]
+    fn a_dead_resolver_outranks_a_hijack_finding_on_another_query() {
+        let hop = graded(
+            failed("System"),
+            bench("Cloudflare", true, &["104.16.132.229"]),
+            bench("Google", true, &["104.16.132.229"]),
+            Some(Hijack::Nxdomain),
+        );
+        assert_eq!(hop.status, Status::Fail);
+        assert_eq!(hop.fault, Some(Fault::ResolverDead));
     }
 
     #[test]
