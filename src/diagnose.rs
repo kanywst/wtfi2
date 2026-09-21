@@ -242,6 +242,12 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
             Some("Renew the DHCP lease, or check for a static configuration that was left half-filled.".to_string()),
             Confidence::Certain,
         ),
+        (HopId::Host, Some(Fault::GatewayOffSubnet)) => (
+            "Your address and your router don't match",
+            "Your machine and its default gateway are configured on different subnets, so they can't reach each other at all — the router will look unresponsive because nothing you send can arrive.".to_string(),
+            Some("Renew the DHCP lease, or clear a static IP left over from a different network.".to_string()),
+            Confidence::Certain,
+        ),
         (HopId::Host, _) => (
             "You're offline",
             "The connectivity chain is broken end-to-end.".to_string(),
@@ -693,6 +699,28 @@ mod tests {
             ],
         };
         assert_eq!(diagnose(&p).headline, "Nothing was measured");
+    }
+
+    /// The gateway's own probe fails as collateral here, and its arm says
+    /// "reboot the router" at `Likely` — while the host hop already holds the
+    /// certain, specific cause. `Host` sorts before `Gateway`, so grading this
+    /// as a break is what lets the right evidence win.
+    #[test]
+    fn a_gateway_off_subnet_beats_the_routers_collateral_failure() {
+        let mut host = hop(HopId::Host, Layer::Link, Status::Fail);
+        host.fault = Some(Fault::GatewayOffSubnet);
+        let mut gw = hop(HopId::Gateway, Layer::Network, Status::Fail);
+        gw.fault = Some(Fault::GatewaySilent);
+        let p = Path {
+            hops: vec![host, hop(HopId::Link, Layer::Link, Status::Ok), gw],
+        };
+        let v = diagnose(&p);
+        assert!(v.headline.contains("don't match"), "got: {}", v.headline);
+        assert!(
+            !v.fix.as_deref().unwrap().contains("Reboot"),
+            "the router is fine; it just can't be reached"
+        );
+        assert_eq!(v.confidence, Confidence::Certain);
     }
 
     #[test]

@@ -63,6 +63,9 @@ pub enum Fault {
     SelfAssignedAddr,
     /// The interface has no address at all.
     NoAddress,
+    /// The configured address and the default gateway share no subnet, so
+    /// they cannot reach each other however healthy each one is.
+    GatewayOffSubnet,
     /// Associated, but there is no default route off this machine — typically
     /// a DHCP lease that never arrived.
     NoRoute,
@@ -88,6 +91,7 @@ impl Fault {
             Fault::NotAssociated => "not_associated",
             Fault::SelfAssignedAddr => "self_assigned_addr",
             Fault::NoAddress => "no_address",
+            Fault::GatewayOffSubnet => "gateway_off_subnet",
             Fault::NoRoute => "no_route",
             Fault::NoGateway => "no_gateway",
             Fault::GatewaySilent => "gateway_silent",
@@ -304,6 +308,7 @@ mod tests {
             Fault::NotAssociated,
             Fault::SelfAssignedAddr,
             Fault::NoAddress,
+            Fault::GatewayOffSubnet,
             Fault::NoRoute,
             Fault::NoGateway,
             Fault::GatewaySilent,

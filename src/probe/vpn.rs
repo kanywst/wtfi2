@@ -137,6 +137,12 @@ mod tests {
         fn link(&self, _: &str) -> Result<LinkInfo, PlatformError> {
             Ok(LinkInfo::default())
         }
+        fn addrs(&self, _: &str) -> Result<AddrInfo, PlatformError> {
+            Ok(AddrInfo::default())
+        }
+        fn primary_interface(&self) -> Result<String, PlatformError> {
+            Ok("en0".into())
+        }
         fn resolvers(&self) -> Result<ResolverInfo, PlatformError> {
             Ok(ResolverInfo::default())
         }

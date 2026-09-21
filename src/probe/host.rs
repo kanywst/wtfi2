@@ -86,16 +86,29 @@ fn grade(hop: &mut Hop, interface: &str, addrs: &AddrInfo, gateway: Option<IpAdd
 
     // An address and a gateway that share no subnet cannot talk to each other,
     // however healthy each is on its own.
+    //
+    // Graded like the self-assigned case, and for the same reason: it is a
+    // break only when there is no other way out. Left at `Warn` it lost the
+    // verdict to the gateway's own collateral failure downstream, which says
+    // "Your router isn't responding — reboot the router" at `Confidence::
+    // Likely` while this hop already holds the certain, specific cause.
+    // `first_break` looks only at `Fail`, and `Host` sorts before `Gateway`.
     if let Some(gw) = gateway
         && addrs.v4_contains(gw) == Some(false)
     {
-        hop.status = Status::Warn;
         hop.metrics.push(
             Metric::new("Gateway", format!("{gw} (outside your subnet)")).with_status(Status::Warn),
         );
-        hop.summary = Some(format!(
+        let note = format!(
             "Your address and your gateway ({gw}) are on different subnets — they can't reach each other"
-        ));
+        );
+        if addrs.v6.is_empty() {
+            hop.fail(Fault::GatewayOffSubnet, note);
+        } else {
+            hop.status = Status::Warn;
+            hop.fault = Some(Fault::GatewayOffSubnet);
+            hop.summary = Some(format!("{note}, though IPv6 still has a path out"));
+        }
         return;
     }
 
@@ -167,12 +180,29 @@ mod tests {
         assert!(hop.summary.unwrap().contains("IPv4 only"));
     }
 
-    /// Both ends can be individually healthy and still unable to talk.
+    /// Both ends can be individually healthy and still unable to talk — and
+    /// on IPv4 alone that is total unreachability, so it has to be a `Fail`.
+    /// Left at `Warn` the verdict went to the gateway's collateral failure
+    /// ("reboot the router") while this hop already held the certain cause.
     #[test]
-    fn a_gateway_outside_the_subnet_is_flagged() {
+    fn a_gateway_outside_the_subnet_is_a_break() {
         let hop = graded(&addrs(Some(("192.168.0.15", 24)), &[]), Some("10.0.0.1"));
-        assert_eq!(hop.status, Status::Warn);
+        assert_eq!(hop.status, Status::Fail);
+        assert_eq!(hop.fault, Some(Fault::GatewayOffSubnet));
         assert!(hop.summary.unwrap().contains("different subnets"));
+    }
+
+    /// With IPv6 configured there is still a path out, so it degrades rather
+    /// than breaking — the same test the self-assigned branch applies.
+    #[test]
+    fn a_gateway_outside_the_subnet_only_warns_when_ipv6_works() {
+        let hop = graded(
+            &addrs(Some(("192.168.0.15", 24)), &["2001:db8::5"]),
+            Some("10.0.0.1"),
+        );
+        assert_eq!(hop.status, Status::Warn);
+        assert_eq!(hop.fault, Some(Fault::GatewayOffSubnet));
+        assert!(hop.summary.unwrap().contains("IPv6 still has a path"));
     }
 
     #[test]
