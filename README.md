@@ -28,8 +28,8 @@ cause** so the answer is one line, not ten.
 - **Catches "up but unusable".** Every hop can answer and still be dropping a quarter of your packets. wtfi measures loss and jitter per hop, so the classic full-bars-nothing-loads network is diagnosed instead of being reported as healthy — and it says whether the loss is your Wi-Fi or your uplink.
 - **Live dashboard.** `wtfi -w` re-probes continuously with real-time latency
   sparklines and a signal gauge, so you can walk around and find the dead zone.
-- **No sudo required.** Signal, noise, gateway RTT, dual-stack reachability,
-  DNS benchmarking and captive-portal detection all work unprivileged.
+- **Says what it measured.** Every verdict carries the method behind it — how many probes, to where, over how long — so you can tell a thorough measurement from a single timed-out packet instead of taking the headline on trust.
+- **No sudo required.** Signal, noise, gateway RTT, dual-stack reachability, DNS benchmarking, the TTL sweep and captive-portal detection all work unprivileged.
 
 ## See it
 
@@ -38,17 +38,18 @@ The live dashboard (`wtfi -w`):
 ```text
  wtfi  what the f*ck internet  ✓ live
 ┌ ✓ You ───────┐     ┌ ✓ Wi-Fi ─────┐     ┌ ✓ Gateway ───┐     ┌ ✓ Internet ─┐     ┌ ✗ DNS ───────┐     ┌ – Portal ────┐
-│   this Mac   │     │  -45 dBm     │     │  192.168.0.1 │     │   1.1.1.1   │     │system resolve│     │ captive check│
-│      ok      │───▶ │   43 dB SNR  │───▶ │     2 ms     │───▶ │    12 ms    │─╳─▶ │     down     │───▶ │   skipped    │
+│192.168.0.15/24│    │  -53 dBm     │     │  192.168.0.1 │     │  8.8.8.8    │     │ 192.168.0.1  │     │ captive check│
+│      ok      │───▶ │   34 dB SNR  │───▶ │     4 ms     │───▶ │     7 ms    │─╳─▶ │     down     │───▶ │   skipped    │
 └──────────────┘     └──────────────┘     └──────────────┘     └─────────────┘     └──────────────┘     └──────────────┘
 ┌ verdict ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │  BROKEN  DNS resolution is failing                                                                                   │
 │ Raw internet works (IPs are reachable) but name resolution fails — a classic DNS-only outage.                        │
 │ → Switch resolvers to 1.1.1.1 / 8.8.8.8, or flush the DNS cache.                                                     │
+│ evidence: cloudflare.com. asked of 3 resolvers under a 3s deadline (0 answered)                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The one-shot report (`wtfi`):
+The one-shot report (`wtfi -v`, real output with the public address masked):
 
 ```text
  wtfi · what the f*ck internet
@@ -57,6 +58,53 @@ The one-shot report (`wtfi`):
 
   ALL GOOD ✓ You're fully online
             Every hop from your Wi-Fi to the internet is healthy.
+
+  ✓ You       192.168.0.15/24
+      192.168.0.15/24 · IPv4 only
+      Interface: en0
+      IPv4: 192.168.0.15/24
+  ✓ Wi-Fi     en0
+      Excellent · -53 dBm (SNR 34 dB)
+      RSSI: -53 dBm
+      Channel: 44 (5GHz) / 80MHz
+      PHY: 802.11ac
+      Tx Rate: 526 Mbps
+  ✓ Gateway   192.168.0.1
+      Router reachable in 4 ms
+      ↳ 5 ICMP echoes to 192.168.0.1, 200ms apart
+      RTT: 3.7 ms avg
+      Loss: 0% (0/5 lost)
+      Jitter: ±0.5 ms
+  ✓ Internet  8.8.8.8 (Google)
+      Reachable over IPv4 (7 ms via Google) · no IPv6 on this network
+      ↳ 5 handshakes to :443 across 3 independent networks, and one HTTPS request that completed
+      Cloudflare: 5 ms
+      Google: 4 ms
+      Quad9: 5 ms
+      Cloudflare v6: unreachable
+      Google v6: unreachable
+      Public IP: 203.0.113.76
+  ✓ DNS       192.168.0.1
+      Resolving fast (10 ms)
+      ↳ cloudflare.com. asked of 3 resolvers under a 3s deadline (3 answered), plus one nonexistent-name check
+      Resolvers: 192.168.0.1
+      System: 10 ms
+      Cloudflare: 9 ms
+      Google: 13 ms
+  ✓ Portal    captive check
+      No portal — traffic flows clean to the internet
+```
+
+The `Uplink` node only joins the chain when something upstream is already broken — a healthy run never pays for the TTL sweep. When it does appear, it is what turns "your ISP is down" into a hop number:
+
+```text
+  ✓ Gateway ─✗─ ✗ Uplink ─── ✗ Internet
+
+  BROKEN   ✗ The break is inside your ISP's network
+            Dies past hop 2 — the last reply came from 203.0.113.1, then 4 hops of silence.
+            → Not your Mac and not your router. Report the outage to your ISP and quote
+              the last hop that answered, from the Uplink detail below.
+            evidence: TTL sweep to 1.1.1.1, 2 of 6 hops queried replied, 1 probe per hop, 1s wait
 ```
 
 ## Install
