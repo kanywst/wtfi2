@@ -197,11 +197,16 @@ fn remaining(deadline: Instant) -> Duration {
 /// Parse `traceroute -n` output.
 ///
 /// ```text
-/// traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
-///  1  192.168.0.1  3.456 ms
-///  2  203.0.113.1  12.345 ms
+/// traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 48 byte packets
+///  1  192.168.0.1  3.974 ms
+///  2  203.0.113.1  4.520 ms
 ///  3  *
 /// ```
+///
+/// Shape confirmed against a real `traceroute -n -P icmp -m 6 -q 1 -w 1`
+/// on macOS 26 — the addresses here are documentation ranges, but the leading
+/// space, the two-space separators, the bare `*` for a silent hop and the
+/// unnumbered header line are what the tool actually emits.
 ///
 /// The header line has no leading hop number, so requiring one to parse as a
 /// TTL skips it without a special case.
@@ -330,7 +335,9 @@ mod tests {
         assert_eq!(hop.metrics[1].value, "*");
     }
 
-    const TRACE: &str = "traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 52 byte packets
+    /// Byte-for-byte the shape of a real macOS `traceroute -n -P icmp` run,
+    /// with documentation addresses substituted for the live ones.
+    const TRACE: &str = "traceroute to 1.1.1.1 (1.1.1.1), 6 hops max, 48 byte packets
  1  192.168.0.1  3.456 ms
  2  203.0.113.1  12.345 ms
  3  *
