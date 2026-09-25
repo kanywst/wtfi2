@@ -69,7 +69,7 @@ jobs:
             exit 1
           fi
 
-      - uses: anthropics/claude-code-action@7b0b255830a1fab6e602658672acad11c12d841d # v1
+      - uses: anthropics/claude-code-action@cfc3eb22bfed5c26ef66e3223c982af27e4524de # v1
         with:
           # A subscription token, not an API key: runs against the Claude plan
           # instead of API credits. Generate it with `claude setup-token`.
