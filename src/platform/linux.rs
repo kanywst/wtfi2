@@ -200,11 +200,13 @@ fn ip_default_route() -> Result<RouteInfo, PlatformError> {
     if let Some(info) = parse_ip_route(&v4)? {
         return Ok(info);
     }
-    // If the IPv6 table can't be read, the IPv4 answer — read successfully,
-    // and empty — is the one that stands.
-    match run("ip", &["-j", "-6", "route", "show", "default"]).map(|t| parse_ip_route(&t)) {
-        Ok(Ok(Some(info))) => Ok(info),
-        _ => Err(PlatformError::NoNetwork),
+    match run("ip", &["-j", "-6", "route", "show", "default"]) {
+        // Output we can't read is unknown, and must reach `route()` as such so
+        // it can try `/proc` — not be folded into "no route".
+        Ok(v6) => parse_ip_route(&v6)?.ok_or(PlatformError::NoNetwork),
+        // If the IPv6 query can't run at all, the IPv4 answer — read
+        // successfully, and empty — is the one that stands.
+        Err(_) => Err(PlatformError::NoNetwork),
     }
 }
 
