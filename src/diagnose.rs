@@ -8,6 +8,21 @@
 use crate::model::{Fault, HopId, Path, Status};
 use crate::probe::net::LOSS_WARN_PCT;
 
+/// What the report calls the machine it runs on. "Your Mac" on a Linux laptop
+/// reads as a bug, and makes the rest of the verdict easier to doubt.
+const MACHINE: &str = if cfg!(target_os = "macos") {
+    "Mac"
+} else {
+    "machine"
+};
+
+/// How to renew a DHCP lease on this OS, as the start of a fix.
+const RENEW_LEASE: &str = if cfg!(target_os = "macos") {
+    "Renew the DHCP lease (System Settings → Network → Details → TCP/IP → Renew DHCP Lease)"
+} else {
+    "Renew the DHCP lease by reconnecting (with NetworkManager: `nmcli device connect <interface>`)"
+};
+
 /// Confidence in a verdict, surfaced so the UI can hedge honestly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confidence {
@@ -152,8 +167,8 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
     let (headline, cause, fix, confidence) = match (id, fault) {
         (HopId::Link, Some(Fault::NoRoute)) => (
             "No route off this machine",
-            "The Wi-Fi link is up, but there's no default route — so nothing can leave this Mac. That is almost always a DHCP lease that never arrived, not a signal problem.".to_string(),
-            Some("Renew the DHCP lease (System Settings → Network → Details → TCP/IP → Renew DHCP Lease), or rejoin the network.".to_string()),
+            format!("The Wi-Fi link is up, but there's no default route — so nothing can leave this {MACHINE}. That is almost always a DHCP lease that never arrived, not a signal problem."),
+            Some(format!("{RENEW_LEASE}, or rejoin the network.")),
             Confidence::Likely,
         ),
         (HopId::Link, _) => (
@@ -220,7 +235,7 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
         (HopId::Uplink, Some(Fault::UplinkDiesInIsp)) => (
             "The break is inside your ISP's network",
             format!("Your equipment is forwarding fine — the trace gets out of your house and then stops. {} Nothing you own is between you and that point.", uplink_evidence(path)),
-            Some("Not your Mac and not your router. Report the outage to your ISP and quote the last hop that answered, from the Uplink detail below.".to_string()),
+            Some(format!("Not your {MACHINE} and not your router. Report the outage to your ISP and quote the last hop that answered, from the Uplink detail below.")),
             Confidence::Likely,
         ),
         (HopId::Uplink, _) => (
@@ -254,7 +269,7 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
                 (
                     "Your ISP / uplink is down",
                     "The router answers locally, but nothing beyond it is reachable — the break is between your router and the internet.".to_string(),
-                    Some("Check the modem/ONU lights; this is usually an ISP or WAN-cable outage, not your Mac.".to_string()),
+                    Some(format!("Check the modem/ONU lights; this is usually an ISP or WAN-cable outage, not your {MACHINE}.")),
                     Confidence::Likely,
                 )
             }
@@ -299,13 +314,13 @@ fn explain_break(path: &Path, id: HopId) -> Verdict {
             Some("Reconnect or quit the VPN client, then re-test.".to_string()),
             Confidence::Likely,
         ),
-        // DHCP never answered, so macOS autoconfigured. Every hop downstream
+        // DHCP never answered, so the OS autoconfigured. Every hop downstream
         // will fail too, but they are all collateral: nothing can be reached
         // from an address nothing else shares.
         (HopId::Host, Some(Fault::SelfAssignedAddr)) => (
             "DHCP never gave you an address",
-            "Your Mac fell back to a self-assigned 169.254 address, which can't reach anything beyond this machine. The Wi-Fi link is fine; the lease is what's missing.".to_string(),
-            Some("Renew the DHCP lease (System Settings → Network → Details → TCP/IP → Renew DHCP Lease). If that fails, the router's DHCP server is the problem, not your Mac.".to_string()),
+            format!("Your {MACHINE} fell back to a self-assigned 169.254 address, which can't reach anything beyond it. The Wi-Fi link is fine; the lease is what's missing."),
+            Some(format!("{RENEW_LEASE}. If that fails, the router's DHCP server is the problem, not your {MACHINE}.")),
             Confidence::Certain,
         ),
         (HopId::Host, Some(Fault::NoAddress)) => (
