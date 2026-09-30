@@ -153,10 +153,22 @@ fn vpn_state_unknown(path: &Path) -> bool {
 
 /// What the TTL sweep actually saw, quoted into the verdict so the claim
 /// carries its evidence rather than asking to be trusted.
+///
+/// Returned as a finished sentence: every caller sets it between two others,
+/// and the probe's summaries are written as card lines with no full stop — so
+/// quoting one bare ran it straight into the next ("…of silence Nothing you
+/// own…").
 fn uplink_evidence(path: &Path) -> String {
-    path.get(HopId::Uplink)
+    let summary = path
+        .get(HopId::Uplink)
         .and_then(|h| h.summary.clone())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let summary = summary.trim_end();
+    if summary.is_empty() || summary.ends_with(['.', '!', '?']) {
+        summary.to_string()
+    } else {
+        format!("{summary}.")
+    }
 }
 
 fn explain_break(path: &Path, id: HopId) -> Verdict {
@@ -547,6 +559,20 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoted_uplink_evidence_ends_its_sentence() {
+        let mut path = Path { hops: Vec::new() };
+        let mut up = crate::model::Hop::new(HopId::Uplink, crate::model::Layer::Internet, "Uplink");
+        up.summary = Some("Dies past hop 2 — then 4 hops of silence".into());
+        path.upsert(up);
+        assert_eq!(
+            uplink_evidence(&path),
+            "Dies past hop 2 — then 4 hops of silence."
+        );
+        path.hops[0].summary = Some("Already a sentence.".into());
+        assert_eq!(uplink_evidence(&path), "Already a sentence.");
+    }
     use crate::model::{Hop, Layer};
 
     fn hop(id: HopId, layer: Layer, s: Status) -> Hop {
