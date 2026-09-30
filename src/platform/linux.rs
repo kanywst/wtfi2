@@ -100,6 +100,14 @@ impl Platform for Linux {
     }
 
     fn link(&self, interface: &str) -> Result<LinkInfo, PlatformError> {
+        // An interface that has vanished (dongle pulled, driver crashed,
+        // renamed mid-sweep) is not "wired and fine" — which is what failing
+        // both wireless checks below would otherwise say about it.
+        if !Path::new("/sys/class/net").join(interface).exists() {
+            return Err(PlatformError::Command(format!(
+                "{interface} is not in /sys/class/net"
+            )));
+        }
         if !is_wireless(interface) {
             return Ok(LinkInfo {
                 interface: interface.to_string(),
