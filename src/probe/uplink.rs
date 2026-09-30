@@ -95,6 +95,18 @@ pub async fn probe() -> Hop {
     hop
 }
 
+/// The Uplink hop for a sweep that already ran: the reasoning half of
+/// [`probe`], so the scripted demo is graded by the real thing rather than by
+/// a copy of its wording.
+#[cfg(feature = "demo")]
+pub(crate) fn from_sweep(hops: &[TtlHop]) -> Hop {
+    let mut hop = Hop::new(HopId::Uplink, Layer::Internet, "Uplink");
+    hop.subtitle = Some(format!("path to {TARGET}"));
+    let target: IpAddr = TARGET.parse().expect("TARGET is a literal address");
+    grade(&mut hop, hops, target);
+    hop
+}
+
 /// Turn the sweep into a verdict about where the path stops. Pure, so the
 /// reasoning is testable without a network to break.
 fn grade(hop: &mut Hop, hops: &[TtlHop], target: IpAddr) {

@@ -10,14 +10,29 @@ async fn main() -> Result<()> {
 
     // Before the OS check: the demo never touches the platform layer.
     #[cfg(feature = "demo")]
-    if cli.demo {
-        return ui::run_demo().await;
+    let demo = match cli.demo.as_deref() {
+        None => None,
+        Some(v) => match wtfi2::demo::Scenario::parse(v, cli.watch) {
+            Some(s) => Some(s),
+            None => {
+                eprintln!("wtfi: unknown --demo scenario {v:?} (healthy, dns, isp)");
+                std::process::exit(64);
+            }
+        },
+    };
+    #[cfg(feature = "demo")]
+    if let Some(scenario) = demo
+        && cli.watch
+    {
+        return ui::run_demo(scenario).await;
     }
+    #[cfg(not(feature = "demo"))]
+    let demo: Option<()> = None;
 
     // Refuse before probing: every hop would fail and the report would blame the
     // user's network for what is really a missing port. Exits outside the 0/1/2
     // health scale, since this says nothing about the network.
-    if let Some(reason) = platform::UNSUPPORTED_OS {
+    if let Some(reason) = platform::UNSUPPORTED_OS.filter(|_| demo.is_none()) {
         eprintln!("wtfi: {reason}");
         std::process::exit(3);
     }
@@ -26,6 +41,12 @@ async fn main() -> Result<()> {
         return ui::run(cli.sweep_deadline()).await;
     }
 
+    #[cfg(feature = "demo")]
+    let path = match demo {
+        Some(scenario) => wtfi2::demo::run_once(scenario).await,
+        None => engine::run_once_within(cli.sweep_deadline()).await,
+    };
+    #[cfg(not(feature = "demo"))]
     let path = engine::run_once_within(cli.sweep_deadline()).await;
     let verdict = diagnose::diagnose(&path);
 

@@ -36,7 +36,7 @@ struct App {
     #[cfg(feature = "demo")]
     sweeps: usize,
     #[cfg(feature = "demo")]
-    demo: bool,
+    demo: Option<crate::demo::Scenario>,
 }
 
 impl App {
@@ -53,7 +53,7 @@ impl App {
             #[cfg(feature = "demo")]
             sweeps: 0,
             #[cfg(feature = "demo")]
-            demo: false,
+            demo: None,
         }
     }
 
@@ -86,8 +86,8 @@ impl App {
         #[cfg(feature = "demo")]
         {
             self.sweeps += 1;
-            if self.demo {
-                return crate::demo::spawn(self.sweeps - 1);
+            if let Some(scenario) = self.demo {
+                return crate::demo::spawn(scenario, self.sweeps - 1);
             }
         }
         engine::spawn()
@@ -126,14 +126,14 @@ pub async fn run(sweep_deadline: Duration) -> Result<()> {
 
 /// Entry point for `wtfi --demo`: the live dashboard over scripted sweeps.
 #[cfg(feature = "demo")]
-pub async fn run_demo() -> Result<()> {
+pub async fn run_demo(scenario: crate::demo::Scenario) -> Result<()> {
     // Unlike `run`, there is no one-shot report to fall back to: the demo only
     // exists to be watched, and `ratatui::init` panics without a terminal.
     if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         return Err(color_eyre::eyre::eyre!("--demo needs a terminal"));
     }
     let mut app = App::new();
-    app.demo = true;
+    app.demo = Some(scenario);
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, app).await;
     ratatui::restore();
