@@ -109,7 +109,7 @@ The `Uplink` node only joins the chain when something upstream is already broken
 
 ## Install
 
-Homebrew (macOS):
+Homebrew (macOS; Linux users install from crates.io below):
 
 ```bash
 brew install kanywst/tap/wtfi2
@@ -129,7 +129,7 @@ cd wtfi2
 cargo install --path .
 ```
 
-The installed command is `wtfi` in every case. Note that the crate builds anywhere but only *diagnoses* on macOS — see [Platform support](#platform-support).
+The installed command is `wtfi` in every case. The crate builds anywhere but only *diagnoses* on macOS and Linux — see [Platform support](#platform-support).
 
 ## Usage
 
@@ -188,8 +188,8 @@ Built for 2026, single self-contained binary:
 | CLI          | `clap` 4                                           |
 
 The OS-specific data acquisition sits behind a `Platform` trait, so the whole
-diagnostic stack is portable — only a thin macOS module touches CoreWLAN,
-`route` and `scutil`.
+diagnostic stack is portable — only a thin module per OS touches the system:
+CoreWLAN, `route` and `scutil` on macOS; `ip`, `iw` and `resolv.conf` on Linux.
 
 ## Platform support
 
@@ -200,13 +200,22 @@ Location permission, so those show as *hidden* in an unsigned build, while RSSI,
 noise, channel, PHY and everything that actually matters for diagnosis remain
 available.
 
+Linux reads the same facts without root: rtnetlink through `ip -j` for routes,
+addresses and tunnels, nl80211 through `iw` for signal, frequency, bitrate and
+noise, and `/etc/resolv.conf` (or systemd-resolved's upstream list behind the
+`127.0.0.53` stub) for resolvers. Nothing is redacted there, so the SSID and
+BSSID show as-is. Without `iw` it falls back to `/proc/net/wireless` for the
+signal; without `ip`, to `/proc/net/route`. Prebuilt binaries are macOS-only
+for now, so on Linux install with `cargo install wtfi2`.
+
 On any other OS there is no platform module yet, so `wtfi` refuses up front — one line on stderr and exit 3 — rather than probing and reporting your network as broken. The crate still compiles everywhere, which is what keeps `cargo install` and the docs.rs build honest.
 
 ## Roadmap
 
 - Real SSID/BSSID via Location authorization in a signed `.app` bundle
   (CoreWLAN telemetry already lands instantly today).
-- Linux platform module (`nl80211` / `netlink`).
+- Prebuilt Linux binaries in the release pipeline (the Linux platform module
+  itself ships; today it installs through `cargo install`).
 - Trends that survive a restart. Export already ships as `wtfi --json`, and `wtfi -w` keeps an in-session sparkline; what is missing is persisting sweeps to disk so yesterday's dead zone is still there tomorrow.
 
 ## License

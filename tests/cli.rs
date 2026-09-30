@@ -21,10 +21,9 @@ const DOCUMENTED_EXIT_CODES: [i32; 5] = [0, 1, 2, 3, 4];
 /// exits with this *before* reading `--json` or probing anything, so stdout is
 /// empty and every assertion about a report has to stand down.
 ///
-/// That path is real in CI: `ci.yml`'s `package` job runs `cargo test
-/// --all-features` on `ubuntu-latest`. Guarding per test rather than putting
-/// `#![cfg(target_os = "macos")]` on the file keeps the Linux leg exercising
-/// the refusal contract, which is documented behaviour in its own right.
+/// Neither CI leg takes that path any more (macOS and Linux both have a
+/// platform module), but it is documented behaviour on every other OS, so the
+/// tests guard for it per test rather than assuming a supported platform.
 const EXIT_UNSUPPORTED: i32 = 3;
 
 fn refused(out: &Output) -> bool {
