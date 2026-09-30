@@ -53,8 +53,17 @@ async fn main() -> Result<()> {
     if cli.json {
         println!("{}", json::to_string(&path, &verdict));
     } else {
-        let color = !cli.no_color && std::io::stdout().is_terminal();
-        print!("{}", render::report(&path, &verdict, cli.verbose, color));
+        let tty = std::io::stdout().is_terminal();
+        let color = !cli.no_color && tty;
+        // Wrap to the terminal; leave lines whole for a pipe.
+        let width = tty
+            .then(crossterm::terminal::size)
+            .and_then(Result::ok)
+            .map(|(cols, _)| usize::from(cols));
+        print!(
+            "{}",
+            render::report_to_width(&path, &verdict, cli.verbose, color, width)
+        );
     }
 
     // Exit code reflects health, so scripts can branch on it. "Nothing could
