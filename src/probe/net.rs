@@ -178,9 +178,9 @@ pub fn apply_quality(hop: &mut Hop, q: &Quality, jitter_warn_ms: f64) -> Status 
 /// kernel can't pick an egress interface.
 ///
 /// `wait` bounds the burst so a black-holed target costs a bounded amount of
-/// time rather than `count * timeout`. Only `ping(8)` can enforce that itself
-/// (`-t`); `ping6(8)` has no timeout option at all — its `-t` is an unrelated
-/// boolean — so the v6 burst is bounded from out here instead.
+/// time rather than `count * timeout`. How `ping` is told that differs by OS,
+/// which [`ping_command`] owns; the whole child is also bounded from out here,
+/// for the one variant (macOS `ping6`) that has no such option at all.
 ///
 /// Output is parsed regardless of exit status: `ping` exits non-zero on 100%
 /// loss, and "everything was lost" is a result we very much want to report.
@@ -195,35 +195,12 @@ pub async fn ping_burst(
     interval: Duration,
     wait: Duration,
 ) -> Quality {
-    let secs = wait.as_secs().max(1).to_string();
-    let count_s = count.to_string();
-    // Three decimals: `ping` accepts down to 0.002s unprivileged, and rounding
-    // a sub-50ms interval to `0.0` would get the whole burst rejected.
-    let interval_s = format!("{:.3}", interval.as_secs_f64());
-    let (bin, target) = match addr {
-        IpAddr::V4(v4) => ("ping", v4.to_string()),
-        IpAddr::V6(v6) => match zone {
-            Some(z) => ("ping6", format!("{v6}%{z}")),
-            None => ("ping6", v6.to_string()),
-        },
-    };
-    let is_v6 = addr.is_ipv6();
+    let (bin, args) = ping_command(cfg!(target_os = "linux"), addr, zone, count, interval, wait);
     let mut cmd = Command::new(bin);
-    cmd.args(["-c", &count_s]);
-    if !is_v6 {
-        // `ping6` would swallow the value as a `hops` positional and then fail
-        // to resolve it, sending nothing at all.
-        cmd.args(["-t", &secs]);
-    }
-    // A single sample needs no spacing, and `ping` refuses intervals below
-    // 0.002s for non-root.
-    if count > 1 {
-        cmd.args(["-i", &interval_s]);
-    }
-    cmd.arg(&target).kill_on_drop(true);
+    cmd.args(&args).kill_on_drop(true);
 
-    // Ceiling for the whole child: what `-t` already does for v4, and the only
-    // thing bounding v6. Padded so it can't pre-empt `ping`'s own tally.
+    // Ceiling for the whole child: what the deadline flag already does
+    // everywhere but macOS `ping6`, and the only thing bounding that one. Padded so it can't pre-empt `ping`'s own tally.
     let budget = wait + interval * count + Duration::from_secs(1);
     let out = match timeout(budget, cmd.output()).await {
         Ok(Ok(o)) => o,
@@ -248,6 +225,58 @@ pub async fn ping_burst(
         sent,
         rtts_ms: rtts_ms[..keep].to_vec(),
     }
+}
+
+/// The `ping` invocation for one burst: binary and arguments, target last.
+///
+/// Pure, and keyed on `linux` rather than on `cfg`, so both dialects are tested
+/// on whichever OS runs the suite. They share `-c` and `-i` and disagree on the
+/// rest in ways that fail silently rather than loudly:
+///
+/// - The deadline. macOS `ping -t` is a timeout; iputils `ping -t` is the
+///   **TTL**, so the macOS flag on Linux would cap every echo at a couple of
+///   hops and report a healthy internet as unreachable. iputils spells the
+///   deadline `-w`, and accepts it for IPv6 too.
+/// - IPv6. macOS has a separate `ping6`, whose `-t` is an unrelated boolean
+///   that would swallow the value as a `hops` positional and send nothing.
+///   Current iputils may not ship `ping6` at all; `ping -6` is the spelling
+///   that always exists.
+fn ping_command(
+    linux: bool,
+    addr: IpAddr,
+    zone: Option<&str>,
+    count: u32,
+    interval: Duration,
+    wait: Duration,
+) -> (&'static str, Vec<String>) {
+    let secs = wait.as_secs().max(1).to_string();
+    let target = match (addr, zone) {
+        (IpAddr::V6(v6), Some(z)) => format!("{v6}%{z}"),
+        _ => addr.to_string(),
+    };
+    let mut args = vec!["-c".to_string(), count.to_string()];
+    let bin = match (linux, addr.is_ipv6()) {
+        (true, v6) => {
+            if v6 {
+                args.push("-6".into());
+            }
+            args.extend(["-w".into(), secs]);
+            "ping"
+        }
+        (false, false) => {
+            args.extend(["-t".into(), secs]);
+            "ping"
+        }
+        (false, true) => "ping6",
+    };
+    // A single sample needs no spacing, and `ping` refuses intervals below
+    // 0.002s for non-root. Three decimals: rounding a sub-50ms interval to
+    // `0.0` would get the whole burst rejected.
+    if count > 1 {
+        args.extend(["-i".into(), format!("{:.3}", interval.as_secs_f64())]);
+    }
+    args.push(target);
+    (bin, args)
 }
 
 /// Pull every `time=3.456 ms` out of ping output, in reply order.
@@ -305,6 +334,75 @@ pub async fn tcp_connect(addr: SocketAddr, wait: Duration) -> Probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cmd(linux: bool, addr: &str, zone: Option<&str>) -> (&'static str, Vec<String>) {
+        let wait = Duration::from_secs(2);
+        ping_command(
+            linux,
+            addr.parse().unwrap(),
+            zone,
+            5,
+            Duration::from_millis(200),
+            wait,
+        )
+    }
+
+    /// The bug this guards: macOS's timeout flag is iputils' TTL flag, so
+    /// `-t 2` on Linux caps every echo at two hops and grades a healthy
+    /// internet as unreachable.
+    #[test]
+    fn linux_ping_bounds_the_burst_with_a_deadline_not_a_ttl() {
+        let (bin, args) = cmd(true, "1.1.1.1", None);
+        assert_eq!(bin, "ping");
+        assert_eq!(args, ["-c", "5", "-w", "2", "-i", "0.200", "1.1.1.1"]);
+        assert!(!args.contains(&"-t".to_string()));
+    }
+
+    #[test]
+    fn linux_ping6_is_ping_dash_6_with_the_zone_kept() {
+        let (bin, args) = cmd(true, "fe80::1", Some("wlan0"));
+        assert_eq!(bin, "ping");
+        assert_eq!(
+            args,
+            ["-c", "5", "-6", "-w", "2", "-i", "0.200", "fe80::1%wlan0"]
+        );
+    }
+
+    #[test]
+    fn macos_ping_keeps_its_own_dialect() {
+        assert_eq!(
+            cmd(false, "192.168.0.1", None),
+            (
+                "ping",
+                ["-c", "5", "-t", "2", "-i", "0.200", "192.168.0.1"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
+        // `ping6` has no timeout option; its `-t` would eat the value.
+        assert_eq!(
+            cmd(false, "fe80::1", Some("en0")),
+            (
+                "ping6",
+                ["-c", "5", "-i", "0.200", "fe80::1%en0"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn a_single_echo_asks_for_no_interval() {
+        let (_, args) = ping_command(
+            true,
+            "1.1.1.1".parse().unwrap(),
+            None,
+            1,
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+        );
+        assert!(!args.contains(&"-i".to_string()));
+    }
 
     /// A realistic macOS `ping -c 5` transcript with two packets dropped.
     const LOSSY: &str = "\
