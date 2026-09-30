@@ -12,7 +12,7 @@ keywords = ["network", "wifi", "diagnostic", "tui", "macos"]
 categories = ["command-line-utilities"]
 # Keep the published crate to what a consumer actually builds. The CI and
 # release-pipeline scaffolding only matters in this repo.
-exclude = [".github/", "dist-workspace.toml"]
+exclude = [".github/", "dist-workspace.toml", "docs/"]
 
 [[bin]]
 name = "wtfi"
