@@ -32,6 +32,11 @@ struct App {
     gw_hist: VecDeque<f64>,
     wan_hist: VecDeque<f64>,
     scanning: bool,
+    /// Sweeps started so far; picks which scripted sweep `--demo` plays.
+    #[cfg(feature = "demo")]
+    sweeps: usize,
+    #[cfg(feature = "demo")]
+    demo: bool,
 }
 
 impl App {
@@ -45,6 +50,10 @@ impl App {
             gw_hist: VecDeque::with_capacity(HISTORY),
             wan_hist: VecDeque::with_capacity(HISTORY),
             scanning: true,
+            #[cfg(feature = "demo")]
+            sweeps: 0,
+            #[cfg(feature = "demo")]
+            demo: false,
         }
     }
 
@@ -74,6 +83,13 @@ impl App {
             }
         }
         self.scanning = true;
+        #[cfg(feature = "demo")]
+        {
+            self.sweeps += 1;
+            if self.demo {
+                return crate::demo::spawn(self.sweeps - 1);
+            }
+        }
         engine::spawn()
     }
 }
@@ -103,13 +119,23 @@ pub async fn run(sweep_deadline: Duration) -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal).await;
+    let result = event_loop(&mut terminal, App::new()).await;
     ratatui::restore();
     result
 }
 
-async fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+/// Entry point for `wtfi --demo`: the live dashboard over scripted sweeps.
+#[cfg(feature = "demo")]
+pub async fn run_demo() -> Result<()> {
     let mut app = App::new();
+    app.demo = true;
+    let mut terminal = ratatui::init();
+    let result = event_loop(&mut terminal, app).await;
+    ratatui::restore();
+    result
+}
+
+async fn event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<()> {
     let mut events = EventStream::new();
     let mut ticker = interval(Duration::from_millis(120));
     let mut reprobe = interval(Duration::from_secs(REPROBE_SECS));

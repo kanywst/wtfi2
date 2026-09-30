@@ -46,6 +46,12 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
 objc2-core-wlan = { version = "0.3", default-features = false, features = ["std", "CWInterface", "CWWiFiClient", "CWChannel", "CoreWLANTypes"] }
 
+[features]
+# `wtfi --demo`: replay scripted sweeps instead of probing, for recording the
+# README GIF without publishing the network it was recorded on. Off in release
+# builds; CI turns it on through `--all-features`.
+demo = []
+
 [dev-dependencies]
 # The integration tests parse the binary's --json output. serde_json is already
 # a runtime dependency, but tests/ links only against the crate and its dev

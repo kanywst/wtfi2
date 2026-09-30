@@ -5,6 +5,8 @@
 //! you in one line where the connection died and how to fix it.
 
 pub mod cli;
+#[cfg(feature = "demo")]
+pub mod demo;
 pub mod diagnose;
 pub mod engine;
 pub mod json;
