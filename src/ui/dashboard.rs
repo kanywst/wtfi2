@@ -127,6 +127,11 @@ pub async fn run(sweep_deadline: Duration) -> Result<()> {
 /// Entry point for `wtfi --demo`: the live dashboard over scripted sweeps.
 #[cfg(feature = "demo")]
 pub async fn run_demo() -> Result<()> {
+    // Unlike `run`, there is no one-shot report to fall back to: the demo only
+    // exists to be watched, and `ratatui::init` panics without a terminal.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return Err(color_eyre::eyre::eyre!("--demo needs a terminal"));
+    }
     let mut app = App::new();
     app.demo = true;
     let mut terminal = ratatui::init();
