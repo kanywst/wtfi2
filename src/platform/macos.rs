@@ -165,9 +165,10 @@ impl Platform for MacOs {
         let Some(iface) = detect_tunnel(&nwi) else {
             return Ok(VpnInfo::default());
         };
-        let local_ip = run("ifconfig", &[&iface])
-            .ok()
-            .and_then(|t| parse_ifconfig_inet(&t));
+        // Propagated, not defaulted: the VPN hop reads a missing address as
+        // "the tunnel is up but carrying nothing", which an `ifconfig` that
+        // never ran must not be allowed to claim.
+        let local_ip = parse_ifconfig_inet(&run("ifconfig", &[&iface])?);
         // Vendor: a running VPN client's daemon name is the most reliable
         // sudo-free signal — the tunnel interface is an opaque `utunN` for
         // nearly every vendor. Fall back to the tunnel address range.
