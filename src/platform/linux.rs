@@ -18,7 +18,7 @@
 use super::shared::{is_link_local, parse_addr, vendor_from_ip, vendor_from_processes};
 use super::{AddrInfo, LinkInfo, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo};
 use serde_json::Value;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::process::Command;
 
@@ -69,28 +69,28 @@ fn is_wireless(iface: &str) -> bool {
 
 impl Platform for Linux {
     fn route(&self) -> Result<RouteInfo, PlatformError> {
-        let mut info = match run("ip", &["-j", "route", "show", "default"]) {
-            Ok(v4) => match parse_ip_route(&v4) {
-                Some(i) => i,
-                // No IPv4 default: an IPv6-only network is still a network.
-                None => run("ip", &["-j", "-6", "route", "show", "default"])
-                    .ok()
-                    .and_then(|t| parse_ip_route(&t))
-                    .ok_or(PlatformError::NoNetwork)?,
+        let mut info = match ip_default_route() {
+            Ok(info) => info,
+            Err(PlatformError::NoNetwork) => return Err(PlatformError::NoNetwork),
+            // `ip` is missing, refused, or too old to print routes as JSON
+            // (iproute2 before 4.17 accepts `-j` and ignores it for routes).
+            // The kernel's own tables still answer. If they can't be read
+            // either, report the `ip` failure: we could not look.
+            Err(e) => match proc_default_route() {
+                Ok(info) => info,
+                Err(PlatformError::NoNetwork) => return Err(PlatformError::NoNetwork),
+                Err(_) => return Err(e),
             },
-            // `ip` itself is missing or refused: the kernel's own table still
-            // answers for IPv4.
-            Err(e) => read("/proc/net/route")
-                .map_err(|_| e)
-                .and_then(|t| parse_proc_route(&t).ok_or(PlatformError::NoNetwork))?,
         };
         info.mtu = read(&format!("/sys/class/net/{}/mtu", info.interface))
             .ok()
             .and_then(|t| t.trim().parse().ok());
+        info.egress_interface = egress_dev().filter(|dev| *dev != info.interface);
+        let prefer = info.egress_interface.as_deref().unwrap_or(&info.interface);
         match run("ip", &["-j", "-d", "link", "show", "up"]) {
             Err(_) => info.tunnel_unreadable = true,
             Ok(links) => {
-                if let Some((iface, _)) = detect_tunnel(&links) {
+                if let Some((iface, _)) = detect_tunnel(&links, prefer) {
                     info.tunnel_active = true;
                     info.tunnel_iface = Some(iface);
                 }
@@ -172,7 +172,8 @@ impl Platform for Linux {
 
     fn vpn(&self) -> Result<VpnInfo, PlatformError> {
         let links = run("ip", &["-j", "-d", "link", "show", "up"])?;
-        let Some((iface, kind)) = detect_tunnel(&links) else {
+        let egress = egress_dev().unwrap_or_default();
+        let Some((iface, kind)) = detect_tunnel(&links, &egress) else {
             return Ok(VpnInfo::default());
         };
         let local_ip = run("ip", &["-j", "addr", "show", "dev", &iface])
@@ -190,6 +191,44 @@ impl Platform for Linux {
             vendor,
         })
     }
+}
+
+/// The main table's default route, falling back to IPv6 for an IPv6-only
+/// network.
+fn ip_default_route() -> Result<RouteInfo, PlatformError> {
+    let v4 = run("ip", &["-j", "route", "show", "default"])?;
+    if let Some(info) = parse_ip_route(&v4)? {
+        return Ok(info);
+    }
+    // If the IPv6 table can't be read, the IPv4 answer — read successfully,
+    // and empty — is the one that stands.
+    match run("ip", &["-j", "-6", "route", "show", "default"]).map(|t| parse_ip_route(&t)) {
+        Ok(Ok(Some(info))) => Ok(info),
+        _ => Err(PlatformError::NoNetwork),
+    }
+}
+
+/// The default route from `/proc/net/route`, then `/proc/net/ipv6_route`.
+fn proc_default_route() -> Result<RouteInfo, PlatformError> {
+    if let Some(info) = parse_proc_route(&read("/proc/net/route")?) {
+        return Ok(info);
+    }
+    read("/proc/net/ipv6_route")
+        .ok()
+        .and_then(|t| parse_proc_ipv6_route(&t))
+        .ok_or(PlatformError::NoNetwork)
+}
+
+/// The interface an internet-bound packet actually leaves through, from a
+/// real lookup (`ip route get`) that follows policy rules and longest-prefix
+/// matches — which a listing of the main table's `default` entry does not.
+/// `None` when the lookup can't be made; the caller then falls back to the
+/// default route's own interface, which is what it would have used anyway.
+fn egress_dev() -> Option<String> {
+    ["1.1.1.1", "2606:4700:4700::1111"].iter().find_map(|dst| {
+        let text = run("ip", &["-j", "route", "get", dst]).ok()?;
+        json(&text)?.first()?["dev"].as_str().map(str::to_string)
+    })
 }
 
 /// Every process name, from `/proc/<pid>/comm`. Read directly rather than via
@@ -217,25 +256,46 @@ fn json(text: &str) -> Option<Vec<Value>> {
 
 /// The preferred default route from `ip -j route show default`: the lowest
 /// metric wins, as it does in the kernel.
-fn parse_ip_route(text: &str) -> Option<RouteInfo> {
-    let routes = json(text)?;
-    let best = routes
+///
+/// `Ok(None)` only when the table was read and holds no default route. Output
+/// that isn't the promised JSON is a parse error: reading it as "no route"
+/// would report a confident outage on the strength of a tool we misread.
+fn parse_ip_route(text: &str) -> Result<Option<RouteInfo>, PlatformError> {
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let routes =
+        json(text).ok_or_else(|| PlatformError::Parse("unreadable `ip -j route`".into()))?;
+    // A multipath (ECMP) default carries no `dev` of its own, only a list of
+    // `nexthops`; the first stands in for the route.
+    let hop_of = |r: &Value| -> Option<(String, Option<IpAddr>)> {
+        let hop = if r["dev"].is_string() {
+            r
+        } else {
+            r["nexthops"].as_array()?.first()?
+        };
+        let dev = hop["dev"].as_str()?.to_string();
+        Some((dev, hop["gateway"].as_str().and_then(|g| g.parse().ok())))
+    };
+    let Some((interface, gateway)) = routes
         .iter()
-        .filter(|r| r["dev"].is_string())
-        .min_by_key(|r| r["metric"].as_u64().unwrap_or(0))?;
-    let interface = best["dev"].as_str()?.to_string();
-    let gateway: Option<IpAddr> = best["gateway"].as_str().and_then(|g| g.parse().ok());
+        .filter_map(|r| Some((r["metric"].as_u64().unwrap_or(0), hop_of(r)?)))
+        .min_by_key(|(metric, _)| *metric)
+        .map(|(_, hop)| hop)
+    else {
+        return Ok(None);
+    };
     // A link-local IPv6 gateway is only reachable through the interface that
     // learned it; `ip` leaves the zone implicit in `dev`.
     let gateway_zone = gateway
         .filter(|g| g.is_ipv6() && is_link_local(*g))
         .map(|_| interface.clone());
-    Some(RouteInfo {
+    Ok(Some(RouteInfo {
         interface,
         gateway,
         gateway_zone,
         ..Default::default()
-    })
+    }))
 }
 
 /// The IPv4 default route from `/proc/net/route`, whose addresses are
@@ -263,21 +323,71 @@ fn parse_proc_route(text: &str) -> Option<RouteInfo> {
         })
 }
 
-/// The first up tunnel in `ip -j -d link show up`, with its link kind.
+/// The IPv6 default route from `/proc/net/ipv6_route`.
 ///
-/// Matched by the driver kind where the kernel reports one, and by name for
-/// the common userspace clients, so a Docker bridge or veth — up, virtual, and
-/// nothing to do with a VPN — never qualifies.
-fn detect_tunnel(text: &str) -> Option<(String, Option<String>)> {
-    json(text)?.iter().find_map(|l| {
-        let name = l["ifname"].as_str()?;
-        let kind = l["linkinfo"]["info_kind"].as_str();
-        let by_kind = matches!(kind, Some("tun" | "wireguard"));
-        let by_name = ["tun", "tap", "wg", "tailscale", "utun", "ppp"]
-            .iter()
-            .any(|p| name.starts_with(p));
-        (by_kind || by_name).then(|| (name.to_string(), kind.map(str::to_string)))
+/// ```text
+/// dest                             plen src                              plen next_hop                         metric   ref      use      flags    iface
+/// 00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003 wlan0
+/// ```
+///
+/// The kernel also lists an unreachable `::/0` on `lo`; only a route that is
+/// up (`RTF_UP`) on a real interface counts.
+fn parse_proc_ipv6_route(text: &str) -> Option<RouteInfo> {
+    text.lines().find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let flags = u32::from_str_radix(f.get(8)?, 16).ok()?;
+        let default = f[0].bytes().all(|b| b == b'0') && f[1] == "00";
+        if !default || flags & 0x1 == 0 || f.get(9).is_none_or(|i| *i == "lo") {
+            return None;
+        }
+        let gw = u128::from_str_radix(f[4], 16)
+            .ok()
+            .filter(|g| *g != 0)
+            .map(|g| IpAddr::V6(Ipv6Addr::from(g)));
+        let interface = f[9].to_string();
+        let gateway_zone = gw.filter(|g| is_link_local(*g)).map(|_| interface.clone());
+        Some(RouteInfo {
+            interface,
+            gateway: gw,
+            gateway_zone,
+            ..Default::default()
+        })
     })
+}
+
+/// The first up VPN tunnel in `ip -j -d link show up`, with its link kind.
+///
+/// The kernel's driver kind decides wherever it reports one, and the name only
+/// when it doesn't. Plenty of up, virtual interfaces are not VPNs, and calling
+/// one a tunnel reroutes the verdict: a Docker bridge or veth, a PPPoE `ppp0`,
+/// and above all the `vnetN` NIC of every libvirt/QEMU guest — which is a `tun`
+/// device too, but in `tap` (Ethernet) mode, where L3 VPN clients use `tun`.
+///
+/// With several tunnels up, the one named `prefer` (the egress interface)
+/// wins: it is the one carrying the traffic being diagnosed.
+fn detect_tunnel(text: &str, prefer: &str) -> Option<(String, Option<String>)> {
+    let tunnels: Vec<(String, Option<String>)> = json(text)?
+        .iter()
+        .filter_map(|l| {
+            let name = l["ifname"].as_str()?;
+            let kind = l["linkinfo"]["info_kind"].as_str();
+            let by_name = ["tun", "wg", "tailscale", "utun"]
+                .iter()
+                .any(|p| name.starts_with(p));
+            let is_vpn = match kind {
+                Some("wireguard") => true,
+                Some("tun") => match l["linkinfo"]["info_data"]["type"].as_str() {
+                    Some(mode) => mode == "tun",
+                    None => by_name,
+                },
+                Some(_) => false,
+                None => by_name,
+            };
+            is_vpn.then(|| (name.to_string(), kind.map(str::to_string)))
+        })
+        .collect();
+    let preferred = tunnels.iter().position(|(name, _)| name == prefer);
+    tunnels.into_iter().nth(preferred.unwrap_or(0))
 }
 
 fn addr_infos(text: &str) -> Vec<Value> {
@@ -441,7 +551,7 @@ fn parse_survey_noise(text: &str) -> Option<i32> {
 ///  wlan0: 0000   56.  -54.  -256        0      0      0
 /// ```
 ///
-/// `-256` is the driver saying "no noise reading", not a noise floor.
+/// `-256` is the driver saying "no reading" — in either column, not a level.
 fn parse_proc_wireless(text: &str, iface: &str) -> Option<LinkInfo> {
     let line = text
         .lines()
@@ -454,7 +564,7 @@ fn parse_proc_wireless(text: &str, iface: &str) -> Option<LinkInfo> {
             .ok()
             .map(|v| v as i32)
     };
-    let rssi = num(2).filter(|v| *v < 0);
+    let rssi = num(2).filter(|v| *v < 0 && *v > -256);
     let noise = num(3).filter(|v| *v < 0 && *v > -256);
     Some(LinkInfo {
         is_wifi: true,
@@ -490,7 +600,7 @@ mod tests {
 
     #[test]
     fn route_prefers_the_lowest_metric() {
-        let r = parse_ip_route(ROUTE).unwrap();
+        let r = parse_ip_route(ROUTE).unwrap().unwrap();
         assert_eq!(r.interface, "enp3s0");
         assert_eq!(r.gateway.unwrap().to_string(), "10.0.0.1");
         assert_eq!(r.gateway_zone, None);
@@ -499,15 +609,24 @@ mod tests {
     #[test]
     fn a_link_local_v6_gateway_is_zoned_to_its_interface() {
         let text = r#"[{"dst":"default","gateway":"fe80::1","dev":"wlan0","protocol":"ra","metric":600,"flags":[]}]"#;
-        let r = parse_ip_route(text).unwrap();
+        let r = parse_ip_route(text).unwrap().unwrap();
         assert_eq!(r.gateway.unwrap().to_string(), "fe80::1");
         assert_eq!(r.gateway_zone.as_deref(), Some("wlan0"));
     }
 
     #[test]
     fn an_empty_table_is_no_route() {
-        assert!(parse_ip_route("[]").is_none());
-        assert!(parse_ip_route("").is_none());
+        assert!(parse_ip_route("[]").unwrap().is_none());
+        assert!(parse_ip_route("").unwrap().is_none());
+    }
+
+    /// Misreading the tool must never become "you have no route".
+    #[test]
+    fn unreadable_route_output_is_unknown_not_an_outage() {
+        assert!(matches!(
+            parse_ip_route("Option \"-j\" is unknown, try \"ip -help\"."),
+            Err(PlatformError::Parse(_))
+        ));
     }
 
     #[test]
@@ -528,13 +647,74 @@ mod tests {
             {"ifname":"wg-home","flags":["POINTOPOINT","NOARP","UP","LOWER_UP"],"linkinfo":{"info_kind":"wireguard"}}
         ]"#;
         assert_eq!(
-            detect_tunnel(text),
+            detect_tunnel(text, "wlan0"),
             Some(("wg-home".into(), Some("wireguard".into())))
         );
-        let ts = r#"[{"ifname":"tailscale0","flags":["UP"],"linkinfo":{"info_kind":"tun"}}]"#;
-        assert_eq!(detect_tunnel(ts).unwrap().0, "tailscale0");
+        let ts = r#"[{"ifname":"tailscale0","flags":["UP"],"linkinfo":{"info_kind":"tun","info_data":{"type":"tun","pi":false,"vnet_hdr":true}}}]"#;
+        assert_eq!(detect_tunnel(ts, "").unwrap().0, "tailscale0");
         let none = r#"[{"ifname":"veth1a2b","flags":["UP"],"linkinfo":{"info_kind":"veth"}}]"#;
-        assert_eq!(detect_tunnel(none), None);
+        assert_eq!(detect_tunnel(none, ""), None);
+    }
+
+    /// A VM's NIC is a `tun` device in `tap` mode. Reading it as a VPN would
+    /// blame a dead tunnel for an outage that has nothing to do with one.
+    #[test]
+    fn vm_taps_and_pppoe_are_not_vpns() {
+        let text = r#"[
+            {"ifname":"vnet0","flags":["UP"],"linkinfo":{"info_kind":"tun","info_data":{"type":"tap"}}},
+            {"ifname":"ppp0","flags":["POINTOPOINT","UP"]},
+            {"ifname":"tun0","flags":["UP"],"linkinfo":{"info_kind":"tun","info_data":{"type":"tun"}}}
+        ]"#;
+        assert_eq!(detect_tunnel(text, "").unwrap().0, "tun0");
+    }
+
+    #[test]
+    fn the_tunnel_carrying_traffic_wins_over_the_first_one_listed() {
+        let text = r#"[
+            {"ifname":"tailscale0","flags":["UP"],"linkinfo":{"info_kind":"tun","info_data":{"type":"tun"}}},
+            {"ifname":"wg0","flags":["UP"],"linkinfo":{"info_kind":"wireguard"}}
+        ]"#;
+        assert_eq!(detect_tunnel(text, "wg0").unwrap().0, "wg0");
+        assert_eq!(detect_tunnel(text, "wlan0").unwrap().0, "tailscale0");
+    }
+
+    #[test]
+    fn a_multipath_default_uses_its_first_nexthop() {
+        let text = r#"[{"dst":"default","protocol":"static","metric":100,"flags":[],"nexthops":[
+            {"gateway":"192.168.1.1","dev":"wlan0","weight":1,"flags":[]},
+            {"gateway":"192.168.2.1","dev":"eth0","weight":1,"flags":[]}]}]"#;
+        let r = parse_ip_route(text).unwrap().unwrap();
+        assert_eq!(r.interface, "wlan0");
+        assert_eq!(r.gateway.unwrap().to_string(), "192.168.1.1");
+    }
+
+    /// iproute2 before 4.17 ignores `-j` for routes and prints text. That has
+    /// to reach the caller as "unreadable" so it falls back to `/proc`.
+    #[test]
+    fn text_route_output_from_an_old_ip_is_a_parse_error() {
+        assert!(matches!(
+            parse_ip_route("default via 192.168.1.1 dev wlan0 proto dhcp metric 600\n"),
+            Err(PlatformError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn proc_ipv6_route_finds_the_default_and_skips_lo() {
+        let text = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo\n\
+                    fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001    wlan0\n\
+                    00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003    wlan0\n";
+        let r = parse_proc_ipv6_route(text).unwrap();
+        assert_eq!(r.interface, "wlan0");
+        assert_eq!(r.gateway.unwrap().to_string(), "fe80::1");
+        assert_eq!(r.gateway_zone.as_deref(), Some("wlan0"));
+        assert!(parse_proc_ipv6_route(text.lines().next().unwrap()).is_none());
+    }
+
+    #[test]
+    fn proc_wireless_ignores_a_sentinel_signal_too() {
+        let text =
+            " wlan0: 0000    0.  -256.  -256        0      0      0      0      0        0\n";
+        assert_eq!(parse_proc_wireless(text, "wlan0").unwrap().rssi_dbm, None);
     }
 
     const ADDR: &str = r#"[{"ifindex":3,"ifname":"wlan0","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"mtu":1500,"operstate":"UP","addr_info":[
