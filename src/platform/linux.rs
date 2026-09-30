@@ -188,9 +188,11 @@ impl Platform for Linux {
         let Some((iface, kind)) = detect_tunnel(&links, prefer) else {
             return Ok(VpnInfo::default());
         };
-        let local_ip = run("ip", &["-j", "addr", "show", "dev", &iface])
-            .ok()
-            .and_then(|t| tunnel_local_ip(&t));
+        // Propagated, not defaulted: the VPN hop reads a missing address as
+        // "the tunnel is up but carrying nothing", which a failed read must
+        // not be allowed to claim.
+        let local_ip = tunnel_local_ip(&run("ip", &["-j", "addr", "show", "dev", &iface])?)
+            .ok_or_else(|| PlatformError::Parse("unreadable `ip -j addr`".into()))?;
         let vendor = vendor_from_processes(&process_names())
             .or_else(|| local_ip.and_then(vendor_from_ip))
             // In-kernel WireGuard has no daemon to name it.
@@ -216,9 +218,9 @@ fn ip_default_route() -> Result<RouteInfo, PlatformError> {
         // Output we can't read is unknown, and must reach `route()` as such so
         // it can try `/proc` — not be folded into "no route".
         Ok(v6) => parse_ip_route(&v6)?.ok_or(PlatformError::NoNetwork),
-        // If the IPv6 query can't run at all, the IPv4 answer — read
-        // successfully, and empty — is the one that stands.
-        Err(_) => Err(PlatformError::NoNetwork),
+        // A query that couldn't run is unknown too: `route()` then reads both
+        // tables from `/proc`, which is what settles "no route".
+        Err(e) => Err(e),
     }
 }
 
@@ -227,10 +229,13 @@ fn proc_default_route() -> Result<RouteInfo, PlatformError> {
     if let Some(info) = parse_proc_route(&read("/proc/net/route")?) {
         return Ok(info);
     }
-    read("/proc/net/ipv6_route")
-        .ok()
-        .and_then(|t| parse_proc_ipv6_route(&t))
-        .ok_or(PlatformError::NoNetwork)
+    match std::fs::read_to_string("/proc/net/ipv6_route") {
+        Ok(t) => parse_proc_ipv6_route(&t).ok_or(PlatformError::NoNetwork),
+        // No such file: the kernel has IPv6 disabled, so there is no IPv6
+        // route to have — the empty IPv4 table stands.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(PlatformError::NoNetwork),
+        Err(e) => Err(PlatformError::Command(format!("/proc/net/ipv6_route: {e}"))),
+    }
 }
 
 /// The interface an internet-bound packet actually leaves through, from a
@@ -435,10 +440,14 @@ fn parse_ip_addr(text: &str) -> Option<AddrInfo> {
 }
 
 /// A tunnel's own address, preferring IPv4 and skipping link-local IPv6.
-fn tunnel_local_ip(text: &str) -> Option<IpAddr> {
+/// `None` when the output is unreadable; `Some(None)` when it was read and the
+/// tunnel genuinely has no address.
+fn tunnel_local_ip(text: &str) -> Option<Option<IpAddr>> {
     let a = parse_ip_addr(text)?;
-    a.v4.map(|(ip, _)| IpAddr::V4(ip))
-        .or_else(|| a.v6.first().map(|v6| IpAddr::V6(*v6)))
+    Some(
+        a.v4.map(|(ip, _)| IpAddr::V4(ip))
+            .or_else(|| a.v6.first().map(|v6| IpAddr::V6(*v6))),
+    )
 }
 
 /// Parse `iw dev <if> link`. `None` for `Not connected.` — the interface is up
@@ -762,7 +771,17 @@ mod tests {
         let text = r#"[{"ifname":"tailscale0","addr_info":[
             {"family":"inet6","local":"fd7a:115c:a1e0::1","prefixlen":128},
             {"family":"inet","local":"100.86.1.2","prefixlen":32}]}]"#;
-        assert_eq!(tunnel_local_ip(text).unwrap().to_string(), "100.86.1.2");
+        assert_eq!(
+            tunnel_local_ip(text).unwrap().unwrap().to_string(),
+            "100.86.1.2"
+        );
+        let bare = r#"[{"ifname":"wg0","addr_info":[]}]"#;
+        assert_eq!(
+            tunnel_local_ip(bare),
+            Some(None),
+            "read, and genuinely empty"
+        );
+        assert_eq!(tunnel_local_ip("garbage"), None, "unreadable is not empty");
     }
 
     const IW_VHT: &str = "Connected to 00:11:22:33:44:55 (on wlan0)
