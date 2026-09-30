@@ -21,7 +21,7 @@ pub fn probe(platform: &impl Platform, route: &RouteInfo) -> Hop {
     // metric, and `diagnose::vpn_is_full_tunnel` keys off that metric alone —
     // turning a real WAN outage into "Internet is down — through your VPN" at
     // `Confidence::Likely`.
-    let info = match platform.vpn() {
+    let info = match platform.vpn(route) {
         Ok(info) => info,
         Err(e) => {
             hop.status = Status::Warn;
@@ -111,7 +111,7 @@ mod tests {
         fn resolvers(&self) -> Result<ResolverInfo, PlatformError> {
             Ok(ResolverInfo::default())
         }
-        fn vpn(&self) -> Result<VpnInfo, PlatformError> {
+        fn vpn(&self, _route: &RouteInfo) -> Result<VpnInfo, PlatformError> {
             Ok(self.0.clone())
         }
     }
@@ -148,7 +148,7 @@ mod tests {
         fn resolvers(&self) -> Result<ResolverInfo, PlatformError> {
             Ok(ResolverInfo::default())
         }
-        fn vpn(&self) -> Result<VpnInfo, PlatformError> {
+        fn vpn(&self, _route: &RouteInfo) -> Result<VpnInfo, PlatformError> {
             Err(PlatformError::Command("scutil: refused".into()))
         }
     }

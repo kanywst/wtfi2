@@ -210,7 +210,12 @@ pub trait Platform: Send + Sync {
     fn resolvers(&self) -> Result<ResolverInfo, PlatformError>;
     /// Describe the active VPN/overlay tunnel, if any. An inactive result
     /// (`VpnInfo::active == false`) is normal, not an error.
-    fn vpn(&self) -> Result<VpnInfo, PlatformError>;
+    ///
+    /// `route` is the reading [`Platform::route`] just made. With several
+    /// tunnels up, describe the one it named (`tunnel_iface`): picking again
+    /// independently lets the two reads disagree, and the VPN hop then grades
+    /// one tunnel's mode against another's route.
+    fn vpn(&self, route: &RouteInfo) -> Result<VpnInfo, PlatformError>;
 }
 
 /// Return the platform implementation for the current OS.

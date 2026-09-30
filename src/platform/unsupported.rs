@@ -28,7 +28,7 @@ impl Platform for Unsupported {
         Err(PlatformError::Unsupported)
     }
 
-    fn vpn(&self) -> Result<VpnInfo, PlatformError> {
+    fn vpn(&self, _route: &RouteInfo) -> Result<VpnInfo, PlatformError> {
         Err(PlatformError::Unsupported)
     }
 }
@@ -48,7 +48,10 @@ mod tests {
             Err(PlatformError::Unsupported)
         ));
         assert!(matches!(p.resolvers(), Err(PlatformError::Unsupported)));
-        assert!(matches!(p.vpn(), Err(PlatformError::Unsupported)));
+        assert!(matches!(
+            p.vpn(&RouteInfo::default()),
+            Err(PlatformError::Unsupported)
+        ));
     }
 
     /// Guards against the two `cfg` gates drifting: this module compiling while
