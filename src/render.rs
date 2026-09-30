@@ -37,8 +37,25 @@ fn status_code(st: Status) -> &'static str {
     }
 }
 
-/// Render the full report to a string.
+/// Render the full report to a string, one line per paragraph.
 pub fn report(path: &Path, verdict: &Verdict, verbose: bool, color: bool) -> String {
+    report_to_width(path, verdict, verbose, color, None)
+}
+
+/// Render the full report, word-wrapping prose to `width` columns.
+///
+/// A verdict's cause runs past 200 characters, and a terminal left to wrap it
+/// itself restarts the overflow at column 0 — under the headline's tag, where
+/// it reads as a new, unlabelled line. Wrapping here keeps each paragraph
+/// under its own indent. `None` leaves lines whole, which is what a pipe or a
+/// script parsing the text wants.
+pub fn report_to_width(
+    path: &Path,
+    verdict: &Verdict,
+    verbose: bool,
+    color: bool,
+    width: Option<usize>,
+) -> String {
     let p = Palette { on: color };
     let mut out = String::new();
 
@@ -48,9 +65,9 @@ pub fn report(path: &Path, verdict: &Verdict, verbose: bool, color: bool) -> Str
 
     out.push_str(&topology(path, &p));
     out.push_str("\n\n");
-    out.push_str(&verdict_block(path, verdict, &p));
+    out.push_str(&verdict_block(path, verdict, &p, width));
     out.push('\n');
-    out.push_str(&detail(path, &p, verbose));
+    out.push_str(&detail(path, &p, verbose, width));
 
     out
 }
@@ -84,7 +101,58 @@ fn verdict_evidence(path: &Path, v: &Verdict) -> Option<String> {
     path.get(v.source?)?.evidence.clone()
 }
 
-fn verdict_block(path: &Path, v: &Verdict, p: &Palette) -> String {
+/// Word-wrap `text` into lines that fit `width` once indented by `indent`.
+/// Counts characters: the report is ASCII plus single-width symbols (`—`,
+/// `→`, `✓`). `None` returns the text as one line, untouched.
+fn wrap(text: &str, indent: usize, width: Option<usize>) -> Vec<String> {
+    let Some(width) = width else {
+        return vec![text.to_string()];
+    };
+    // Below this a narrow pane would wrap every other word; overflowing is
+    // the lesser evil.
+    let room = width.saturating_sub(indent).max(30);
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let len = cur.chars().count();
+        if len > 0 && len + 1 + word.chars().count() > room {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// `text` wrapped under `indent` spaces, the first line after `lead` (a
+/// marker such as `→ `) and the rest aligned beneath its text.
+fn paragraph(
+    text: &str,
+    indent: usize,
+    lead: &str,
+    width: Option<usize>,
+    style: impl Fn(&str) -> String,
+) -> String {
+    let lead_len = lead.chars().count();
+    let pad = " ".repeat(indent);
+    let hang = " ".repeat(indent + lead_len);
+    let mut s = String::new();
+    for (i, line) in wrap(text, indent + lead_len, width).iter().enumerate() {
+        if i == 0 {
+            s.push_str(&format!("{pad}{lead}{}\n", style(line)));
+        } else {
+            s.push_str(&format!("{hang}{}\n", style(line)));
+        }
+    }
+    s
+}
+
+fn verdict_block(path: &Path, v: &Verdict, p: &Palette, width: Option<usize>) -> String {
     let mut s = String::new();
     let tag = match v.status {
         Status::Ok => "  ALL GOOD ",
@@ -97,22 +165,18 @@ fn verdict_block(path: &Path, v: &Verdict, p: &Palette) -> String {
     };
     s.push_str(&p.status(v.status, &p.bold(tag)));
     s.push_str(&p.bold(&format!("{} {}\n", v.status.glyph(), v.headline)));
-    s.push_str(&format!("            {}\n", p.dim(&v.cause)));
+    s.push_str(&paragraph(&v.cause, 12, "", width, |l| p.dim(l)));
     if let Some(fix) = &v.fix {
-        s.push_str(&format!(
-            "            {} {}\n",
-            p.status(Status::Ok, "→"),
-            fix
-        ));
+        let arrow = format!("{} ", p.status(Status::Ok, "→"));
+        let body = paragraph(fix, 12, "→ ", width, str::to_string);
+        s.push_str(&body.replacen("→ ", &arrow, 1));
     }
     // What the claim rests on. Without it the reader has no way to tell a
     // thorough measurement from a single timed-out packet.
     if let Some(evidence) = verdict_evidence(path, v) {
-        s.push_str(&format!(
-            "            {} {}\n",
-            p.dim("evidence:"),
-            p.dim(&evidence)
-        ));
+        let label = format!("{} ", p.dim("evidence:"));
+        let body = paragraph(&evidence, 12, "evidence: ", width, |l| p.dim(l));
+        s.push_str(&body.replacen("evidence: ", &label, 1));
     }
     let conf = match v.confidence {
         Confidence::Certain => "",
@@ -125,7 +189,7 @@ fn verdict_block(path: &Path, v: &Verdict, p: &Palette) -> String {
     s
 }
 
-fn detail(path: &Path, p: &Palette, verbose: bool) -> String {
+fn detail(path: &Path, p: &Palette, verbose: bool, width: Option<usize>) -> String {
     let mut s = String::new();
     // The host hop is listed like any other: it carries this machine's address,
     // subnet and DHCP state now, which is the first thing you want when the
@@ -140,14 +204,18 @@ fn detail(path: &Path, p: &Palette, verbose: bool) -> String {
         s.push_str(&p.status(hop.status, &head));
         s.push('\n');
         if let Some(sum) = &hop.summary {
-            s.push_str(&format!("      {}\n", p.dim(sum)));
+            s.push_str(&paragraph(sum, 6, "", width, |l| p.dim(l)));
         }
         if verbose {
             // Every hop's method, not just the one that owns the verdict: in
             // verbose mode the reader is checking the working, and a metric
             // means little without knowing how it was taken.
             if let Some(evidence) = &hop.evidence {
-                s.push_str(&format!("      {}\n", p.dim(&format!("↳ {evidence}"))));
+                s.push_str(&paragraph(evidence, 6, "↳ ", width, |l| p.dim(l)).replacen(
+                    "↳ ",
+                    &p.dim("↳ "),
+                    1,
+                ));
             }
             for m in &hop.metrics {
                 let v = match m.status {
@@ -170,6 +238,41 @@ mod tests {
     use super::*;
     use crate::diagnose::diagnose;
     use crate::model::{Hop, HopId, Layer, Metric, Path};
+
+    #[test]
+    fn wrapping_keeps_every_line_inside_the_width_and_under_its_indent() {
+        let text = "Your equipment is forwarding fine — the trace gets out of your house and then stops. Nothing you own is between you and that point.";
+        let out = paragraph(text, 12, "", Some(60), str::to_string);
+        assert!(out.lines().count() > 1, "should wrap:\n{out}");
+        for line in out.lines() {
+            assert!(line.chars().count() <= 60, "too wide: {line:?}");
+            assert!(
+                line.starts_with("            "),
+                "lost its indent: {line:?}"
+            );
+        }
+        assert_eq!(out.split_whitespace().collect::<Vec<_>>().join(" "), text);
+    }
+
+    #[test]
+    fn a_lead_marker_hangs_the_rest_of_the_paragraph_beneath_its_text() {
+        let out = paragraph(
+            "one two three four five six seven",
+            2,
+            "→ ",
+            Some(34),
+            str::to_string,
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "  → one two three four five six");
+        assert_eq!(lines[1], "    seven");
+    }
+
+    #[test]
+    fn no_width_leaves_the_text_whole() {
+        let long = "word ".repeat(80);
+        assert_eq!(wrap(long.trim(), 12, None), vec![long.trim().to_string()]);
+    }
 
     fn ok(id: HopId, layer: Layer, title: &str) -> Hop {
         let mut h = Hop::new(id, layer, title);
