@@ -115,7 +115,14 @@ fn send_stalled(tx: &mpsc::UnboundedSender<Hop>, status: Status, fault: Fault, s
 /// has said what address this machine actually holds.
 fn host_hop() -> Hop {
     let mut h = Hop::new(HopId::Host, Layer::Link, "You");
-    h.subtitle = Some("this Mac".into());
+    h.subtitle = Some(
+        if cfg!(target_os = "macos") {
+            "this Mac"
+        } else {
+            "this machine"
+        }
+        .into(),
+    );
     h
 }
 
