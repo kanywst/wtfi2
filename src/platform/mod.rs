@@ -80,6 +80,17 @@ pub struct RouteInfo {
     /// True when a VPN/tunnel interface (utun/tailscale) owns a route.
     pub tunnel_active: bool,
     pub tunnel_iface: Option<String>,
+    /// The interface internet-bound traffic actually leaves through, when that
+    /// is not `interface`.
+    ///
+    /// On macOS a default-route lookup already follows a VPN's split default
+    /// (`0.0.0.0/1` + `128.0.0.0/1`), so `interface` *is* the egress and this
+    /// stays `None`. Linux full-tunnel VPNs mostly steer traffic with policy
+    /// routing instead (wg-quick, a Tailscale exit node), leaving the main
+    /// table's default on the Wi-Fi — which is still the right interface for
+    /// the local hops, and the wrong one to ask "does the VPN carry
+    /// everything?". This answers the second question.
+    pub egress_interface: Option<String>,
     /// True when the tunnel lookup itself failed, so `tunnel_active == false`
     /// means "we couldn't tell" rather than "there is no tunnel".
     ///

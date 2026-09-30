@@ -39,12 +39,14 @@ pub fn probe(platform: &impl Platform, route: &RouteInfo) -> Hop {
         .clone()
         .or_else(|| route.tunnel_iface.clone());
 
-    // Full-tunnel = the tunnel owns the default route, so everything egresses
-    // through it. Split-tunnel = it only claims specific routes.
-    let full_tunnel = iface
+    // Full-tunnel = everything internet-bound egresses through the tunnel,
+    // whether it owns the default route or steers traffic by policy.
+    // Split-tunnel = it only claims specific routes.
+    let egress = route
+        .egress_interface
         .as_deref()
-        .map(|i| i == route.interface)
-        .unwrap_or(false);
+        .unwrap_or(&route.interface);
+    let full_tunnel = iface.as_deref().is_some_and(|i| i == egress);
     let mode = if full_tunnel {
         "full-tunnel"
     } else {
@@ -166,6 +168,24 @@ mod tests {
             "a failed read must not claim a tunnel mode: {:?}",
             hop.metrics
         );
+    }
+
+    /// wg-quick and Tailscale exit nodes leave the main table's default on the
+    /// Wi-Fi and steer traffic by policy. Still a full tunnel: a dead one looks
+    /// exactly like an ISP outage.
+    #[test]
+    fn full_tunnel_when_policy_routing_sends_everything_through_it() {
+        let vpn = VpnInfo {
+            active: true,
+            interface: Some("wg0".into()),
+            ..Default::default()
+        };
+        let route = RouteInfo {
+            interface: "wlan0".into(),
+            egress_interface: Some("wg0".into()),
+            ..Default::default()
+        };
+        assert_eq!(mode(&probe(&MockPlatform(vpn), &route)), "full-tunnel");
     }
 
     #[test]
