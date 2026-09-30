@@ -13,18 +13,21 @@ pub mod macos;
 #[cfg(target_os = "macos")]
 mod corewlan;
 
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
+pub mod linux;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod shared;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub mod unsupported;
 
 /// Why wtfi refuses to probe on this OS, or `None` when it is supported.
-/// macOS is the only real [`Platform`] impl today.
-pub const UNSUPPORTED_OS: Option<&str> = if cfg!(target_os = "macos") {
+/// macOS and Linux are the real [`Platform`] impls today.
+pub const UNSUPPORTED_OS: Option<&str> = if cfg!(any(target_os = "macos", target_os = "linux")) {
     None
 } else {
-    Some("wtfi has no platform module for this OS yet — macOS only for now")
+    Some("wtfi has no platform module for this OS yet — macOS and Linux only for now")
 };
 
 /// Physical / link-layer (L2) facts about the active Wi-Fi interface.
@@ -206,7 +209,13 @@ pub fn current() -> impl Platform {
 }
 
 /// Return the platform implementation for the current OS.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub fn current() -> impl Platform {
+    linux::Linux::new()
+}
+
+/// Return the platform implementation for the current OS.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn current() -> impl Platform {
     unsupported::Unsupported
 }
