@@ -157,7 +157,7 @@ impl Platform for MacOs {
         Ok(parse_resolvers(&text))
     }
 
-    fn vpn(&self) -> Result<VpnInfo, PlatformError> {
+    fn vpn(&self, _route: &RouteInfo) -> Result<VpnInfo, PlatformError> {
         // `scutil --nwi` lists interfaces that are part of the *active* network
         // state, so a utun here is a real tunnel, not one of the idle utun0-3
         // devices macOS always keeps around.

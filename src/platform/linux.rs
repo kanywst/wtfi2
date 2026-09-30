@@ -170,10 +170,14 @@ impl Platform for Linux {
         Ok(ResolverInfo { nameservers: conf })
     }
 
-    fn vpn(&self) -> Result<VpnInfo, PlatformError> {
+    fn vpn(&self, route: &RouteInfo) -> Result<VpnInfo, PlatformError> {
         let links = run("ip", &["-j", "-d", "link", "show", "up"])?;
-        let egress = egress_dev().unwrap_or_default();
-        let Some((iface, kind)) = detect_tunnel(&links, &egress) else {
+        let prefer = route
+            .tunnel_iface
+            .as_deref()
+            .or(route.egress_interface.as_deref())
+            .unwrap_or(&route.interface);
+        let Some((iface, kind)) = detect_tunnel(&links, prefer) else {
             return Ok(VpnInfo::default());
         };
         let local_ip = run("ip", &["-j", "addr", "show", "dev", &iface])
