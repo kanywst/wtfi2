@@ -11,6 +11,12 @@ pinpoints *exactly* where your connection dies, and tells you how to fix it.
 > The Wi-Fi icon shows full bars. The browser says "Offline".
 > Stop guessing which hop is broken. Watch the whole path light up.
 
+![wtfi -w: the live dashboard catching a DNS-only outage and its recovery](docs/demo.gif)
+
+*Recorded from `--demo`, which replays scripted sweeps on documentation
+addresses so the GIF shows no real network. Re-record with
+[`docs/demo.tape`](docs/demo.tape).*
+
 This is a ground-up rewrite of the archived
 [`wtfi`](https://github.com/kanywst/wtfi). The old version printed a flat
 checklist and left you to correlate it. `wtfi2` draws the connection as a
