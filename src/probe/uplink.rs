@@ -53,6 +53,16 @@ pub struct TtlHop {
     pub rtt_ms: Option<f64>,
 }
 
+/// The traceroute arguments for ICMP probes. Linux's `-P icmp` asks for a raw
+/// socket, which needs root and fails without a word; `-I` falls back to an
+/// unprivileged ICMP datagram socket where `ping_group_range` allows one. BSD
+/// traceroute on macOS only knows `-P icmp`.
+const ICMP_ARGS: &[&str] = if cfg!(target_os = "linux") {
+    &["-I"]
+} else {
+    &["-P", "icmp"]
+};
+
 pub async fn probe() -> Hop {
     let mut hop = Hop::new(HopId::Uplink, Layer::Internet, "Uplink");
     hop.subtitle = Some(format!("path to {TARGET}"));
@@ -63,7 +73,7 @@ pub async fn probe() -> Hop {
     // by plenty of NATs and firewalls that pass ICMP perfectly well — and a
     // sweep that dies at hop 1 because of the probe protocol would invent the
     // exact fault this module exists to locate.
-    let mut hops = sweep(&["-P", "icmp"], remaining(deadline)).await;
+    let mut hops = sweep(ICMP_ARGS, remaining(deadline)).await;
     // Retry over UDP only when there is genuinely time left. A sweep that
     // produced nothing because the flag was refused fails in milliseconds; one
     // that produced nothing because every hop stayed silent has already spent
