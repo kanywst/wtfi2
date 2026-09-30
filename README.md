@@ -115,10 +115,16 @@ The `Uplink` node only joins the chain when something upstream is already broken
 
 ## Install
 
-Homebrew (macOS; Linux users install from crates.io below):
+Homebrew (macOS and Linux):
 
 ```bash
 brew install kanywst/tap/wtfi2
+```
+
+Prebuilt binary via the install script (macOS and Linux):
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/kanywst/wtfi2/releases/latest/download/wtfi2-installer.sh | sh
 ```
 
 From crates.io (requires Rust 1.88+):
@@ -211,8 +217,8 @@ addresses and tunnels, nl80211 through `iw` for signal, frequency, bitrate and
 noise, and `/etc/resolv.conf` (or systemd-resolved's upstream list behind the
 `127.0.0.53` stub) for resolvers. Nothing is redacted there, so the SSID and
 BSSID show as-is. Without `iw` it falls back to `/proc/net/wireless` for the
-signal; without `ip`, to `/proc/net/route`. Prebuilt binaries are macOS-only
-for now, so on Linux install with `cargo install wtfi2`.
+signal; without `ip`, to `/proc/net/route`. Prebuilt binaries cover x86_64 and
+aarch64 (glibc).
 
 On any other OS there is no platform module yet, so `wtfi` refuses up front — one line on stderr and exit 3 — rather than probing and reporting your network as broken. The crate still compiles everywhere, which is what keeps `cargo install` and the docs.rs build honest.
 
@@ -220,8 +226,6 @@ On any other OS there is no platform module yet, so `wtfi` refuses up front — 
 
 - Real SSID/BSSID via Location authorization in a signed `.app` bundle
   (CoreWLAN telemetry already lands instantly today).
-- Prebuilt Linux binaries in the release pipeline (the Linux platform module
-  itself ships; today it installs through `cargo install`).
 - Trends that survive a restart. Export already ships as `wtfi --json`, and `wtfi -w` keeps an in-session sparkline; what is missing is persisting sweeps to disk so yesterday's dead zone is still there tomorrow.
 
 ## License

@@ -33,9 +33,9 @@ github-attestations = true
 # CycloneDX SBOM (.cdx.xml) published alongside the binaries, so a consumer can
 # tell what is inside a release without building it.
 cargo-cyclonedx = true
-# macOS only for now. Linux has a platform module but installs through `cargo
-# install`; Linux targets here are on the roadmap
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+# Every OS with a platform module. The Linux builds are glibc, built on dist's
+# default Ubuntu runners.
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Where to host releases
