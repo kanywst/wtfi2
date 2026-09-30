@@ -33,7 +33,8 @@ github-attestations = true
 # CycloneDX SBOM (.cdx.xml) published alongside the binaries, so a consumer can
 # tell what is inside a release without building it.
 cargo-cyclonedx = true
-# macOS only — the platform layer targets macOS (Linux is on the roadmap)
+# macOS only for now. Linux has a platform module but installs through `cargo
+# install`; Linux targets here are on the roadmap
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
