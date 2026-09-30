@@ -27,6 +27,11 @@ pub struct Cli {
     /// only on a network so slow that whole probes are timing out.
     #[arg(long = "timeout", value_name = "SECS", default_value_t = crate::engine::SWEEP_DEADLINE.as_secs())]
     pub timeout_secs: u64,
+
+    /// Replay scripted sweeps in the live dashboard instead of probing.
+    #[cfg(feature = "demo")]
+    #[arg(long = "demo", hide = true)]
+    pub demo: bool,
 }
 
 impl Cli {

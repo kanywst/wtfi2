@@ -3,3 +3,5 @@
 mod dashboard;
 
 pub use dashboard::run;
+#[cfg(feature = "demo")]
+pub use dashboard::run_demo;

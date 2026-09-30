@@ -8,6 +8,12 @@ async fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse_args();
 
+    // Before the OS check: the demo never touches the platform layer.
+    #[cfg(feature = "demo")]
+    if cli.demo {
+        return ui::run_demo().await;
+    }
+
     // Refuse before probing: every hop would fail and the report would blame the
     // user's network for what is really a missing port. Exits outside the 0/1/2
     // health scale, since this says nothing about the network.
