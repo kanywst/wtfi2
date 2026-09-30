@@ -13,6 +13,9 @@ pub mod macos;
 #[cfg(target_os = "macos")]
 mod corewlan;
 
+#[cfg(target_os = "macos")]
+mod shared;
+
 #[cfg(not(target_os = "macos"))]
 pub mod unsupported;
 
