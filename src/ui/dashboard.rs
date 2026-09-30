@@ -403,23 +403,10 @@ fn telemetry(f: &mut Frame, area: Rect, app: &App) {
     ])
     .split(inner);
 
-    // Signal strength gauge from the link hop's RSSI metric.
-    let rssi = app
-        .path
-        .get(HopId::Link)
-        .and_then(|h| h.metrics.iter().find(|m| m.label == "RSSI"))
-        .and_then(|m| m.value.split_whitespace().next())
-        .and_then(|s| s.parse::<f64>().ok());
+    let (rssi, gcol) = signal_gauge(app.path.get(HopId::Link));
     let ratio = rssi
         .map(|r| ((r + 90.0) / 60.0).clamp(0.0, 1.0))
         .unwrap_or(0.0);
-    let gcol = if ratio > 0.6 {
-        Color::Green
-    } else if ratio > 0.35 {
-        Color::Yellow
-    } else {
-        Color::Red
-    };
     let g = Gauge::default()
         .gauge_style(Style::new().fg(gcol))
         .ratio(ratio)
@@ -446,6 +433,26 @@ fn telemetry(f: &mut Frame, area: Rect, app: &App) {
         Color::Magenta,
         loss_badge(app, HopId::Wan),
     );
+}
+
+/// The signal gauge's reading and colour, from the link hop's RSSI metric.
+///
+/// Coloured by the grade the link probe gave that reading, not by a threshold
+/// of its own. A separate threshold (green only above -54 dBm) painted a
+/// -55 dBm link yellow while the card beside it said "Excellent", and a gauge
+/// that disagrees with the verdict makes the reader doubt both. The metric's
+/// grade, unlike the hop's, survives the reset to pending at each re-probe, so
+/// the gauge doesn't flicker between sweeps either.
+fn signal_gauge(link: Option<&Hop>) -> (Option<f64>, Color) {
+    let metric = link.and_then(|h| h.metrics.iter().find(|m| m.label == "RSSI"));
+    let rssi = metric
+        .and_then(|m| m.value.split_whitespace().next())
+        .and_then(|s| s.parse::<f64>().ok());
+    let col = match metric.and_then(|m| m.status) {
+        Some(s @ (Status::Ok | Status::Warn | Status::Fail)) => color(s),
+        _ => Color::DarkGray,
+    };
+    (rssi, col)
 }
 
 /// Loss badge for a telemetry row. `None` when the path is clean, so a healthy
@@ -516,6 +523,33 @@ fn footer(f: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn link_with(value: &str, status: Option<Status>) -> Hop {
+        let mut hop = Hop::new(HopId::Link, crate::model::Layer::Link, "Wi-Fi");
+        let mut m = crate::model::Metric::new("RSSI", value);
+        m.status = status;
+        hop.metrics.push(m);
+        hop
+    }
+
+    /// The bug: -55 dBm graded "Excellent" on the card, yellow on the gauge.
+    #[test]
+    fn the_gauge_takes_the_links_grade_not_its_own_threshold() {
+        let (rssi, col) = signal_gauge(Some(&link_with("-55 dBm", Some(Status::Ok))));
+        assert_eq!(rssi, Some(-55.0));
+        assert_eq!(col, Color::Green);
+        let (_, col) = signal_gauge(Some(&link_with("-72 dBm", Some(Status::Warn))));
+        assert_eq!(col, Color::Yellow);
+    }
+
+    #[test]
+    fn an_ungraded_or_missing_reading_is_grey() {
+        assert_eq!(
+            signal_gauge(Some(&link_with("-55 dBm", None))).1,
+            Color::DarkGray
+        );
+        assert_eq!(signal_gauge(None), (None, Color::DarkGray));
+    }
     use crate::model::Layer;
 
     fn app_with_gateway_loss(loss_pct: Option<f64>) -> App {
