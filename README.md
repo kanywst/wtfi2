@@ -13,10 +13,6 @@ pinpoints *exactly* where your connection dies, and tells you how to fix it.
 
 ![wtfi -w: the live dashboard catching a DNS-only outage and its recovery](docs/demo.gif)
 
-*Recorded from `--demo`, which replays scripted sweeps on documentation
-addresses so the GIF shows no real network. Re-record with
-[`docs/demo.tape`](docs/demo.tape).*
-
 This is a ground-up rewrite of the archived
 [`wtfi`](https://github.com/kanywst/wtfi). The old version printed a flat
 checklist and left you to correlate it. `wtfi2` draws the connection as a
@@ -39,79 +35,22 @@ cause** so the answer is one line, not ten.
 
 ## See it
 
-The live dashboard (`wtfi -w`):
+The live dashboard (`wtfi -w`) is the recording at the top: it re-probes every
+four seconds, and the verdict follows the network as it breaks and recovers.
 
-```text
- wtfi  what the f*ck internet  ✓ live
-┌ ✓ You ───────┐     ┌ ✓ Wi-Fi ─────┐     ┌ ✓ Gateway ───┐     ┌ ✓ Internet ─┐     ┌ ✗ DNS ───────┐     ┌ – Portal ────┐
-│192.168.0.15/24│    │  -53 dBm     │     │  192.168.0.1 │     │  8.8.8.8    │     │ 192.168.0.1  │     │ captive check│
-│      ok      │───▶ │   34 dB SNR  │───▶ │     4 ms     │───▶ │     7 ms    │─╳─▶ │     down     │───▶ │   skipped    │
-└──────────────┘     └──────────────┘     └──────────────┘     └─────────────┘     └──────────────┘     └──────────────┘
-┌ verdict ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  BROKEN  DNS resolution is failing                                                                                   │
-│ Raw internet works (IPs are reachable) but name resolution fails — a classic DNS-only outage.                        │
-│ → Switch resolvers to 1.1.1.1 / 8.8.8.8, or flush the DNS cache.                                                     │
-│ evidence: cloudflare.com. asked of 3 resolvers under a 3s deadline (0 answered)                                      │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-```
+The one-shot report (`wtfi -v`) shows every hop with what it measured and how:
 
-The one-shot report (`wtfi -v`, real output with the public address masked):
+![wtfi -v: every hop healthy, each with its metrics and the method behind them](docs/report.gif)
 
-```text
- wtfi · what the f*ck internet
+The `Uplink` node only joins the chain when something upstream is already
+broken — a healthy run never pays for the TTL sweep. When it does appear, it is
+what turns "your ISP is down" into a hop number:
 
-  ✓ You ─── ✓ Wi-Fi ─── ✓ Gateway ─── ✓ Internet ─── ✓ DNS ─── ✓ Portal
+![wtfi on an ISP outage: the trace dies past hop 2, inside the provider's network](docs/uplink.gif)
 
-  ALL GOOD ✓ You're fully online
-            Every hop from your Wi-Fi to the internet is healthy.
-
-  ✓ You       192.168.0.15/24
-      192.168.0.15/24 · IPv4 only
-      Interface: en0
-      IPv4: 192.168.0.15/24
-  ✓ Wi-Fi     en0
-      Excellent · -53 dBm (SNR 34 dB)
-      RSSI: -53 dBm
-      Channel: 44 (5GHz) / 80MHz
-      PHY: 802.11ac
-      Tx Rate: 526 Mbps
-  ✓ Gateway   192.168.0.1
-      Router reachable in 4 ms
-      ↳ 5 ICMP echoes to 192.168.0.1, 200ms apart
-      RTT: 3.7 ms avg
-      Loss: 0% (0/5 lost)
-      Jitter: ±0.5 ms
-  ✓ Internet  8.8.8.8 (Google)
-      Reachable over IPv4 (7 ms via Google) · no IPv6 on this network
-      ↳ 5 handshakes to :443 across 3 independent networks, and one HTTPS request that completed
-      Cloudflare: 5 ms
-      Google: 4 ms
-      Quad9: 5 ms
-      Cloudflare v6: unreachable
-      Google v6: unreachable
-      Public IP: 203.0.113.76
-  ✓ DNS       192.168.0.1
-      Resolving fast (10 ms)
-      ↳ cloudflare.com. asked of 3 resolvers under a 3s deadline (3 answered), plus one nonexistent-name check
-      Resolvers: 192.168.0.1
-      System: 10 ms
-      Cloudflare: 9 ms
-      Google: 13 ms
-  ✓ Portal    captive check
-      No portal — traffic flows clean to the internet
-```
-
-The `Uplink` node only joins the chain when something upstream is already broken — a healthy run never pays for the TTL sweep. When it does appear, it is what turns "your ISP is down" into a hop number:
-
-```text
-  ✓ Gateway ─✗─ ✗ Uplink ─── ✗ Internet
-
-  BROKEN   ✗ The break is inside your ISP's network
-            Dies past hop 2 — the last reply came from 203.0.113.1, then 4 hops of silence.
-            → Not your Mac and not your router. Report the outage to your ISP and quote
-              the last hop that answered, from the Uplink detail below.
-            evidence: TTL sweep to 1.1.1.1, 2 of 6 hops queried replied, 1 probe per hop, 1s wait
-```
+*All three are recorded from `--demo`, which replays scripted sweeps on
+documentation addresses (RFC 5737) so no real network appears. Re-record them
+with the tapes in [`docs/`](docs/).*
 
 ## Install
 
