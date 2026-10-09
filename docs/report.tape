@@ -1,11 +1,9 @@
-# Records docs/report.gif for the README's "See it" section.
+# Records docs/report.png for the README's "See it" section.
 #
 #   cargo build --release --features demo && vhs docs/report.tape
 #
 # Scripted with --demo on documentation addresses (RFC 5737); see
 # docs/demo.tape for why the README is never recorded from a real network.
-
-Output docs/report.gif
 
 Set Shell "bash"
 Set FontSize 14
@@ -24,3 +22,4 @@ Type "wtfi -v"
 Sleep 400ms
 Enter
 Sleep 4s
+Screenshot docs/report.png

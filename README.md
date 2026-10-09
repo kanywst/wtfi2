@@ -40,17 +40,15 @@ four seconds, and the verdict follows the network as it breaks and recovers.
 
 The one-shot report (`wtfi -v`) shows every hop with what it measured and how:
 
-![wtfi -v: every hop healthy, each with its metrics and the method behind them](docs/report.gif)
+![wtfi -v: every hop healthy, each with its metrics and the method behind them](docs/report.png)
 
 The `Uplink` node only joins the chain when something upstream is already
 broken — a healthy run never pays for the TTL sweep. When it does appear, it is
 what turns "your ISP is down" into a hop number:
 
-![wtfi on an ISP outage: the trace dies past hop 2, inside the provider's network](docs/uplink.gif)
+![wtfi on an ISP outage: the trace dies past hop 2, inside the provider's network](docs/uplink.png)
 
-*All three are recorded from `--demo`, which replays scripted sweeps on
-documentation addresses (RFC 5737) so no real network appears. Re-record them
-with the tapes in [`docs/`](docs/).*
+*The recording and both screenshots come from `--demo`, which replays scripted sweeps on documentation addresses (RFC 5737) so no real network appears. Regenerate them with the tapes in [`docs/`](docs/).*
 
 ## Install
 
