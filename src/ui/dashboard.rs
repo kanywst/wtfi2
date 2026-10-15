@@ -71,21 +71,17 @@ impl App {
         self.path.upsert(hop);
         if self.path.is_complete() {
             self.verdict = diagnose(&self.path);
-            // Only on the transition, so a hop landing after the sweep settled
-            // can't record the same sweep twice.
+            // Once per sweep: only on the transition out of scanning.
             if self.scanning
                 && let Some(file) = &self.record_to
             {
-                // Nowhere to report a write error without tearing the TUI, and
-                // a full disk is no reason to stop showing the network.
                 let _ = history::append(file, &history::Record::now(&self.path, &self.verdict));
             }
             self.scanning = false;
         }
     }
 
-    /// Start recording to `file`, and pick the sparklines up where the last
-    /// recorded session left them.
+    /// Record to `file`, seeding the sparklines from what it already holds.
     fn record_to(&mut self, file: PathBuf) {
         for r in history::load(&file, HISTORY).unwrap_or_default() {
             push(&mut self.gw_hist, r.gateway_ms);

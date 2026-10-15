@@ -1,13 +1,4 @@
-//! Sweeps persisted to disk, so a trend survives the process that saw it.
-//!
-//! `wtfi -w` already draws latency sparklines, but they live in memory: quit
-//! the dashboard and yesterday's dead zone is gone. `--record` appends one
-//! line per finished sweep to a JSON Lines file, `--history` reads it back,
-//! and the dashboard seeds its sparklines from it on start.
-//!
-//! Recording is opt-in. A diagnostic that quietly writes to disk on every run
-//! is a surprise, and on a shared machine a log of which networks failed when
-//! is not something to leave behind unasked.
+//! Sweep history on disk (`--record` / `--history`), one JSON line per sweep.
 
 use crate::diagnose::Verdict;
 use crate::json::{hop_id_str, status_str};
@@ -18,21 +9,14 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Past this size the file is cut back to its newer half. Size rather than
-/// line count, because checking it is one `stat` instead of a full read on
-/// every append — and `-w` appends every few seconds.
+/// Past this size the file is cut back to its newer half.
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// One finished sweep, flattened to the numbers a trend is drawn from.
-///
-/// Deliberately not the full `--json` document: the per-hop prose and evidence
-/// are what make a report readable, but over thousands of sweeps they are
-/// megabytes of repeated sentences, and nothing downstream plots them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
-    /// Unix seconds when the sweep settled.
+    /// Unix seconds.
     pub ts: u64,
-    /// Overall status, spelled as in `--json`.
     pub status: String,
     pub first_break: Option<String>,
     pub headline: String,
@@ -66,7 +50,6 @@ impl Record {
     }
 }
 
-/// The link probe reports RSSI as a display string (`-52 dBm`), not a number.
 fn rssi_dbm(link: &Hop) -> Option<f64> {
     link.metrics
         .iter()
@@ -75,12 +58,8 @@ fn rssi_dbm(link: &Hop) -> Option<f64> {
         .and_then(|s| s.parse().ok())
 }
 
-/// Where the history lives: `$WTFI_HISTORY` if set, else
-/// `$XDG_STATE_HOME/wtfi/history.jsonl`, else `~/.local/state/wtfi/…`.
-///
-/// The same XDG path on macOS too, rather than `~/Library/Application
-/// Support`: it is a log a user may want to `tail` or `jq`, and one location
-/// across both platforms is easier to document than two.
+/// `$WTFI_HISTORY`, else `$XDG_STATE_HOME/wtfi/history.jsonl`, else
+/// `~/.local/state/wtfi/history.jsonl` (macOS included).
 pub fn default_path() -> Option<PathBuf> {
     let var = |k| std::env::var_os(k).filter(|v| !v.is_empty());
     if let Some(p) = var("WTFI_HISTORY") {
@@ -92,7 +71,6 @@ pub fn default_path() -> Option<PathBuf> {
     Some(state.join("wtfi").join("history.jsonl"))
 }
 
-/// Append one record, creating the directory on first use.
 pub fn append(file: &std::path::Path, record: &Record) -> io::Result<()> {
     if let Some(dir) = file.parent() {
         fs::create_dir_all(dir)?;
@@ -109,8 +87,7 @@ pub fn append(file: &std::path::Path, record: &Record) -> io::Result<()> {
         .write_all(line.as_bytes())
 }
 
-/// Keep the newer half of the file. Written to a sibling and renamed over the
-/// original, so a crash mid-trim leaves the old history rather than half of it.
+/// Keep the newer half. Written via rename so a crash can't truncate it.
 fn trim(file: &std::path::Path) -> io::Result<()> {
     let text = fs::read_to_string(file)?;
     let lines: Vec<&str> = text.lines().collect();
@@ -120,9 +97,7 @@ fn trim(file: &std::path::Path) -> io::Result<()> {
     fs::rename(tmp, file)
 }
 
-/// The newest `n` records, oldest first. A missing file is an empty history,
-/// and a line that doesn't parse (a torn write, a hand edit) is skipped rather
-/// than costing the reader every line after it.
+/// The newest `n` records, oldest first. Unparseable lines are skipped.
 pub fn load(file: &std::path::Path, n: usize) -> io::Result<Vec<Record>> {
     let text = match fs::read_to_string(file) {
         Ok(t) => t,
@@ -138,7 +113,6 @@ pub fn load(file: &std::path::Path, n: usize) -> io::Result<Vec<Record>> {
     Ok(records)
 }
 
-/// One line per sweep plus a tally, for `wtfi --history`.
 pub fn render(records: &[Record]) -> String {
     if records.is_empty() {
         return "No recorded sweeps yet. Run `wtfi --record` (or `wtfi -w --record`) to start.\n"
@@ -173,11 +147,10 @@ pub fn render(records: &[Record]) -> String {
     out
 }
 
-/// `YYYY-MM-DD HH:MM:SSZ`. UTC because local time needs the tz database, and
-/// a timestamp that says which zone it is in beats one that guesses.
+/// `YYYY-MM-DD HH:MM:SSZ` (UTC; local time would need a tz database).
 fn utc(ts: u64) -> String {
     let (days, secs) = (ts / 86_400, ts % 86_400);
-    // Howard Hinnant's days-to-civil, for the proleptic Gregorian calendar.
+    // Howard Hinnant's days-to-civil.
     let z = days as i64 + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);

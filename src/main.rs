@@ -8,8 +8,6 @@ async fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse_args();
 
-    // Reading the history needs no platform module and no network, so it
-    // answers before either is checked.
     if let Some(n) = cli.history {
         let records = match history::default_path() {
             Some(file) => history::load(&file, n)?,
@@ -22,8 +20,6 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    // `--record` with nowhere to write is a warning, not an error: the sweep
-    // is still worth reporting.
     let record_to = cli.record.then(history::default_path).flatten();
     if cli.record && record_to.is_none() {
         eprintln!("wtfi: not recording: set WTFI_HISTORY, XDG_STATE_HOME or HOME");

@@ -294,9 +294,6 @@ fn help_and_version_answer_without_probing() {
     );
 }
 
-/// `--record` then `--history --json` must hand back the sweep that was just
-/// reported, with the same status — the history is only worth reading if it
-/// agrees with what the user saw at the time.
 #[test]
 fn a_recorded_sweep_comes_back_from_history() {
     let file = std::env::temp_dir().join(format!("wtfi-cli-history-{}.jsonl", std::process::id()));
@@ -325,8 +322,6 @@ fn a_recorded_sweep_comes_back_from_history() {
     let _ = std::fs::remove_file(&file);
 }
 
-/// Reading history never probes, so it has to answer even where the platform
-/// would refuse a sweep, and an empty history is not an error.
 #[test]
 fn an_empty_history_is_not_an_error() {
     let out = Command::new(env!("CARGO_BIN_EXE_wtfi"))
