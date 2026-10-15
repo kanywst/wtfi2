@@ -1,12 +1,29 @@
 use color_eyre::Result;
 use std::io::IsTerminal;
 use wtfi2::cli::Cli;
-use wtfi2::{diagnose, engine, json, platform, render, ui};
+use wtfi2::{diagnose, engine, history, json, platform, render, ui};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse_args();
+
+    if let Some(n) = cli.history {
+        let records = match history::default_path() {
+            Some(file) => history::load(&file, n)?,
+            None => Vec::new(),
+        };
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&records)?);
+        } else {
+            print!("{}", history::render(&records));
+        }
+        return Ok(());
+    }
+    let record_to = cli.record.then(history::default_path).flatten();
+    if cli.record && record_to.is_none() {
+        eprintln!("wtfi: not recording: set WTFI_HISTORY, XDG_STATE_HOME or HOME");
+    }
 
     // Before the OS check: the demo never touches the platform layer.
     #[cfg(feature = "demo")]
@@ -38,7 +55,7 @@ async fn main() -> Result<()> {
     }
 
     if cli.watch {
-        return ui::run(cli.sweep_deadline()).await;
+        return ui::run(cli.sweep_deadline(), record_to).await;
     }
 
     #[cfg(feature = "demo")]
@@ -49,6 +66,14 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "demo"))]
     let path = engine::run_once_within(cli.sweep_deadline()).await;
     let verdict = diagnose::diagnose(&path);
+
+    #[cfg(feature = "demo")]
+    let record_to = record_to.filter(|_| demo.is_none());
+    if let Some(file) = &record_to
+        && let Err(e) = history::append(file, &history::Record::now(&path, &verdict))
+    {
+        eprintln!("wtfi: could not record to {}: {e}", file.display());
+    }
 
     if cli.json {
         println!("{}", json::to_string(&path, &verdict));

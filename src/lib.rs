@@ -9,6 +9,7 @@ pub mod cli;
 pub mod demo;
 pub mod diagnose;
 pub mod engine;
+pub mod history;
 pub mod json;
 pub mod model;
 pub mod platform;
