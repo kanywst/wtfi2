@@ -78,6 +78,52 @@ cd wtfi2
 cargo install --path .
 ```
 
+### Nix / NixOS
+
+The repo ships a flake, so you can run it without installing anything:
+
+```bash
+nix run github:kanywst/wtfi2          # one-shot report
+nix run github:kanywst/wtfi2 -- -w    # live dashboard
+```
+
+A development shell with the toolchain and the network tools wtfi shells out to
+(`ip`, `iw`, `ping`, `traceroute`):
+
+```bash
+nix develop
+cargo run -- -w
+```
+
+To install it into a flake-based NixOS system, add the flake as an input and
+pull in the overlay it exposes:
+
+```nix
+# flake.nix
+inputs.wtfi2.url = "github:kanywst/wtfi2";
+
+outputs = { nixpkgs, ... }@inputs: {
+  nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+    specialArgs = { inherit inputs; };
+    modules = [ ./configuration.nix ];
+  };
+};
+```
+
+```nix
+# configuration.nix
+{ inputs, pkgs, ... }:
+{
+  nixpkgs.overlays = [ inputs.wtfi2.overlays.default ];
+  environment.systemPackages = [ pkgs.wtfi2 ];
+}
+```
+
+`inputs.wtfi2.nixosModules.default` wires up the same overlay for you if you
+prefer `imports = [ inputs.wtfi2.nixosModules.default ];`. On Linux the package
+falls back to its own `ip`, `iw`, `ping` and `traceroute` when the system has
+none.
+
 The installed command is `wtfi` in every case. The crate builds anywhere but only *diagnoses* on macOS and Linux — see [Platform support](#platform-support).
 
 ## Usage
