@@ -34,8 +34,8 @@ struct App {
     gw_hist: VecDeque<f64>,
     wan_hist: VecDeque<f64>,
     scanning: bool,
-    /// Where each finished sweep is appended, under `--record`.
-    record_to: Option<PathBuf>,
+    /// Feeds the history writer thread, under `--record`.
+    record_tx: Option<std::sync::mpsc::Sender<history::Record>>,
     /// Sweeps started so far; picks which scripted sweep `--demo` plays.
     #[cfg(feature = "demo")]
     sweeps: usize,
@@ -54,7 +54,7 @@ impl App {
             gw_hist: VecDeque::with_capacity(HISTORY),
             wan_hist: VecDeque::with_capacity(HISTORY),
             scanning: true,
-            record_to: None,
+            record_tx: None,
             #[cfg(feature = "demo")]
             sweeps: 0,
             #[cfg(feature = "demo")]
@@ -73,14 +73,9 @@ impl App {
             self.verdict = diagnose(&self.path);
             // Once per sweep: only on the transition out of scanning.
             if self.scanning
-                && let Some(file) = &self.record_to
+                && let Some(tx) = &self.record_tx
             {
-                // Off the render loop: a trim rewrites the whole file.
-                let (file, record) = (
-                    file.clone(),
-                    history::Record::now(&self.path, &self.verdict),
-                );
-                tokio::task::spawn_blocking(move || history::append(&file, &record));
+                let _ = tx.send(history::Record::now(&self.path, &self.verdict));
             }
             self.scanning = false;
         }
@@ -92,7 +87,15 @@ impl App {
             push(&mut self.gw_hist, r.gateway_ms);
             push(&mut self.wan_hist, r.wan_ms);
         }
-        self.record_to = Some(file);
+        // One writer thread: file I/O stays off the render loop and appends
+        // land in sweep order.
+        let (tx, rx) = std::sync::mpsc::channel::<history::Record>();
+        std::thread::spawn(move || {
+            for record in rx {
+                let _ = history::append(&file, &record);
+            }
+        });
+        self.record_tx = Some(tx);
     }
 
     fn restart(&mut self) -> mpsc::UnboundedReceiver<Hop> {

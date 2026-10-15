@@ -5,7 +5,7 @@ use crate::json::{hop_id_str, status_str};
 use crate::model::{Hop, HopId, Path};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -78,13 +78,23 @@ pub fn append(file: &std::path::Path, record: &Record) -> io::Result<()> {
     if fs::metadata(file).is_ok_and(|m| m.len() > MAX_BYTES) {
         trim(file)?;
     }
-    let mut line = serde_json::to_string(record).map_err(io::Error::other)?;
-    line.push('\n');
-    OpenOptions::new()
+    let mut out = OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
-        .open(file)?
-        .write_all(line.as_bytes())
+        .open(file)?;
+    let mut line = serde_json::to_string(record).map_err(io::Error::other)?;
+    // Don't glue this record onto a line a killed process left unterminated.
+    if out.metadata()?.len() > 0 {
+        let mut last = [0u8; 1];
+        out.seek(SeekFrom::End(-1))?;
+        out.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            line.insert(0, '\n');
+        }
+    }
+    line.push('\n');
+    out.write_all(line.as_bytes())
 }
 
 /// Keep the newer half. Written via rename so a crash can't truncate it.
@@ -216,7 +226,7 @@ mod tests {
             .append(true)
             .open(&f)
             .unwrap()
-            .write_all(b"{\"ts\":2,\"sta\n")
+            .write_all(b"{\"ts\":2,\"sta")
             .unwrap();
         append(&f, &record(3, "fail")).unwrap();
         let got: Vec<u64> = load(&f, 10).unwrap().iter().map(|r| r.ts).collect();
