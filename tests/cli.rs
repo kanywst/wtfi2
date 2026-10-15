@@ -274,7 +274,15 @@ fn help_and_version_answer_without_probing() {
     let help = run(&["--help"]);
     assert!(help.status.success());
     let text = String::from_utf8_lossy(&help.stdout);
-    for flag in ["--watch", "--json", "--verbose", "--no-color", "--timeout"] {
+    for flag in [
+        "--watch",
+        "--json",
+        "--verbose",
+        "--no-color",
+        "--timeout",
+        "--record",
+        "--history",
+    ] {
         assert!(text.contains(flag), "`{flag}` missing from --help");
     }
 
@@ -284,4 +292,51 @@ fn help_and_version_answer_without_probing() {
         String::from_utf8_lossy(&version.stdout).contains(env!("CARGO_PKG_VERSION")),
         "--version should report the crate version"
     );
+}
+
+/// `--record` then `--history --json` must hand back the sweep that was just
+/// reported, with the same status — the history is only worth reading if it
+/// agrees with what the user saw at the time.
+#[test]
+fn a_recorded_sweep_comes_back_from_history() {
+    let file = std::env::temp_dir().join(format!("wtfi-cli-history-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&file);
+    let with_file = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_wtfi"))
+            .args(args)
+            .env("WTFI_HISTORY", &file)
+            .output()
+            .expect("the binary under test should run")
+    };
+
+    let out = with_file(&["--record", "--json", "--timeout", "8"]);
+    if refused(&out) {
+        return;
+    }
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+
+    let out = with_file(&["--history", "--json"]);
+    assert!(out.status.success(), "--history should exit 0");
+    let records: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let records = records.as_array().expect("--history --json is an array");
+    assert_eq!(records.len(), 1, "one sweep recorded: {records:?}");
+    assert_eq!(records[0]["status"], report["status"]);
+    assert_eq!(records[0]["first_break"], report["first_break"]);
+    let _ = std::fs::remove_file(&file);
+}
+
+/// Reading history never probes, so it has to answer even where the platform
+/// would refuse a sweep, and an empty history is not an error.
+#[test]
+fn an_empty_history_is_not_an_error() {
+    let out = Command::new(env!("CARGO_BIN_EXE_wtfi"))
+        .arg("--history")
+        .env(
+            "WTFI_HISTORY",
+            std::env::temp_dir().join("wtfi-cli-no-such-history.jsonl"),
+        )
+        .output()
+        .expect("the binary under test should run");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("No recorded sweeps"));
 }

@@ -135,7 +135,11 @@ wtfi -v           # verbose: every metric for every hop
 wtfi --json       # machine-readable output for scripts/CI
 wtfi --no-color   # plain text, no ANSI
 wtfi --timeout 5  # give up on the sweep sooner and report what landed
+wtfi --record     # also append this sweep to the history file (works with -w)
+wtfi --history    # the last 20 recorded sweeps (--history 100, --history --json)
 ```
+
+Recording is off unless you pass `--record`. Each finished sweep becomes one JSON line in `$XDG_STATE_HOME/wtfi/history.jsonl` (`~/.local/state/wtfi/history.jsonl` when that is unset, on macOS too; `WTFI_HISTORY` overrides the path). `wtfi -w --record` also starts its latency sparklines from the last recorded sweeps, so a dead zone you walked through yesterday is still on the graph today. The file trims itself to its newer half past 4 MiB.
 
 The exit code reflects health, so scripts can branch on it:
 
@@ -209,7 +213,6 @@ On any other OS there is no platform module yet, so `wtfi` refuses up front — 
 
 - Real SSID/BSSID via Location authorization in a signed `.app` bundle
   (CoreWLAN telemetry already lands instantly today).
-- Trends that survive a restart. Export already ships as `wtfi --json`, and `wtfi -w` keeps an in-session sparkline; what is missing is persisting sweeps to disk so yesterday's dead zone is still there tomorrow.
 
 ## License
 

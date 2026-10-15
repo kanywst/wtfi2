@@ -18,6 +18,16 @@ pub struct Cli {
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
 
+    /// Append this sweep (every sweep, under `-w`) to the history file, and
+    /// seed the dashboard's sparklines from it. Off unless asked for.
+    #[arg(long = "record")]
+    pub record: bool,
+
+    /// Print the newest N recorded sweeps (default 20) instead of probing.
+    /// With `--json`, print them as a JSON array.
+    #[arg(long = "history", value_name = "N", num_args = 0..=1, default_missing_value = "20", conflicts_with_all = ["watch", "record"])]
+    pub history: Option<usize>,
+
     /// Disable ANSI color in the text report.
     #[arg(long = "no-color")]
     pub no_color: bool,

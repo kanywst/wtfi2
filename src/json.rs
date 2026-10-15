@@ -1,10 +1,10 @@
 //! Machine-readable output for `--json` (scripting, CI, sharing).
 
 use crate::diagnose::Verdict;
-use crate::model::{Path, Status};
+use crate::model::{HopId, Path, Status};
 use serde_json::{Value, json};
 
-fn status_str(s: Status) -> &'static str {
+pub(crate) fn status_str(s: Status) -> &'static str {
     match s {
         Status::Ok => "ok",
         Status::Warn => "warn",
@@ -14,13 +14,17 @@ fn status_str(s: Status) -> &'static str {
     }
 }
 
+pub(crate) fn hop_id_str(id: HopId) -> String {
+    format!("{id:?}").to_lowercase()
+}
+
 pub fn to_value(path: &Path, verdict: &Verdict) -> Value {
     let hops: Vec<Value> = path
         .hops
         .iter()
         .map(|h| {
             json!({
-                "id": format!("{:?}", h.id).to_lowercase(),
+                "id": hop_id_str(h.id),
                 "layer": h.layer.label(),
                 "title": h.title,
                 "subtitle": h.subtitle,
@@ -47,9 +51,9 @@ pub fn to_value(path: &Path, verdict: &Verdict) -> Value {
             "cause": verdict.cause,
             "fix": verdict.fix,
             "confidence": format!("{:?}", verdict.confidence).to_lowercase(),
-            "source": verdict.source.map(|id| format!("{id:?}").to_lowercase()),
+            "source": verdict.source.map(hop_id_str),
         },
-        "first_break": path.first_break().map(|h| format!("{:?}", h.id).to_lowercase()),
+        "first_break": path.first_break().map(|h| hop_id_str(h.id)),
         "path": hops,
     })
 }

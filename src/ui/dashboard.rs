@@ -7,6 +7,7 @@
 
 use crate::diagnose::{Verdict, diagnose};
 use crate::engine;
+use crate::history;
 use crate::model::{Hop, HopId, Path, Status};
 use color_eyre::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
@@ -17,6 +18,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Gauge, Padding, Paragraph};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::interval;
@@ -32,6 +34,8 @@ struct App {
     gw_hist: VecDeque<f64>,
     wan_hist: VecDeque<f64>,
     scanning: bool,
+    /// Where each finished sweep is appended, under `--record`.
+    record_to: Option<PathBuf>,
     /// Sweeps started so far; picks which scripted sweep `--demo` plays.
     #[cfg(feature = "demo")]
     sweeps: usize,
@@ -50,6 +54,7 @@ impl App {
             gw_hist: VecDeque::with_capacity(HISTORY),
             wan_hist: VecDeque::with_capacity(HISTORY),
             scanning: true,
+            record_to: None,
             #[cfg(feature = "demo")]
             sweeps: 0,
             #[cfg(feature = "demo")]
@@ -66,8 +71,27 @@ impl App {
         self.path.upsert(hop);
         if self.path.is_complete() {
             self.verdict = diagnose(&self.path);
+            // Only on the transition, so a hop landing after the sweep settled
+            // can't record the same sweep twice.
+            if self.scanning
+                && let Some(file) = &self.record_to
+            {
+                // Nowhere to report a write error without tearing the TUI, and
+                // a full disk is no reason to stop showing the network.
+                let _ = history::append(file, &history::Record::now(&self.path, &self.verdict));
+            }
             self.scanning = false;
         }
+    }
+
+    /// Start recording to `file`, and pick the sparklines up where the last
+    /// recorded session left them.
+    fn record_to(&mut self, file: PathBuf) {
+        for r in history::load(&file, HISTORY).unwrap_or_default() {
+            push(&mut self.gw_hist, r.gateway_ms);
+            push(&mut self.wan_hist, r.wan_ms);
+        }
+        self.record_to = Some(file);
     }
 
     fn restart(&mut self) -> mpsc::UnboundedReceiver<Hop> {
@@ -109,17 +133,26 @@ fn push(hist: &mut VecDeque<f64>, v: Option<f64>) {
 /// here that runs a bounded one-shot sweep. Threading it through matters
 /// because `wtfi -w --timeout 3 > out.txt` used to accept the flag and then
 /// silently wait out the 20s default instead.
-pub async fn run(sweep_deadline: Duration) -> Result<()> {
+pub async fn run(sweep_deadline: Duration, record_to: Option<PathBuf>) -> Result<()> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         // No TTY (piped/CI): fall back to a single report instead of failing.
         let path = engine::run_once_within(sweep_deadline).await;
         let verdict = diagnose(&path);
+        if let Some(file) = &record_to
+            && let Err(e) = history::append(file, &history::Record::now(&path, &verdict))
+        {
+            eprintln!("wtfi: could not record to {}: {e}", file.display());
+        }
         print!("{}", crate::render::report(&path, &verdict, true, false));
         return Ok(());
     }
 
+    let mut app = App::new();
+    if let Some(file) = record_to {
+        app.record_to(file);
+    }
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, App::new()).await;
+    let result = event_loop(&mut terminal, app).await;
     ratatui::restore();
     result
 }
@@ -533,6 +566,28 @@ mod tests {
     }
 
     /// The bug: -55 dBm graded "Excellent" on the card, yellow on the gauge.
+    #[test]
+    fn recording_seeds_the_sparklines_from_the_last_session() {
+        let file = std::env::temp_dir().join(format!("wtfi-dash-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = engine::skeleton();
+        let verdict = diagnose(&path);
+        for (ts, gw) in [(1, Some(3.0)), (2, None), (3, Some(9.0))] {
+            let mut r = history::Record::new(&path, &verdict, ts);
+            r.gateway_ms = gw;
+            history::append(&file, &r).unwrap();
+        }
+        let mut app = App::new();
+        app.record_to(file.clone());
+        assert_eq!(
+            app.gw_hist,
+            [3.0, 9.0],
+            "a sweep with no reading leaves no point"
+        );
+        assert!(app.wan_hist.is_empty());
+        let _ = std::fs::remove_file(&file);
+    }
+
     #[test]
     fn the_gauge_takes_the_links_grade_not_its_own_threshold() {
         let (rssi, col) = signal_gauge(Some(&link_with("-55 dBm", Some(Status::Ok))));
