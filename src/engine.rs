@@ -425,10 +425,7 @@ pub async fn run_once_within(deadline: Duration) -> Path {
     settle_within(spawn(), deadline).await
 }
 
-/// Drain `rx` into a fresh skeleton until it closes or `deadline` passes, then
-/// mark every hop still `Pending` as unmeasured. Split out of
-/// [`run_once_within`] so the settling can be tested against a channel the
-/// test controls instead of whatever the real probes find on the host.
+/// Split out so tests can drive it without the real probes.
 async fn settle_within(mut rx: mpsc::UnboundedReceiver<Hop>, deadline: Duration) -> Path {
     let mut path = skeleton();
     let sleep = tokio::time::sleep(deadline);
@@ -470,10 +467,7 @@ mod tests {
         );
     }
 
-    /// A sweep cut short before any probe reports. The sender is held open so
-    /// the deadline, not a closed channel, is what ends the drain — and no
-    /// real probe runs, so a host with no network (a Nix build sandbox) can't
-    /// slip a fast `Fail` in ahead of the deadline.
+    /// No real probes: on a host with no network one can `Fail` inside 1ms.
     async fn a_silent_sweep_cut_short() -> Path {
         let (_tx, rx) = mpsc::unbounded_channel();
         settle_within(rx, Duration::from_millis(1)).await
@@ -509,8 +503,6 @@ mod tests {
         );
     }
 
-    /// Hops that did report keep their grade; only the silent ones are
-    /// marked unmeasured.
     #[tokio::test]
     async fn a_truncated_sweep_keeps_the_hops_that_reported() {
         let (tx, rx) = mpsc::unbounded_channel();
