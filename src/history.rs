@@ -91,7 +91,7 @@ pub fn append(file: &std::path::Path, record: &Record) -> io::Result<()> {
 fn trim(file: &std::path::Path) -> io::Result<()> {
     let text = fs::read_to_string(file)?;
     let lines: Vec<&str> = text.lines().collect();
-    let keep = &lines[lines.len() / 2..];
+    let keep = &lines[lines.len().div_ceil(2)..];
     let tmp = file.with_extension("jsonl.tmp");
     fs::write(&tmp, keep.join("\n") + "\n")?;
     fs::rename(tmp, file)

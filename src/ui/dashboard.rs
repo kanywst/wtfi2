@@ -75,7 +75,12 @@ impl App {
             if self.scanning
                 && let Some(file) = &self.record_to
             {
-                let _ = history::append(file, &history::Record::now(&self.path, &self.verdict));
+                // Off the render loop: a trim rewrites the whole file.
+                let (file, record) = (
+                    file.clone(),
+                    history::Record::now(&self.path, &self.verdict),
+                );
+                tokio::task::spawn_blocking(move || history::append(&file, &record));
             }
             self.scanning = false;
         }
@@ -561,7 +566,6 @@ mod tests {
         hop
     }
 
-    /// The bug: -55 dBm graded "Excellent" on the card, yellow on the gauge.
     #[test]
     fn recording_seeds_the_sparklines_from_the_last_session() {
         let file = std::env::temp_dir().join(format!("wtfi-dash-{}.jsonl", std::process::id()));
@@ -584,6 +588,7 @@ mod tests {
         let _ = std::fs::remove_file(&file);
     }
 
+    /// The bug: -55 dBm graded "Excellent" on the card, yellow on the gauge.
     #[test]
     fn the_gauge_takes_the_links_grade_not_its_own_threshold() {
         let (rssi, col) = signal_gauge(Some(&link_with("-55 dBm", Some(Status::Ok))));
