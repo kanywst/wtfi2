@@ -7,14 +7,14 @@ use std::future::Future;
 use std::io::Write;
 use std::time::Duration;
 
-/// The cadence while something is wrong, so an outage gets fine-grained edges.
+/// The cadence while something is broken, so an outage gets fine-grained edges.
 pub const FAST: Duration = Duration::from_secs(5);
 
 pub fn next_wait(every: Duration, status: Status) -> Duration {
-    if status == Status::Ok {
-        every
-    } else {
+    if status == Status::Fail {
         every.min(FAST)
+    } else {
+        every
     }
 }
 
@@ -38,7 +38,11 @@ pub fn record(every: Duration, file: &std::path::Path, path: &Path) -> Duration 
     let mut record = Record::now(path, &verdict);
     record.interval_s = Some(wait.as_secs());
     if let Err(e) = history::append(file, &record) {
-        eprintln!("wtfi: could not record to {}: {e}", file.display());
+        let _ = writeln!(
+            std::io::stderr(),
+            "wtfi: could not record to {}: {e}",
+            file.display()
+        );
     }
     // Best effort: a closed stdout must not stop the recording.
     let _ = writeln!(std::io::stdout(), "{}", history::line(&record));
@@ -56,7 +60,12 @@ mod tests {
         let every = Duration::from_secs(30);
         assert_eq!(next_wait(every, Status::Ok), every);
         assert_eq!(next_wait(every, Status::Fail), FAST);
-        assert_eq!(next_wait(every, Status::Warn), FAST);
+        assert_eq!(
+            next_wait(every, Status::Warn),
+            every,
+            "a steady degradation isn't an outage"
+        );
+        assert_eq!(next_wait(every, Status::Skipped), every);
         let quick = Duration::from_secs(2);
         assert_eq!(
             next_wait(quick, Status::Fail),
