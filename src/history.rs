@@ -2,7 +2,7 @@
 
 use crate::diagnose::Verdict;
 use crate::json::{hop_id_str, status_str};
-use crate::model::{Hop, HopId, Path};
+use crate::model::{Fault, Hop, HopId, Path};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -27,6 +27,9 @@ pub struct Record {
     /// Planned seconds until the next sweep, set by `--every`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_s: Option<u64>,
+    /// Some hop never reported (the sweep hit its deadline or a tool didn't run).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 impl Record {
@@ -42,6 +45,7 @@ impl Record {
             wan_loss_pct: path.get(HopId::Wan).and_then(|h| h.loss_pct),
             rssi_dbm: path.get(HopId::Link).and_then(rssi_dbm),
             interval_s: None,
+            partial: path.hops.iter().any(|h| h.fault == Some(Fault::Unobserved)),
         }
     }
 
@@ -163,7 +167,11 @@ pub fn line(r: &Record) -> String {
         ms(r.gateway_ms),
         wan,
         r.rssi_dbm.map_or("—".into(), |v| format!("{v:.0} dBm")),
-        r.headline,
+        if r.partial {
+            format!("{} (partial sweep)", r.headline)
+        } else {
+            r.headline.clone()
+        },
     )
 }
 
@@ -203,6 +211,7 @@ mod tests {
             wan_loss_pct: None,
             rssi_dbm: Some(-52.0),
             interval_s: None,
+            partial: false,
         }
     }
 
@@ -267,6 +276,22 @@ mod tests {
         assert_eq!(utc(0), "1970-01-01 00:00:00Z");
         assert_eq!(utc(951_782_400), "2000-02-29 00:00:00Z");
         assert_eq!(utc(1_792_078_245), "2026-10-15 15:30:45Z");
+    }
+
+    #[test]
+    fn a_cut_off_sweep_is_marked_partial() {
+        let mut path = crate::engine::skeleton();
+        path.get_mut(HopId::Wan).unwrap().fault = Some(Fault::Unobserved);
+        let verdict = crate::diagnose::diagnose(&path);
+        let r = Record::new(&path, &verdict, 7);
+        assert!(r.partial);
+        assert!(line(&r).ends_with("(partial sweep)"));
+        assert!(
+            serde_json::to_string(&record(0, "ok"))
+                .unwrap()
+                .find("partial")
+                .is_none()
+        );
     }
 
     #[test]

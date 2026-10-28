@@ -15,7 +15,10 @@ pub const MIN_GAP: Duration = Duration::from_secs(2);
 
 /// A period after the last start, but never right on the heels of a long sweep.
 pub fn next_start(started: Instant, period: Duration, now: Instant) -> Instant {
-    (started + period).max(now + MIN_GAP)
+    let due = started
+        .checked_add(period)
+        .unwrap_or(now + Duration::from_secs(86_400));
+    due.max(now + MIN_GAP)
 }
 
 pub fn next_wait(every: Duration, status: Status) -> Duration {
@@ -88,6 +91,10 @@ mod tests {
         let t0 = Instant::now();
         let fast = Duration::from_secs(5);
         assert_eq!(next_start(t0, fast, t0 + Duration::from_secs(1)), t0 + fast);
+        assert!(
+            next_start(t0, Duration::MAX, t0) > t0,
+            "a huge --every doesn't overflow"
+        );
         assert_eq!(
             next_start(t0, fast, t0 + Duration::from_secs(16)),
             t0 + Duration::from_secs(18),
