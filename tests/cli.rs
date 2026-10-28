@@ -282,6 +282,10 @@ fn help_and_version_answer_without_probing() {
         "--timeout",
         "--record",
         "--history",
+        "--every",
+        "--bundle",
+        "--no-redact",
+        "--mcp",
     ] {
         assert!(text.contains(flag), "`{flag}` missing from --help");
     }
@@ -334,4 +338,86 @@ fn an_empty_history_is_not_an_error() {
         .expect("the binary under test should run");
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("No recorded sweeps"));
+}
+
+#[test]
+fn every_needs_record() {
+    let out = run(&["--every", "30s"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--record"));
+}
+
+#[test]
+fn a_recorded_sweep_lands_in_the_bundle() {
+    let dir = std::env::temp_dir().join(format!("wtfi-cli-bundle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let file = dir.join("history.jsonl");
+    let with_file = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_wtfi"))
+            .args(args)
+            .env("WTFI_HISTORY", &file)
+            .output()
+            .expect("the binary under test should run")
+    };
+
+    let out = with_file(&["--record", "--json", "--timeout", "8"]);
+    if refused(&out) {
+        return;
+    }
+    assert!(
+        dir.join("sweeps.jsonl").exists(),
+        "the first sweep is kept in full"
+    );
+
+    let out = with_file(&["--bundle", "1h"]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("# wtfi network report"), "{text}");
+    assert!(
+        text.contains("1 sweeps") && text.contains("<sweep at="),
+        "{text}"
+    );
+    assert!(text.trim_end().ends_with("what is still open."));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mcp_answers_over_stdio() {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wtfi"))
+        .arg("--mcp")
+        .env(
+            "WTFI_HISTORY",
+            std::env::temp_dir().join("wtfi-cli-no-such-history.jsonl"),
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("the binary under test should run");
+    let requests = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_episodes","arguments":{}}}"#,
+    ];
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all((requests.join("\n") + "\n").as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let replies: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("one JSON reply per line"))
+        .collect();
+    assert_eq!(
+        replies.len(),
+        3,
+        "the notification gets no reply: {replies:?}"
+    );
+    assert_eq!(replies[0]["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(replies[2]["id"], 3);
 }
