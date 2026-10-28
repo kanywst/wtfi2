@@ -123,17 +123,21 @@ impl Log {
         let state = state_of(record);
         let changed = self.state.as_ref() != Some(&state);
         let stale = record.status != "ok" && record.ts >= self.last_snapshot + RESNAPSHOT_SECS;
-        self.state = Some(state);
         if !changed && !stale {
             self.held = Some(snapshot);
             return Ok(());
         }
+        // State moves on only once the full sweeps are on disk, so a failed write is retried.
         let to = sweeps_path(&self.file);
-        if let Some(before) = self.held.take().filter(|_| changed) {
-            append_line(&to, &before, SWEEPS_MAX_BYTES)?;
+        if changed && let Some(before) = &self.held {
+            append_line(&to, before, SWEEPS_MAX_BYTES)?;
+            self.held = None;
         }
+        append_line(&to, &snapshot, SWEEPS_MAX_BYTES)?;
+        self.state = Some(state);
+        self.held = None;
         self.last_snapshot = record.ts;
-        append_line(&to, &snapshot, SWEEPS_MAX_BYTES)
+        Ok(())
     }
 }
 
@@ -149,6 +153,10 @@ fn last_snapshot_ts(file: &std::path::Path) -> Option<u64> {
         .lines()
         .rev()
         .find_map(|l| serde_json::from_str::<Value>(l).ok()?["ts"].as_u64())
+        .or_else(|| {
+            let modified = f.metadata().ok()?.modified().ok()?;
+            Some(modified.duration_since(UNIX_EPOCH).ok()?.as_secs())
+        })
 }
 
 fn state_of(r: &Record) -> String {
@@ -424,6 +432,36 @@ mod tests {
         }
         let ts: Vec<u64> = load_sweeps(&f, 0).unwrap().iter().map(|s| s.ts).collect();
         assert_eq!(ts, [0, 600, 1200]);
+    }
+
+    #[test]
+    fn snapshots_stay_in_order_around_a_resnapshot() {
+        let f = tempfile("order");
+        let mut log = Log::open(f.clone());
+        for (ts, status) in [(0, "fail"), (300, "fail"), (600, "fail"), (605, "ok")] {
+            log.push(&record(ts, status), Value::Null).unwrap();
+        }
+        let ts: Vec<u64> = load_sweeps(&f, 0).unwrap().iter().map(|s| s.ts).collect();
+        assert_eq!(ts, [0, 600, 605]);
+    }
+
+    #[test]
+    fn a_failed_snapshot_write_is_retried_on_the_next_sweep() {
+        let f = tempfile("retry");
+        let mut log = Log::open(f.clone());
+        log.push(&record(0, "ok"), Value::Null).unwrap();
+        let sweeps = sweeps_path(&f);
+        fs::remove_file(&sweeps).unwrap();
+        fs::create_dir(&sweeps).unwrap();
+        assert!(log.push(&record(10, "fail"), Value::Null).is_err());
+        fs::remove_dir(&sweeps).unwrap();
+        log.push(&record(20, "fail"), Value::Null).unwrap();
+        let ts: Vec<u64> = load_sweeps(&f, 0).unwrap().iter().map(|s| s.ts).collect();
+        assert_eq!(
+            ts,
+            [20],
+            "the outage edge is written once the file is writable again"
+        );
     }
 
     #[test]
