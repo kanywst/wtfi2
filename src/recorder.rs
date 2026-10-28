@@ -6,9 +6,17 @@ use crate::model::{Path, Status};
 use std::future::Future;
 use std::io::Write;
 use std::time::Duration;
+use tokio::time::Instant;
 
 /// The cadence while something is broken, so an outage gets fine-grained edges.
 pub const FAST: Duration = Duration::from_secs(5);
+/// Idle time between sweeps even when one overran its period.
+pub const MIN_GAP: Duration = Duration::from_secs(2);
+
+/// A period after the last start, but never right on the heels of a long sweep.
+pub fn next_start(started: Instant, period: Duration, now: Instant) -> Instant {
+    (started + period).max(now + MIN_GAP)
+}
 
 pub fn next_wait(every: Duration, status: Status) -> Duration {
     if status == Status::Fail {
@@ -28,7 +36,7 @@ where
         let started = tokio::time::Instant::now();
         let period = record(every, file, &sweep(n).await);
         n = n.wrapping_add(1);
-        tokio::time::sleep_until(started + period).await;
+        tokio::time::sleep_until(next_start(started, period, tokio::time::Instant::now())).await;
     }
 }
 
@@ -72,6 +80,18 @@ mod tests {
             next_wait(quick, Status::Fail),
             quick,
             "never slower than asked"
+        );
+    }
+
+    #[test]
+    fn a_long_sweep_still_gets_a_breather() {
+        let t0 = Instant::now();
+        let fast = Duration::from_secs(5);
+        assert_eq!(next_start(t0, fast, t0 + Duration::from_secs(1)), t0 + fast);
+        assert_eq!(
+            next_start(t0, fast, t0 + Duration::from_secs(16)),
+            t0 + Duration::from_secs(18),
+            "a 16s sweep on a broken network isn't followed by another at once"
         );
     }
 
