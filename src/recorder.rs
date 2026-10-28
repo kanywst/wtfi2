@@ -25,13 +25,14 @@ where
 {
     let mut n = 0;
     loop {
-        let wait = record(every, file, &sweep(n).await);
+        let started = tokio::time::Instant::now();
+        let period = record(every, file, &sweep(n).await);
         n = n.wrapping_add(1);
-        tokio::time::sleep(wait).await;
+        tokio::time::sleep_until(started + period).await;
     }
 }
 
-/// Append and print one sweep; returns how long to wait before the next.
+/// Append and print one sweep; returns the period until the next one starts.
 pub fn record(every: Duration, file: &std::path::Path, path: &Path) -> Duration {
     let verdict = diagnose(path);
     let wait = next_wait(every, verdict.status);
