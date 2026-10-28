@@ -1,11 +1,13 @@
 //! `wtfi --mcp`: the recorded history as an MCP server over stdio.
 
-use crate::bundle::{self, LogReader, Redactor};
+use crate::bundle::{self, Redactor};
 use crate::history::{self, Snapshot};
+use crate::platform::LogLine;
 use crate::{diagnose, engine, json};
 use serde_json::{Value, json};
 use std::hash::RandomState;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -14,34 +16,48 @@ const MAX_SWEEPS: usize = 20;
 const LOG_DEFAULT_SECS: u64 = 900;
 const LOG_MAX_SECS: u64 = 7200;
 
-pub struct Server<'a> {
+pub type SharedLog = Arc<dyn Fn(u64, u64) -> Result<Vec<LogLine>, String> + Send + Sync>;
+
+pub struct Server {
     pub history: Option<PathBuf>,
-    pub log: LogReader<'a>,
-    pub now: u64,
+    pub log: SharedLog,
+    /// Fixed clock for tests; `None` reads the system time per request.
+    pub now: Option<u64>,
     /// One salt per session, so a masked SSID or MAC reads the same in every tool.
     pub salt: RandomState,
 }
 
-pub async fn serve(server: &mut Server<'_>) -> std::io::Result<()> {
+/// Requests run concurrently, so a slow tool doesn't hold up `ping`.
+pub async fn serve(server: Arc<Server>) -> std::io::Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
-    while let Some(line) = lines.next_line().await? {
-        let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(req) => {
-                server.now = crate::history::now_secs();
-                server.handle(&req).await
-            }
-            Err(e) => Some(error(Value::Null, -32700, &e.to_string())),
-        };
-        if let Some(reply) = reply {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(reply) = rx.recv().await {
             stdout.write_all(format!("{reply}\n").as_bytes()).await?;
             stdout.flush().await?;
         }
+        std::io::Result::Ok(())
+    });
+    let mut tasks = tokio::task::JoinSet::new();
+    while let Some(line) = lines.next_line().await? {
+        let (server, tx) = (server.clone(), tx.clone());
+        tasks.spawn(async move {
+            let reply = match serde_json::from_str::<Value>(&line) {
+                Ok(req) => server.handle(&req).await,
+                Err(e) => Some(error(Value::Null, -32700, &e.to_string())),
+            };
+            if let Some(reply) = reply {
+                let _ = tx.send(reply);
+            }
+        });
     }
-    Ok(())
+    while tasks.join_next().await.is_some() {}
+    drop(tx);
+    writer.await.unwrap_or(Ok(()))
 }
 
-impl Server<'_> {
+impl Server {
     /// One JSON-RPC message in, at most one out (notifications get none).
     pub async fn handle(&self, req: &Value) -> Option<Value> {
         if !req.is_object() {
@@ -86,12 +102,13 @@ impl Server<'_> {
     }
 
     async fn call(&self, name: &str, args: &Value) -> Result<String, String> {
+        let now = self.now.unwrap_or_else(history::now_secs);
         if name == "diagnose_now" {
             let path = engine::run_once_within(engine::SWEEP_DEADLINE).await;
             let mut doc = json::to_value(&path, &diagnose::diagnose(&path));
             if redacting(args) {
                 let snapshot = Snapshot {
-                    ts: self.now,
+                    ts: now,
                     sweep: doc.clone(),
                 };
                 Redactor::new(&self.salt, &[&snapshot]).sweep(&mut doc);
@@ -102,8 +119,8 @@ impl Server<'_> {
             .history
             .as_ref()
             .ok_or("no history file: set WTFI_HISTORY, XDG_STATE_HOME or HOME")?;
-        let since = self.now.saturating_sub(since(args)?.as_secs());
-        let (from, to) = range(args, since, self.now)?;
+        let since = now.saturating_sub(since(args)?.as_secs());
+        let (from, to) = range(args, since, now)?;
         let since = since.min(from);
         let records = history::load(file, usize::MAX).map_err(|e| e.to_string())?;
         let sweeps = history::load_sweeps(file, since).map_err(|e| e.to_string())?;
@@ -124,6 +141,8 @@ impl Server<'_> {
                             "start_ts": e.start,
                             "end": e.end.map(history::utc),
                             "end_ts": e.end,
+                            "last_unhealthy_ts": e.last,
+                            "recorder_stopped_before_end": e.cut,
                             "sweeps": e.sweeps,
                             "worst": e.worst,
                             "first_break": e.first_break,
@@ -168,19 +187,25 @@ impl Server<'_> {
                         LOG_MAX_SECS / 3600
                     ));
                 }
-                let lines = (self.log)(from, to)?;
+                let log = self.log.clone();
+                let lines = tokio::task::spawn_blocking(move || log(from, to))
+                    .await
+                    .map_err(|e| e.to_string())??;
                 if lines.is_empty() {
                     return Ok("Nothing logged.".into());
                 }
                 bundle::log_block(&lines, redactor.as_ref())
             }
-            "get_bundle" => bundle::build(
-                &records,
-                &sweeps,
-                since,
-                redacting(args).then_some(&self.salt),
-                self.log,
-            ),
+            "get_bundle" => {
+                let (log, salt) = (self.log.clone(), self.salt.clone());
+                let redact = redacting(args);
+                tokio::task::spawn_blocking(move || {
+                    let log = |from, to| log(from, to);
+                    bundle::build(&records, &sweeps, since, redact.then_some(&salt), &log)
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            }
             _ => return Err(format!("unknown tool: {name}")),
         })
     }
@@ -268,7 +293,7 @@ mod tests {
         }])
     }
 
-    fn server(name: &str) -> Server<'static> {
+    fn server(name: &str) -> Server {
         let dir = std::env::temp_dir().join(format!("wtfi-mcp-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let file = dir.join("history.jsonl");
@@ -293,13 +318,13 @@ mod tests {
         }
         Server {
             history: Some(file),
-            log: &log,
-            now: 1030,
+            log: Arc::new(log),
+            now: Some(1030),
             salt: RandomState::new(),
         }
     }
 
-    async fn call(s: &Server<'_>, name: &str, args: Value) -> Value {
+    async fn call(s: &Server, name: &str, args: Value) -> Value {
         let req = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": name, "arguments": args } });
         s.handle(&req).await.unwrap()["result"].clone()
     }
@@ -411,12 +436,32 @@ mod tests {
     #[tokio::test]
     async fn an_explicit_range_reaches_past_the_default_window() {
         let mut s = server("range");
-        s.now = 1030 + 3 * 86_400;
+        s.now = Some(1030 + 3 * 86_400);
         let r = call(&s, "get_sweeps", json!({ "from_ts": 1005, "to_ts": 1015 })).await;
         let v: Value = serde_json::from_str(text(&r)).unwrap();
         assert_eq!(v["sweeps"].as_array().unwrap().len(), 1, "{v}");
         let r = call(&s, "get_os_log", json!({ "from_ts": 0, "to_ts": 86_400 })).await;
         assert_eq!(r["isError"], true, "a day of log is refused");
+    }
+
+    #[tokio::test]
+    async fn a_slow_log_read_doesnt_hold_up_other_requests() {
+        let mut s = server("slow");
+        s.log = Arc::new(|_, _| {
+            std::thread::sleep(Duration::from_millis(800));
+            Ok(Vec::new())
+        });
+        let start = std::time::Instant::now();
+        let ping = async {
+            s.handle(&json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }))
+                .await;
+            start.elapsed()
+        };
+        let (_, pinged) = tokio::join!(call(&s, "get_os_log", json!({})), ping);
+        assert!(
+            pinged < Duration::from_millis(400),
+            "ping waited {pinged:?}"
+        );
     }
 
     #[tokio::test]
@@ -445,8 +490,8 @@ mod tests {
         assert_eq!(r["isError"], true);
         let none = Server {
             history: None,
-            log: &log,
-            now: 0,
+            log: Arc::new(log),
+            now: Some(0),
             salt: RandomState::new(),
         };
         assert_eq!(

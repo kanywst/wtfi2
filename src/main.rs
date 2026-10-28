@@ -21,17 +21,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if cli.mcp {
-        let platform = platform::current();
         let log = |from, to| {
-            platform::Platform::network_log(&platform, from, to).map_err(|e| e.to_string())
+            platform::Platform::network_log(&platform::current(), from, to)
+                .map_err(|e| e.to_string())
         };
-        let mut server = mcp::Server {
+        let server = mcp::Server {
             history: history::default_path(),
-            log: &log,
-            now: 0,
+            log: std::sync::Arc::new(log),
+            now: None,
             salt: std::hash::RandomState::new(),
         };
-        mcp::serve(&mut server).await?;
+        mcp::serve(std::sync::Arc::new(server)).await?;
         return Ok(());
     }
     if let Some(since) = cli.bundle {
