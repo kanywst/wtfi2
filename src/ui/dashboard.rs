@@ -152,7 +152,7 @@ pub async fn run(sweep_deadline: Duration, record_to: Option<PathBuf>) -> Result
                 crate::json::to_value(&path, &verdict),
             )
         {
-            eprintln!("wtfi: could not record to {}: {e}", file.display());
+            eprintln!("wtfi: could not record to {e}");
         }
         print!("{}", crate::render::report(&path, &verdict, true, false));
         return Ok(());

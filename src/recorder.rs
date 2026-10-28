@@ -51,7 +51,7 @@ pub fn record(every: Duration, log: &mut Log, path: &Path) -> Duration {
     let mut record = Record::now(path, &verdict);
     record.interval_s = Some(wait.as_secs());
     if let Err(e) = log.push(&record, json::to_value(path, &verdict)) {
-        let _ = writeln!(std::io::stderr(), "wtfi: could not record: {e}");
+        let _ = writeln!(std::io::stderr(), "wtfi: could not record to {e}");
     }
     // Best effort: a closed stdout must not stop the recording.
     let _ = writeln!(std::io::stdout(), "{}", history::line(&record));

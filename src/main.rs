@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
             json::to_value(&path, &verdict),
         )
     {
-        eprintln!("wtfi: could not record to {}: {e}", file.display());
+        eprintln!("wtfi: could not record to {e}");
     }
 
     if cli.json {
