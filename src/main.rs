@@ -30,6 +30,7 @@ async fn main() -> Result<()> {
             log: std::sync::Arc::new(log),
             now: None,
             salt: std::hash::RandomState::new(),
+            sweeping: Default::default(),
         };
         mcp::serve(std::sync::Arc::new(server)).await?;
         return Ok(());

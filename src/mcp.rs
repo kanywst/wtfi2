@@ -25,6 +25,7 @@ pub struct Server {
     pub now: Option<u64>,
     /// One salt per session, so a masked SSID or MAC reads the same in every tool.
     pub salt: RandomState,
+    pub sweeping: tokio::sync::Mutex<()>,
 }
 
 /// Requests run concurrently, so a slow tool doesn't hold up `ping`.
@@ -44,7 +45,13 @@ pub async fn serve(server: Arc<Server>) -> std::io::Result<()> {
         let (server, tx) = (server.clone(), tx.clone());
         tasks.spawn(async move {
             let reply = match serde_json::from_str::<Value>(&line) {
-                Ok(req) => server.handle(&req).await,
+                Ok(req) => {
+                    let id = req.get("method").and(req.get("id")).cloned();
+                    match tokio::spawn(async move { server.handle(&req).await }).await {
+                        Ok(reply) => reply,
+                        Err(_) => id.map(|id| error(id, -32603, "internal error")),
+                    }
+                }
                 Err(e) => Some(error(Value::Null, -32700, &e.to_string())),
             };
             if let Some(reply) = reply {
@@ -104,6 +111,8 @@ impl Server {
     async fn call(&self, name: &str, args: &Value) -> Result<String, String> {
         let now = self.now.unwrap_or_else(history::now_secs);
         if name == "diagnose_now" {
+            // Overlapping sweeps would load the link and skew each other's numbers.
+            let _one_at_a_time = self.sweeping.lock().await;
             let path = engine::run_once_within(engine::SWEEP_DEADLINE).await;
             let mut doc = json::to_value(&path, &diagnose::diagnose(&path));
             if redacting(args) {
@@ -181,7 +190,7 @@ impl Server {
                 let from = args["from_ts"]
                     .as_u64()
                     .unwrap_or(to.saturating_sub(LOG_DEFAULT_SECS));
-                if to - from > LOG_MAX_SECS {
+                if to.saturating_sub(from) > LOG_MAX_SECS {
                     return Err(format!(
                         "ask for at most {}h of log at a time",
                         LOG_MAX_SECS / 3600
@@ -194,7 +203,7 @@ impl Server {
                 if lines.is_empty() {
                     return Ok("Nothing logged.".into());
                 }
-                bundle::log_block(&lines, redactor.as_ref())
+                bundle::log_block(&lines, None, redactor.as_ref())
             }
             "get_bundle" => {
                 let (log, salt) = (self.log.clone(), self.salt.clone());
@@ -321,6 +330,7 @@ mod tests {
             log: Arc::new(log),
             now: Some(1030),
             salt: RandomState::new(),
+            sweeping: Default::default(),
         }
     }
 
@@ -493,6 +503,7 @@ mod tests {
             log: Arc::new(log),
             now: Some(0),
             salt: RandomState::new(),
+            sweeping: Default::default(),
         };
         assert_eq!(
             call(&none, "list_episodes", json!({})).await["isError"],
