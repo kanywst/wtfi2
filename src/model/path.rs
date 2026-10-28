@@ -238,14 +238,38 @@ impl Path {
     pub fn upsert(&mut self, hop: Hop) {
         if let Some(slot) = self.get_mut(hop.id) {
             *slot = hop;
-            return;
+        } else {
+            let pos = self
+                .hops
+                .iter()
+                .position(|h| (h.id as usize) > (hop.id as usize))
+                .unwrap_or(self.hops.len());
+            self.hops.insert(pos, hop);
         }
-        let pos = self
-            .hops
-            .iter()
-            .position(|h| (h.id as usize) > (hop.id as usize))
-            .unwrap_or(self.hops.len());
-        self.hops.insert(pos, hop);
+        self.excuse_silent_gateway();
+    }
+
+    /// A gateway that ignores every probe is still forwarding if the internet answers through it.
+    fn excuse_silent_gateway(&mut self) {
+        let forwarding = self.get(HopId::Wan).is_some_and(|w| {
+            matches!(w.status, Status::Ok | Status::Warn) && w.fault != Some(Fault::Unobserved)
+        });
+        let Some(gw) = self
+            .get_mut(HopId::Gateway)
+            .filter(|g| forwarding && g.fault == Some(Fault::GatewaySilent))
+        else {
+            return;
+        };
+        gw.status = Status::Ok;
+        gw.fault = None;
+        gw.loss_pct = None;
+        gw.jitter_ms = None;
+        gw.metrics
+            .retain(|m| m.label != "Loss" && m.label != "Jitter");
+        gw.metrics
+            .push(Metric::new("Probes", "ignored (filtered)").with_status(Status::Warn));
+        gw.summary =
+            Some("Router ignores pings and TCP probes, but traffic passes through it".into());
     }
 
     /// The first hop (closest to the host) that is broken, if any.
@@ -270,6 +294,60 @@ impl Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn silent_gateway() -> Hop {
+        let mut gw = Hop::new(HopId::Gateway, Layer::Network, "Gateway");
+        gw.fail(Fault::GatewaySilent, "Router isn't answering");
+        gw.loss_pct = Some(100.0);
+        gw.metrics.push(Metric::new("Loss", "100% (5/5 lost)"));
+        gw
+    }
+
+    fn wan(status: Status) -> Hop {
+        let mut w = Hop::new(HopId::Wan, Layer::Internet, "Internet");
+        w.status = status;
+        w
+    }
+
+    #[test]
+    fn a_silent_gateway_that_forwards_is_not_a_break() {
+        for gateway_first in [true, false] {
+            let mut p = Path::default();
+            if gateway_first {
+                p.upsert(silent_gateway());
+                p.upsert(wan(Status::Ok));
+            } else {
+                p.upsert(wan(Status::Warn));
+                p.upsert(silent_gateway());
+            }
+            let gw = p.get(HopId::Gateway).unwrap();
+            assert_eq!(gw.status, Status::Ok, "gateway_first={gateway_first}");
+            assert_eq!(gw.fault, None);
+            assert_eq!(gw.loss_pct, None);
+            assert!(gw.metrics.iter().all(|m| m.label != "Loss"));
+            assert!(p.first_break().is_none());
+        }
+    }
+
+    #[test]
+    fn a_silent_gateway_stays_broken_when_nothing_gets_through() {
+        for wan_status in [Status::Fail, Status::Skipped, Status::Pending] {
+            let mut p = Path::default();
+            p.upsert(silent_gateway());
+            p.upsert(wan(wan_status));
+            assert_eq!(
+                p.first_break().map(|h| h.id),
+                Some(HopId::Gateway),
+                "{wan_status:?}"
+            );
+        }
+        let mut unobserved = wan(Status::Warn);
+        unobserved.fault = Some(Fault::Unobserved);
+        let mut p = Path::default();
+        p.upsert(silent_gateway());
+        p.upsert(unobserved);
+        assert_eq!(p.first_break().map(|h| h.id), Some(HopId::Gateway));
+    }
 
     #[test]
     fn first_break_returns_earliest_fail() {
