@@ -1,0 +1,367 @@
+//! `wtfi --mcp`: the recorded history as an MCP server over stdio.
+
+use crate::bundle::{self, LogReader};
+use crate::history::{self, Snapshot};
+use crate::{diagnose, engine, json};
+use serde_json::{Value, json};
+use std::path::PathBuf;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+const PROTOCOLS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+const MAX_SWEEPS: usize = 20;
+
+pub struct Server<'a> {
+    pub history: Option<PathBuf>,
+    pub log: LogReader<'a>,
+    pub now: u64,
+}
+
+pub async fn serve(server: &mut Server<'_>) -> std::io::Result<()> {
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdout = tokio::io::stdout();
+    while let Some(line) = lines.next_line().await? {
+        let reply = match serde_json::from_str::<Value>(&line) {
+            Ok(req) => {
+                server.now = crate::history::now_secs();
+                server.handle(&req).await
+            }
+            Err(e) => Some(error(Value::Null, -32700, &e.to_string())),
+        };
+        if let Some(reply) = reply {
+            stdout.write_all(format!("{reply}\n").as_bytes()).await?;
+            stdout.flush().await?;
+        }
+    }
+    Ok(())
+}
+
+impl Server<'_> {
+    /// One JSON-RPC message in, at most one out (notifications get none).
+    pub async fn handle(&self, req: &Value) -> Option<Value> {
+        let id = req.get("id")?.clone();
+        let params = &req["params"];
+        let result = match req["method"].as_str().unwrap_or("") {
+            "initialize" => {
+                let asked = params["protocolVersion"].as_str().unwrap_or("");
+                let version = PROTOCOLS
+                    .into_iter()
+                    .find(|v| *v == asked)
+                    .unwrap_or(PROTOCOLS[0]);
+                json!({
+                    "protocolVersion": version,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "wtfi", "version": env!("CARGO_PKG_VERSION") },
+                    "instructions": "Network history recorded by `wtfi --record`. Start with list_episodes, then pull sweeps or the OS log around the one you care about. diagnose_now probes the network as it is right now.",
+                })
+            }
+            "ping" => json!({}),
+            "tools/list" => json!({ "tools": tools() }),
+            "tools/call" => {
+                let args = &params["arguments"];
+                match self.call(params["name"].as_str().unwrap_or(""), args).await {
+                    Ok(text) => json!({ "content": [{ "type": "text", "text": text }] }),
+                    Err(e) => {
+                        json!({ "content": [{ "type": "text", "text": e }], "isError": true })
+                    }
+                }
+            }
+            m => return Some(error(id, -32601, &format!("method not found: {m}"))),
+        };
+        Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+    }
+
+    async fn call(&self, name: &str, args: &Value) -> Result<String, String> {
+        if name == "diagnose_now" {
+            let path = engine::run_once_within(engine::SWEEP_DEADLINE).await;
+            let doc = json::to_value(&path, &diagnose::diagnose(&path));
+            let snapshot = Snapshot {
+                ts: self.now,
+                sweep: doc.clone(),
+            };
+            return Ok(self.mask(args, doc.to_string(), &[snapshot]));
+        }
+        let file = self
+            .history
+            .as_ref()
+            .ok_or("no history file: set WTFI_HISTORY, XDG_STATE_HOME or HOME")?;
+        let since = self.now.saturating_sub(since(args)?.as_secs());
+        let records = history::load(file, usize::MAX).map_err(|e| e.to_string())?;
+        let records: Vec<_> = records.into_iter().filter(|r| r.ts >= since).collect();
+        let sweeps = history::load_sweeps(file, since).map_err(|e| e.to_string())?;
+        let text = match name {
+            "list_episodes" => {
+                let eps: Vec<Value> = bundle::episodes(&records)
+                    .iter()
+                    .map(|e| {
+                        json!({
+                            "start": history::utc(e.start),
+                            "start_ts": e.start,
+                            "end": e.end.map(history::utc),
+                            "end_ts": e.end,
+                            "sweeps": e.sweeps,
+                            "worst": e.worst,
+                            "first_break": e.first_break,
+                            "headline": e.headline,
+                        })
+                    })
+                    .collect();
+                let gaps: Vec<Value> = bundle::gaps(&records)
+                    .iter()
+                    .map(|(a, b)| json!({ "from": history::utc(*a), "to": history::utc(*b) }))
+                    .collect();
+                json!({ "sweeps": records.len(), "episodes": eps, "recorder_gaps": gaps })
+                    .to_string()
+            }
+            "get_timeline" => serde_json::to_string(&records).map_err(|e| e.to_string())?,
+            "get_sweeps" => {
+                let (from, to) = range(args, since, self.now)?;
+                let mut picked: Vec<Value> = sweeps
+                    .iter()
+                    .filter(|s| (from..=to).contains(&s.ts))
+                    .map(|s| {
+                        let mut sweep = s.sweep.clone();
+                        bundle::prune(&mut sweep);
+                        json!({ "at": history::utc(s.ts), "ts": s.ts, "sweep": sweep })
+                    })
+                    .collect();
+                let skip = picked.len().saturating_sub(MAX_SWEEPS);
+                let picked = picked.split_off(skip);
+                json!({ "omitted_older": skip, "sweeps": picked }).to_string()
+            }
+            "get_os_log" => {
+                let (from, to) = range(args, since, self.now)?;
+                let lines = (self.log)(from, to)?;
+                lines
+                    .iter()
+                    .map(|l| format!("{} {}: {}", l.time, l.source, l.message))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            "get_bundle" => {
+                let all = history::load(file, usize::MAX).map_err(|e| e.to_string())?;
+                return Ok(bundle::build(
+                    &all,
+                    &sweeps,
+                    since,
+                    redacting(args),
+                    self.log,
+                ));
+            }
+            _ => return Err(format!("unknown tool: {name}")),
+        };
+        Ok(self.mask(args, text, &sweeps))
+    }
+
+    fn mask(&self, args: &Value, text: String, sweeps: &[Snapshot]) -> String {
+        if redacting(args) {
+            bundle::redact(&text, sweeps)
+        } else {
+            text
+        }
+    }
+}
+
+fn redacting(args: &Value) -> bool {
+    args["redact"].as_bool().unwrap_or(true)
+}
+
+fn since(args: &Value) -> Result<Duration, String> {
+    crate::cli::parse_duration(args["since"].as_str().unwrap_or("24h"))
+}
+
+fn range(args: &Value, since: u64, now: u64) -> Result<(u64, u64), String> {
+    let from = args["from_ts"].as_u64().unwrap_or(since);
+    let to = args["to_ts"].as_u64().unwrap_or(now);
+    if from > to {
+        return Err("from_ts is after to_ts".into());
+    }
+    Ok((from, to))
+}
+
+fn error(id: Value, code: i64, message: &str) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+fn tools() -> Value {
+    let since = json!({ "type": "string", "description": "How far back to look: 90s, 30m, 2h, 1d. Default 24h." });
+    let redact = json!({ "type": "boolean", "description": "Mask SSIDs, public IPs and MACs. Default true." });
+    let from = json!({ "type": "integer", "description": "Unix seconds. Defaults to the start of `since`." });
+    let to = json!({ "type": "integer", "description": "Unix seconds. Defaults to now." });
+    json!([
+        {
+            "name": "list_episodes",
+            "description": "Outage and degradation episodes (runs of unhealthy sweeps) and spans where the recorder wasn't running.",
+            "inputSchema": { "type": "object", "properties": { "since": since, "redact": redact } },
+            "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "get_timeline",
+            "description": "Every recorded sweep as one small record: status, first broken hop, headline, gateway and internet RTT, loss, RSSI.",
+            "inputSchema": { "type": "object", "properties": { "since": since, "redact": redact } },
+            "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "get_sweeps",
+            "description": "Full per-hop sweeps kept around each change of state, newest 20 in the range.",
+            "inputSchema": { "type": "object", "properties": { "since": since, "from_ts": from, "to_ts": to, "redact": redact } },
+            "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "get_os_log",
+            "description": "Wi-Fi, DHCP, interface and DNS events from the OS log (log show on macOS, journalctl on Linux) between two times.",
+            "inputSchema": { "type": "object", "properties": { "since": since, "from_ts": from, "to_ts": to, "redact": redact } },
+            "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "get_bundle",
+            "description": "The same Markdown report `wtfi --bundle` prints: episodes, gaps, latency, timeline, sweeps and OS log.",
+            "inputSchema": { "type": "object", "properties": { "since": since, "redact": redact } },
+            "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "diagnose_now",
+            "description": "Probe the network right now and return the full diagnosis. Takes up to 20 seconds.",
+            "inputSchema": { "type": "object", "properties": { "redact": redact } },
+            "annotations": { "readOnlyHint": true, "openWorldHint": true },
+        },
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::{Log, Record};
+    use crate::platform::LogLine;
+
+    fn log(from: u64, to: u64) -> Result<Vec<LogLine>, String> {
+        Ok(vec![LogLine {
+            time: "00:00:00".into(),
+            source: "configd".into(),
+            message: format!("window {from}-{to}"),
+        }])
+    }
+
+    fn server(name: &str) -> Server<'static> {
+        let dir = std::env::temp_dir().join(format!("wtfi-mcp-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("history.jsonl");
+        let mut l = Log::open(file.clone());
+        for (ts, status) in [(1000, "ok"), (1010, "fail"), (1020, "ok")] {
+            let r = Record {
+                ts,
+                status: status.into(),
+                first_break: (status == "fail").then(|| "dns".into()),
+                headline: format!("{status}!"),
+                gateway_ms: None,
+                wan_ms: None,
+                wan_loss_pct: None,
+                rssi_dbm: None,
+                interval_s: None,
+            };
+            let sweep = json!({ "path": [{ "id": "wan", "metrics": [{ "label": "Public IP", "value": "198.51.100.7" }] }] });
+            l.push(&r, sweep).unwrap();
+        }
+        Server {
+            history: Some(file),
+            log: &log,
+            now: 1030,
+        }
+    }
+
+    async fn call(s: &Server<'_>, name: &str, args: Value) -> Value {
+        let req = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": name, "arguments": args } });
+        s.handle(&req).await.unwrap()["result"].clone()
+    }
+
+    fn text(result: &Value) -> &str {
+        result["content"][0]["text"].as_str().unwrap()
+    }
+
+    #[tokio::test]
+    async fn initialize_agrees_on_a_version() {
+        let s = server("init");
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } });
+        let r = s.handle(&req).await.unwrap();
+        assert_eq!(r["id"], 1);
+        assert_eq!(r["result"]["protocolVersion"], "2025-06-18");
+        assert!(r["result"]["capabilities"]["tools"].is_object());
+        let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize", "params": { "protocolVersion": "1999-01-01" } });
+        assert_eq!(
+            s.handle(&req).await.unwrap()["result"]["protocolVersion"],
+            PROTOCOLS[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn notifications_get_no_reply_and_unknown_methods_an_error() {
+        let s = server("notify");
+        let n = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        assert_eq!(s.handle(&n).await, None);
+        let r = s
+            .handle(&json!({ "jsonrpc": "2.0", "id": 3, "method": "nope" }))
+            .await
+            .unwrap();
+        assert_eq!(r["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn every_listed_tool_has_a_schema() {
+        let s = server("list");
+        let r = s
+            .handle(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let tools = r["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 6);
+        for t in tools {
+            assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn episodes_and_sweeps_come_from_the_history() {
+        let s = server("episodes");
+        let eps: Value =
+            serde_json::from_str(text(&call(&s, "list_episodes", json!({})).await)).unwrap();
+        assert_eq!(eps["sweeps"], 3);
+        assert_eq!(eps["episodes"][0]["start_ts"], 1010);
+        assert_eq!(eps["episodes"][0]["end_ts"], 1020);
+
+        let r = call(&s, "get_sweeps", json!({ "from_ts": 1005, "to_ts": 1015 })).await;
+        let sweeps: Value = serde_json::from_str(text(&r)).unwrap();
+        assert_eq!(sweeps["sweeps"].as_array().unwrap().len(), 1);
+        assert!(!text(&r).contains("198.51.100.7") && text(&r).contains("198.51.100.x"));
+        let raw = call(&s, "get_sweeps", json!({ "redact": false })).await;
+        assert!(text(&raw).contains("198.51.100.7"));
+    }
+
+    #[tokio::test]
+    async fn os_log_and_bundle_use_the_reader() {
+        let s = server("oslog");
+        let r = call(&s, "get_os_log", json!({ "from_ts": 1000, "to_ts": 1010 })).await;
+        assert_eq!(text(&r), "00:00:00 configd: window 1000-1010");
+        let b = call(&s, "get_bundle", json!({})).await;
+        assert!(text(&b).starts_with("# wtfi network report"));
+    }
+
+    #[tokio::test]
+    async fn bad_arguments_are_tool_errors_not_crashes() {
+        let s = server("bad");
+        let r = call(&s, "get_sweeps", json!({ "since": "soon" })).await;
+        assert_eq!(r["isError"], true);
+        let r = call(&s, "get_os_log", json!({ "from_ts": 9, "to_ts": 1 })).await;
+        assert_eq!(r["isError"], true);
+        let r = call(&s, "nope", json!({})).await;
+        assert_eq!(r["isError"], true);
+        let none = Server {
+            history: None,
+            log: &log,
+            now: 0,
+        };
+        assert_eq!(
+            call(&none, "list_episodes", json!({})).await["isError"],
+            true
+        );
+    }
+}
