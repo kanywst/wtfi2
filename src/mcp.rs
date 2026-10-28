@@ -1,20 +1,25 @@
 //! `wtfi --mcp`: the recorded history as an MCP server over stdio.
 
-use crate::bundle::{self, LogReader};
+use crate::bundle::{self, LogReader, Redactor};
 use crate::history::{self, Snapshot};
 use crate::{diagnose, engine, json};
 use serde_json::{Value, json};
+use std::hash::RandomState;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const PROTOCOLS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const MAX_SWEEPS: usize = 20;
+const LOG_DEFAULT_SECS: u64 = 900;
+const LOG_MAX_SECS: u64 = 7200;
 
 pub struct Server<'a> {
     pub history: Option<PathBuf>,
     pub log: LogReader<'a>,
     pub now: u64,
+    /// One salt per session, so a masked SSID or MAC reads the same in every tool.
+    pub salt: RandomState,
 }
 
 pub async fn serve(server: &mut Server<'_>) -> std::io::Result<()> {
@@ -39,6 +44,15 @@ pub async fn serve(server: &mut Server<'_>) -> std::io::Result<()> {
 impl Server<'_> {
     /// One JSON-RPC message in, at most one out (notifications get none).
     pub async fn handle(&self, req: &Value) -> Option<Value> {
+        if !req.is_object() {
+            return Some(error(
+                Value::Null,
+                -32600,
+                "expected a single JSON-RPC object",
+            ));
+        }
+        // Notifications and replies to our (nonexistent) requests get no answer.
+        req.get("method")?;
         let id = req.get("id")?.clone();
         let params = &req["params"];
         let result = match req["method"].as_str().unwrap_or("") {
@@ -74,24 +88,35 @@ impl Server<'_> {
     async fn call(&self, name: &str, args: &Value) -> Result<String, String> {
         if name == "diagnose_now" {
             let path = engine::run_once_within(engine::SWEEP_DEADLINE).await;
-            let doc = json::to_value(&path, &diagnose::diagnose(&path));
-            let snapshot = Snapshot {
-                ts: self.now,
-                sweep: doc.clone(),
-            };
-            return Ok(self.mask(args, doc.to_string(), &[snapshot]));
+            let mut doc = json::to_value(&path, &diagnose::diagnose(&path));
+            if redacting(args) {
+                let snapshot = Snapshot {
+                    ts: self.now,
+                    sweep: doc.clone(),
+                };
+                Redactor::new(&self.salt, &[&snapshot]).sweep(&mut doc);
+            }
+            return Ok(doc.to_string());
         }
         let file = self
             .history
             .as_ref()
             .ok_or("no history file: set WTFI_HISTORY, XDG_STATE_HOME or HOME")?;
         let since = self.now.saturating_sub(since(args)?.as_secs());
+        let (from, to) = range(args, since, self.now)?;
+        let since = since.min(from);
         let records = history::load(file, usize::MAX).map_err(|e| e.to_string())?;
-        let records: Vec<_> = records.into_iter().filter(|r| r.ts >= since).collect();
         let sweeps = history::load_sweeps(file, since).map_err(|e| e.to_string())?;
-        let text = match name {
+        let all: Vec<&Snapshot> = sweeps.iter().collect();
+        let redactor = redacting(args).then(|| Redactor::new(&self.salt, &all));
+        let text = |s: String| match &redactor {
+            Some(r) => r.text(&s),
+            None => s,
+        };
+        let windowed: Vec<_> = records.iter().filter(|r| r.ts >= since).cloned().collect();
+        Ok(match name {
             "list_episodes" => {
-                let eps: Vec<Value> = bundle::episodes(&records)
+                let eps: Vec<Value> = bundle::episodes(&windowed)
                     .iter()
                     .map(|e| {
                         json!({
@@ -106,22 +131,26 @@ impl Server<'_> {
                         })
                     })
                     .collect();
-                let gaps: Vec<Value> = bundle::gaps(&records)
+                let gaps: Vec<Value> = bundle::gaps(&windowed)
                     .iter()
                     .map(|(a, b)| json!({ "from": history::utc(*a), "to": history::utc(*b) }))
                     .collect();
-                json!({ "sweeps": records.len(), "episodes": eps, "recorder_gaps": gaps })
-                    .to_string()
+                text(
+                    json!({ "sweeps": windowed.len(), "episodes": eps, "recorder_gaps": gaps })
+                        .to_string(),
+                )
             }
-            "get_timeline" => serde_json::to_string(&records).map_err(|e| e.to_string())?,
+            "get_timeline" => text(serde_json::to_string(&windowed).map_err(|e| e.to_string())?),
             "get_sweeps" => {
-                let (from, to) = range(args, since, self.now)?;
                 let mut picked: Vec<Value> = sweeps
                     .iter()
                     .filter(|s| (from..=to).contains(&s.ts))
                     .map(|s| {
                         let mut sweep = s.sweep.clone();
                         bundle::prune(&mut sweep);
+                        if let Some(r) = &redactor {
+                            r.sweep(&mut sweep);
+                        }
                         json!({ "at": history::utc(s.ts), "ts": s.ts, "sweep": sweep })
                     })
                     .collect();
@@ -130,35 +159,30 @@ impl Server<'_> {
                 json!({ "omitted_older": skip, "sweeps": picked }).to_string()
             }
             "get_os_log" => {
-                let (from, to) = range(args, since, self.now)?;
+                let from = args["from_ts"]
+                    .as_u64()
+                    .unwrap_or(to.saturating_sub(LOG_DEFAULT_SECS));
+                if to - from > LOG_MAX_SECS {
+                    return Err(format!(
+                        "ask for at most {}h of log at a time",
+                        LOG_MAX_SECS / 3600
+                    ));
+                }
                 let lines = (self.log)(from, to)?;
-                lines
-                    .iter()
-                    .map(|l| format!("{} {}: {}", l.time, l.source, l.message))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                if lines.is_empty() {
+                    return Ok("Nothing logged.".into());
+                }
+                bundle::log_block(&lines, redactor.as_ref())
             }
-            "get_bundle" => {
-                let all = history::load(file, usize::MAX).map_err(|e| e.to_string())?;
-                return Ok(bundle::build(
-                    &all,
-                    &sweeps,
-                    since,
-                    redacting(args),
-                    self.log,
-                ));
-            }
+            "get_bundle" => bundle::build(
+                &records,
+                &sweeps,
+                since,
+                redacting(args).then_some(&self.salt),
+                self.log,
+            ),
             _ => return Err(format!("unknown tool: {name}")),
-        };
-        Ok(self.mask(args, text, &sweeps))
-    }
-
-    fn mask(&self, args: &Value, text: String, sweeps: &[Snapshot]) -> String {
-        if redacting(args) {
-            bundle::redact(&text, sweeps)
-        } else {
-            text
-        }
+        })
     }
 }
 
@@ -209,7 +233,7 @@ fn tools() -> Value {
         },
         {
             "name": "get_os_log",
-            "description": "Wi-Fi, DHCP, interface and DNS events from the OS log (log show on macOS, journalctl on Linux) between two times.",
+            "description": "Wi-Fi, DHCP, interface and DNS events from the OS log (log show on macOS, journalctl on Linux). Defaults to the 15 minutes before to_ts; at most 2h per call.",
             "inputSchema": { "type": "object", "properties": { "since": since, "from_ts": from, "to_ts": to, "redact": redact } },
             "annotations": { "readOnlyHint": true },
         },
@@ -238,7 +262,9 @@ mod tests {
         Ok(vec![LogLine {
             time: "00:00:00".into(),
             source: "configd".into(),
-            message: format!("window {from}-{to}"),
+            message: format!(
+                "window {from}-{to} SSID 'Cafe' BSSID 00:11:22:33:44:55 via 93.184.215.14"
+            ),
         }])
     }
 
@@ -259,13 +285,17 @@ mod tests {
                 rssi_dbm: None,
                 interval_s: None,
             };
-            let sweep = json!({ "path": [{ "id": "wan", "metrics": [{ "label": "Public IP", "value": "198.51.100.7" }] }] });
+            let sweep = json!({ "path": [
+                { "id": "link", "subtitle": "Cafe", "metrics": [{ "label": "BSSID", "value": "00:11:22:33:44:55" }] },
+                { "id": "wan", "metrics": [{ "label": "Public IP", "value": "198.51.100.7" }] }
+            ] });
             l.push(&r, sweep).unwrap();
         }
         Server {
             history: Some(file),
             log: &log,
             now: 1030,
+            salt: RandomState::new(),
         }
     }
 
@@ -340,9 +370,68 @@ mod tests {
     async fn os_log_and_bundle_use_the_reader() {
         let s = server("oslog");
         let r = call(&s, "get_os_log", json!({ "from_ts": 1000, "to_ts": 1010 })).await;
-        assert_eq!(text(&r), "00:00:00 configd: window 1000-1010");
+        assert!(
+            text(&r).contains("configd: window 1000-1010"),
+            "{}",
+            text(&r)
+        );
+        let r = call(&s, "get_os_log", json!({})).await;
+        assert!(
+            text(&r).contains("window 130-1030"),
+            "15 minutes by default"
+        );
         let b = call(&s, "get_bundle", json!({})).await;
         assert!(text(&b).starts_with("# wtfi network report"));
+    }
+
+    #[tokio::test]
+    async fn every_tool_masks_the_same_way() {
+        let s = server("masks");
+        let log = text(&call(&s, "get_os_log", json!({ "from_ts": 1000, "to_ts": 1010 })).await)
+            .to_string();
+        let sweeps = text(&call(&s, "get_sweeps", json!({})).await).to_string();
+        for leak in ["Cafe", "00:11:22", "93.184.215.14", "198.51.100.7"] {
+            assert!(
+                !log.contains(leak) && !sweeps.contains(leak),
+                "{leak}: {log} {sweeps}"
+            );
+        }
+        let tag = |t: &str, p: &str| t.split(p).nth(1).unwrap()[..4].to_string();
+        assert_eq!(tag(&log, "ssid-"), tag(&sweeps, "ssid-"));
+        assert_eq!(tag(&log, "mac-"), tag(&sweeps, "mac-"));
+        let raw = call(
+            &s,
+            "get_os_log",
+            json!({ "from_ts": 1000, "to_ts": 1010, "redact": false }),
+        )
+        .await;
+        assert!(text(&raw).contains("'Cafe'"));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_range_reaches_past_the_default_window() {
+        let mut s = server("range");
+        s.now = 1030 + 3 * 86_400;
+        let r = call(&s, "get_sweeps", json!({ "from_ts": 1005, "to_ts": 1015 })).await;
+        let v: Value = serde_json::from_str(text(&r)).unwrap();
+        assert_eq!(v["sweeps"].as_array().unwrap().len(), 1, "{v}");
+        let r = call(&s, "get_os_log", json!({ "from_ts": 0, "to_ts": 86_400 })).await;
+        assert_eq!(r["isError"], true, "a day of log is refused");
+    }
+
+    #[tokio::test]
+    async fn responses_and_batches_are_not_mistaken_for_requests() {
+        let s = server("rpc");
+        assert_eq!(
+            s.handle(&json!({ "jsonrpc": "2.0", "id": 5, "result": {} }))
+                .await,
+            None
+        );
+        let r = s
+            .handle(&json!([{ "jsonrpc": "2.0", "id": 1, "method": "ping" }]))
+            .await
+            .unwrap();
+        assert_eq!(r["error"]["code"], -32600);
     }
 
     #[tokio::test]
@@ -358,6 +447,7 @@ mod tests {
             history: None,
             log: &log,
             now: 0,
+            salt: RandomState::new(),
         };
         assert_eq!(
             call(&none, "list_episodes", json!({})).await["isError"],

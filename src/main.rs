@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
             history: history::default_path(),
             log: &log,
             now: 0,
+            salt: std::hash::RandomState::new(),
         };
         mcp::serve(&mut server).await?;
         return Ok(());

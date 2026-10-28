@@ -412,12 +412,6 @@ fn span(secs: u64) -> String {
     }
 }
 
-/// Mask identity fields in `text`, learning SSIDs and addresses from `sweeps`.
-pub fn redact(text: &str, sweeps: &[Snapshot]) -> String {
-    let sweeps: Vec<&Snapshot> = sweeps.iter().collect();
-    Redactor::new(&sweeps).apply(text)
-}
-
 /// Drop nulls and empty arrays so each sweep costs fewer tokens.
 pub fn prune(v: &mut Value) {
     match v {
