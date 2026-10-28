@@ -108,7 +108,7 @@ impl Log {
         let last = load(&file, 1).ok().and_then(|mut r| r.pop());
         Log {
             state: last.as_ref().map(state_of),
-            last_snapshot: last.map_or(0, |r| r.ts),
+            last_snapshot: last_snapshot_ts(&sweeps_path(&file)).unwrap_or(0),
             file,
             held: None,
         }
@@ -135,6 +135,20 @@ impl Log {
         self.last_snapshot = record.ts;
         append_line(&to, &snapshot, SWEEPS_MAX_BYTES)
     }
+}
+
+/// The newest snapshot's time, read from the file's tail.
+fn last_snapshot_ts(file: &std::path::Path) -> Option<u64> {
+    let mut f = fs::File::open(file).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(64 * 1024)))
+        .ok()?;
+    let mut tail = Vec::new();
+    f.read_to_end(&mut tail).ok()?;
+    String::from_utf8_lossy(&tail)
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<Value>(l).ok()?["ts"].as_u64())
 }
 
 fn state_of(r: &Record) -> String {
@@ -398,6 +412,18 @@ mod tests {
             [0, 2],
             "a one-shot run can't hold, so it only skips repeats"
         );
+    }
+
+    #[test]
+    fn reopening_on_a_short_cadence_still_resnapshots_a_long_outage() {
+        let f = tempfile("cadence");
+        for ts in (0..=1500).step_by(300) {
+            Log::open(f.clone())
+                .push(&record(ts, "fail"), Value::Null)
+                .unwrap();
+        }
+        let ts: Vec<u64> = load_sweeps(&f, 0).unwrap().iter().map(|s| s.ts).collect();
+        assert_eq!(ts, [0, 600, 1200]);
     }
 
     #[test]
