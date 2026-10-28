@@ -13,6 +13,10 @@ const LOG_EPISODES: usize = 5;
 const LOG_LEAD_SECS: u64 = 120;
 const LOG_MAX_SECS: u64 = 720;
 const LOG_MAX_LINES: usize = 150;
+/// Lines kept from before an episode began; the rest of the budget goes after it.
+const LOG_LEAD_LINES: usize = 30;
+/// Total time `--bundle` spends reading OS logs.
+const LOG_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 /// A recorder that planned to sweep in N seconds but didn't within N+60 wasn't running.
 const GAP_SLACK_SECS: u64 = 60;
 /// Assumed spacing for records that don't say (one-shot runs, older history).
@@ -272,6 +276,7 @@ pub fn build(
 
     if !eps.is_empty() {
         out.push_str("\n## OS network log\n\nWi-Fi, DHCP, interface and DNS events the OS logged around the newest episodes. Repeated lines are collapsed.\n");
+        let started = std::time::Instant::now();
         for e in eps.iter().skip(eps.len().saturating_sub(LOG_EPISODES)) {
             let from = e.start.saturating_sub(LOG_LEAD_SECS);
             let to = e.end.unwrap_or(last.ts).min(e.start + LOG_MAX_SECS) + 60;
@@ -280,9 +285,14 @@ pub fn build(
                 history::utc(from),
                 history::utc(to)
             ));
+            if started.elapsed() > LOG_BUDGET {
+                out.push_str("Skipped: reading the OS log was taking too long.\n");
+                continue;
+            }
+            let focus = history::utc(e.start);
             match log(from, to) {
                 Ok(lines) if lines.is_empty() => out.push_str("Nothing logged.\n"),
-                Ok(lines) => out.push_str(&log_block(&lines, redactor.as_ref())),
+                Ok(lines) => out.push_str(&log_block(&lines, focus.get(11..19), redactor.as_ref())),
                 Err(e) => out.push_str(&format!("Couldn't read the OS log: {e}\n")),
             }
         }
@@ -296,9 +306,24 @@ pub fn build(
 }
 
 /// A fenced block of collapsed, capped and (when asked) masked log lines.
-pub fn log_block(lines: &[LogLine], redactor: Option<&Redactor>) -> String {
-    let lines = collapse(lines);
+/// `focus` (`HH:MM:SS`) keeps the cap centred on when an episode began.
+pub fn log_block(lines: &[LogLine], focus: Option<&str>, redactor: Option<&Redactor>) -> String {
+    let at = focus.map_or(0, |t| {
+        lines
+            .iter()
+            .position(|l| l.time.as_str() >= t)
+            .unwrap_or(lines.len())
+    });
+    let (before, after) = (collapse(&lines[..at]), collapse(&lines[at..]));
+    let lead = &before[before
+        .len()
+        .saturating_sub(LOG_LEAD_LINES.min(LOG_MAX_LINES))..];
+    let skipped = before.len() - lead.len();
+    let lines: Vec<String> = lead.iter().chain(&after).cloned().collect();
     let mut out = String::from("```text\n");
+    if skipped > 0 {
+        out.push_str(&format!("({skipped} earlier lines omitted)\n"));
+    }
     for line in lines.iter().take(LOG_MAX_LINES) {
         match redactor {
             Some(r) => out.push_str(&r.text(&r.log_line(line))),
@@ -484,6 +509,12 @@ impl<'a> Redactor<'a> {
         for known in self.ssids.iter().filter(|s| s.chars().count() >= 4) {
             line = replace_word(&line, known, &self.ssid(known));
         }
+        if [" NetworkManager: ", " wpa_supplicant: ", " iwd: "]
+            .iter()
+            .any(|s| line.contains(s))
+        {
+            line = self.quoted(&line);
+        }
         let lower = line.to_ascii_lowercase();
         let b = line.as_bytes();
         let mut out = String::with_capacity(line.len());
@@ -532,6 +563,28 @@ impl<'a> Redactor<'a> {
             from = end;
         }
         out.push_str(&line[at..]);
+        out
+    }
+
+    /// Every `'…'` value, which is how these daemons quote SSIDs and connection names.
+    fn quoted(&self, line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let mut rest = line;
+        while let Some(i) = rest.find('\'') {
+            let Some(j) = rest[i + 1..].find('\'') else {
+                break;
+            };
+            let name = &rest[i + 1..i + 1 + j];
+            out.push_str(&rest[..=i]);
+            if name.is_empty() || name.starts_with('<') || name.starts_with("ssid-") {
+                out.push_str(name);
+            } else {
+                out.push_str(&self.ssid(name));
+            }
+            out.push('\'');
+            rest = &rest[i + j + 2..];
+        }
+        out.push_str(rest);
         out
     }
 
@@ -751,10 +804,49 @@ mod tests {
         let lines: Vec<LogLine> = (0..LOG_MAX_LINES + 7)
             .map(|i| line("00:00:00", &format!("event {i}")))
             .collect();
-        let block = log_block(&lines, None);
+        let block = log_block(&lines, None, None);
         assert!(
             block.contains("event 149\n(7 more lines omitted)"),
             "{block}"
+        );
+    }
+
+    #[test]
+    fn the_cap_keeps_the_lines_around_the_break() {
+        let lines: Vec<LogLine> = (0..400)
+            .map(|i| {
+                line(
+                    &format!("00:{:02}:{:02}", i / 60, i % 60),
+                    &format!("event {i}"),
+                )
+            })
+            .collect();
+        let block = log_block(&lines, Some("00:05:00"), None);
+        assert!(block.contains("(270 earlier lines omitted)"), "{block}");
+        assert!(
+            block.contains("event 270\n") && block.contains("event 300\n"),
+            "{block}"
+        );
+        assert!(
+            block.contains("event 399\n") && !block.contains("more lines omitted"),
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn network_manager_names_are_masked_without_an_ssid_keyword() {
+        let state = RandomState::new();
+        let r = Redactor::new(&state, &[]);
+        let out = r.log_line("12:00:00 NetworkManager: <info> device (wlan0): Activation: (wifi) access point 'Foo Bar' has security");
+        assert!(
+            !out.contains("Foo Bar") && out.contains("access point 'ssid-"),
+            "{out}"
+        );
+        let kept = "12:00:00 configd: DHCP en0: status = 'media inactive'";
+        assert_eq!(
+            r.log_line(kept),
+            kept,
+            "other sources keep their quoted values"
         );
     }
 
