@@ -13,7 +13,8 @@
 //! redacted, which is what actually matters for signal diagnosis.
 
 use super::shared::{
-    TOOL_DEADLINE, is_link_local, output_within, parse_addr, vendor_from_ip, vendor_from_processes,
+    LOG_DEADLINE, TOOL_DEADLINE, is_link_local, output_within, parse_addr, run_bounded,
+    vendor_from_ip, vendor_from_processes,
 };
 use super::{
     AddrInfo, LinkInfo, LogLine, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo,
@@ -127,7 +128,12 @@ impl Platform for MacOs {
             "--predicate",
             LOG_PREDICATE,
         ];
-        Ok(parse_log(&run("/usr/bin/log", &args)?))
+        let (out, err) = run_bounded("/usr/bin/log", &args, LOG_DEADLINE)?;
+        let lines = parse_log(&out);
+        if lines.is_empty() && !err.trim().is_empty() {
+            return Err(PlatformError::Command(format!("log: {}", err.trim())));
+        }
+        Ok(lines)
     }
 
     fn route(&self) -> Result<RouteInfo, PlatformError> {

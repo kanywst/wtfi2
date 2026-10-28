@@ -18,7 +18,8 @@
 //! any user.
 
 use super::shared::{
-    TOOL_DEADLINE, is_link_local, output_within, parse_addr, vendor_from_ip, vendor_from_processes,
+    LOG_DEADLINE, TOOL_DEADLINE, is_link_local, output_within, parse_addr, run_bounded,
+    vendor_from_ip, vendor_from_processes,
 };
 use super::{
     AddrInfo, LinkInfo, LogLine, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo,
@@ -89,11 +90,18 @@ fn parse_journal(json: &str) -> Vec<LogLine> {
                 .as_str()
                 .or(v["_COMM"].as_str())?
                 .to_string();
-            let message = v["MESSAGE"]
-                .as_str()?
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
+            let message = match &v["MESSAGE"] {
+                Value::String(m) => m.clone(),
+                Value::Array(bytes) => String::from_utf8_lossy(
+                    &bytes
+                        .iter()
+                        .filter_map(|b| b.as_u64().map(|b| b as u8))
+                        .collect::<Vec<_>>(),
+                )
+                .into_owned(),
+                _ => return None,
+            };
+            let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
             Some(LogLine {
                 time,
                 source,
@@ -101,6 +109,19 @@ fn parse_journal(json: &str) -> Vec<LogLine> {
             })
         })
         .collect()
+}
+
+/// Lines read, or an error when journalctl could only see this user's own journal.
+fn journal_result(out: &str, err: &str) -> Result<Vec<LogLine>, PlatformError> {
+    if err.contains("not seeing messages from other users")
+        || err.contains("insufficient permissions")
+    {
+        return Err(PlatformError::Command(
+            "journalctl can't read the system journal (add yourself to the systemd-journal group)"
+                .into(),
+        ));
+    }
+    Ok(parse_journal(out))
 }
 
 impl Platform for Linux {
@@ -118,7 +139,8 @@ impl Platform for Linux {
         for id in LOG_IDENTIFIERS {
             args.extend(["-t", id]);
         }
-        Ok(parse_journal(&run("journalctl", &args)?))
+        let (out, err) = run_bounded("journalctl", &args, LOG_DEADLINE)?;
+        journal_result(&out, &err)
     }
 
     fn route(&self) -> Result<RouteInfo, PlatformError> {
@@ -677,16 +699,38 @@ mod tests {
         let json = concat!(
             r#"{"__REALTIME_TIMESTAMP":"1793186853000000","SYSLOG_IDENTIFIER":"NetworkManager","MESSAGE":"<info>  device (wlan0): state change"}"#,
             "\n",
-            r#"{"__REALTIME_TIMESTAMP":"1793186854000000","_COMM":"iwd","MESSAGE":[1,2]}"#,
+            r#"{"__REALTIME_TIMESTAMP":"1793186854000000","_COMM":"iwd","MESSAGE":[104,105,255]}"#,
         );
         assert_eq!(
             parse_journal(json),
-            [LogLine {
-                time: "11:27:33".into(),
-                source: "NetworkManager".into(),
-                message: "<info> device (wlan0): state change".into(),
-            }]
+            [
+                LogLine {
+                    time: "11:27:33".into(),
+                    source: "NetworkManager".into(),
+                    message: "<info> device (wlan0): state change".into(),
+                },
+                LogLine {
+                    time: "11:27:34".into(),
+                    source: "iwd".into(),
+                    message: "hi\u{fffd}".into(),
+                }
+            ]
         );
+        assert!(
+            journal_result(
+                "",
+                "Hint: You are currently not seeing messages from other users and the system."
+            )
+            .is_err()
+        );
+        assert!(
+            journal_result(
+                "",
+                "No journal files were opened due to insufficient permissions."
+            )
+            .is_err()
+        );
+        assert_eq!(journal_result("", "").unwrap(), []);
     }
 
     const ROUTE: &str = r#"[{"dst":"default","gateway":"192.168.1.1","dev":"wlp2s0","protocol":"dhcp","prefsrc":"192.168.1.23","metric":600,"flags":[]},{"dst":"default","gateway":"10.0.0.1","dev":"enp3s0","protocol":"dhcp","metric":100,"flags":[]}]"#;
