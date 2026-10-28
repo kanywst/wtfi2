@@ -112,7 +112,9 @@ impl Server {
         let now = self.now.unwrap_or_else(history::now_secs);
         if name == "diagnose_now" {
             // Overlapping sweeps would load the link and skew each other's numbers.
-            let _one_at_a_time = self.sweeping.lock().await;
+            let Ok(_one_at_a_time) = self.sweeping.try_lock() else {
+                return Err("a live sweep is already running; try again in a few seconds".into());
+            };
             let path = engine::run_once_within(engine::SWEEP_DEADLINE).await;
             let mut doc = json::to_value(&path, &diagnose::diagnose(&path));
             if redacting(args) {
@@ -124,15 +126,23 @@ impl Server {
             }
             return Ok(doc.to_string());
         }
-        let file = self
-            .history
-            .as_ref()
-            .ok_or("no history file: set WTFI_HISTORY, XDG_STATE_HOME or HOME")?;
         let window = since(args)?.as_secs();
         let (from, to) = range(args, window, now)?;
         let since = now.saturating_sub(window).min(from);
-        let records = history::load(file, usize::MAX).map_err(|e| e.to_string())?;
-        let sweeps = history::load_sweeps(file, since).map_err(|e| e.to_string())?;
+        // The OS log stands on its own; the recording only adds SSIDs to mask.
+        let log_only = name == "get_os_log";
+        let (records, sweeps) = match &self.history {
+            Some(file) if !log_only => (
+                history::load(file, usize::MAX).map_err(|e| e.to_string())?,
+                history::load_sweeps(file, since).map_err(|e| e.to_string())?,
+            ),
+            Some(file) => (
+                Vec::new(),
+                history::load_sweeps(file, since).unwrap_or_default(),
+            ),
+            None if log_only => (Vec::new(), Vec::new()),
+            None => return Err("no history file: set WTFI_HISTORY, XDG_STATE_HOME or HOME".into()),
+        };
         let all: Vec<&Snapshot> = sweeps.iter().collect();
         let redactor = redacting(args).then(|| Redactor::new(&self.salt, &all));
         let text = |s: String| match &redactor {
@@ -203,7 +213,7 @@ impl Server {
                     .await
                     .map_err(|e| e.to_string())??;
                 if lines.is_empty() {
-                    return Ok("Nothing logged.".into());
+                    return Ok("No matching entries returned.".into());
                 }
                 bundle::log_block(&lines, None, redactor.as_ref())
             }
@@ -284,7 +294,7 @@ fn tools() -> Value {
         },
         {
             "name": "diagnose_now",
-            "description": "Probe the network right now and return the full diagnosis. Takes up to 20 seconds.",
+            "description": "Probe the network right now and return the full diagnosis. Takes up to 20 seconds; one at a time.",
             "inputSchema": { "type": "object", "properties": { "redact": redact } },
             "annotations": { "readOnlyHint": true, "openWorldHint": true },
         },
@@ -337,6 +347,25 @@ mod tests {
             salt: RandomState::new(),
             sweeping: Default::default(),
         }
+    }
+
+    fn none_server() -> Server {
+        Server {
+            history: None,
+            log: Arc::new(log),
+            now: Some(0),
+            salt: RandomState::new(),
+            sweeping: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_live_sweep_is_refused_not_queued() {
+        let s = none_server();
+        let _held = s.sweeping.try_lock().unwrap();
+        let r = call(&s, "diagnose_now", json!({})).await;
+        assert_eq!(r["isError"], true);
+        assert!(text(&r).contains("already running"));
     }
 
     async fn call(s: &Server, name: &str, args: Value) -> Value {
@@ -525,6 +554,8 @@ mod tests {
         assert_eq!(r["isError"], true);
         let r = call(&s, "nope", json!({})).await;
         assert_eq!(r["isError"], true);
+        let r = call(&none_server(), "get_os_log", json!({})).await;
+        assert_ne!(r["isError"], true, "the OS log doesn't need a recording");
         let none = Server {
             history: None,
             log: Arc::new(log),
