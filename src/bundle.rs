@@ -249,11 +249,13 @@ fn timeline(records: &[Record]) -> Vec<String> {
     let mut i = 0;
     while i < records.len() {
         let r = &records[i];
-        let run = records[i..]
-            .iter()
-            .take_while(|o| {
-                o.status == r.status && o.first_break == r.first_break && o.headline == r.headline
-            })
+        let same = |o: &Record| {
+            o.status == r.status && o.first_break == r.first_break && o.headline == r.headline
+        };
+        // A run stops at a recorder gap, so it never spans time nobody measured.
+        let run = 1 + records[i..]
+            .windows(2)
+            .take_while(|w| same(&w[1]) && !is_gap(&w[0], &w[1]))
             .count();
         let tail = if run > 1 {
             format!("  ×{run} until {}", history::utc(records[i + run - 1].ts))
@@ -526,6 +528,7 @@ mod tests {
             wan_loss_pct: None,
             rssi_dbm: None,
             interval_s: interval,
+            partial: false,
         }
     }
 
@@ -567,6 +570,18 @@ mod tests {
         );
         let row = out.lines().find(|l| l.contains("| dns |")).unwrap();
         assert!(!row.contains("2h"), "{row}");
+    }
+
+    #[test]
+    fn a_timeline_run_stops_at_a_recorder_gap() {
+        let r = [
+            rec(0, "fail", Some("dns"), Some(30)),
+            rec(30, "fail", Some("dns"), Some(30)),
+            rec(28_800, "fail", Some("dns"), Some(30)),
+        ];
+        let t = timeline(&r);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(t[0].ends_with("×2 until 1970-01-01 00:00:30Z"), "{}", t[0]);
     }
 
     #[test]
