@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn snapshots_stay_in_order_around_a_resnapshot() {
-        let f = tempfile("order");
+        let f = tempfile("resnapshot-order");
         let mut log = Log::open(f.clone());
         for (ts, status) in [(0, "fail"), (300, "fail"), (600, "fail"), (605, "ok")] {
             log.push(&record(ts, status), Value::Null).unwrap();
