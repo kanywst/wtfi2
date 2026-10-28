@@ -215,7 +215,14 @@ impl Server {
                 if lines.is_empty() {
                     return Ok("No matching entries returned.".into());
                 }
-                bundle::log_block(&lines, None, redactor.as_ref())
+                let block = bundle::log_block(&lines, None, redactor.as_ref());
+                if redactor.is_some() && sweeps.is_empty() {
+                    format!(
+                        "No recorded SSIDs to learn from; only names the log labels as SSIDs or quotes are masked.\n{block}"
+                    )
+                } else {
+                    block
+                }
             }
             "get_bundle" => {
                 let (log, salt) = (self.log.clone(), self.salt.clone());
@@ -333,6 +340,7 @@ mod tests {
                 wan_loss_pct: None,
                 rssi_dbm: None,
                 interval_s: None,
+                partial: false,
             };
             let sweep = json!({ "path": [
                 { "id": "link", "subtitle": "Cafe", "metrics": [{ "label": "BSSID", "value": "00:11:22:33:44:55" }] },
@@ -556,6 +564,11 @@ mod tests {
         assert_eq!(r["isError"], true);
         let r = call(&none_server(), "get_os_log", json!({})).await;
         assert_ne!(r["isError"], true, "the OS log doesn't need a recording");
+        assert!(
+            !text(&r).contains("'Cafe'") && text(&r).contains("No recorded SSIDs"),
+            "{}",
+            text(&r)
+        );
         let none = Server {
             history: None,
             log: Arc::new(log),
