@@ -22,6 +22,10 @@ pub struct Cli {
     #[arg(long = "record")]
     pub record: bool,
 
+    /// With --record: keep sweeping every DURATION (30s, 5m) without the dashboard.
+    #[arg(long = "every", value_name = "DURATION", value_parser = parse_duration, requires = "record", conflicts_with_all = ["watch", "json"])]
+    pub every: Option<std::time::Duration>,
+
     /// Print the newest N recorded sweeps (default 20) instead of probing.
     #[arg(long = "history", value_name = "N", num_args = 0..=1, default_missing_value = "20", conflicts_with_all = ["watch", "record"])]
     pub history: Option<usize>,
@@ -51,8 +55,44 @@ impl Cli {
     }
 }
 
+/// `90`, `90s`, `5m`, `2h` or `1d`.
+pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: u64 = num.parse().map_err(|_| format!("not a duration: {s:?}"))?;
+    let secs = match unit {
+        "" | "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86_400,
+        _ => return Err(format!("unknown unit {unit:?} (use s, m, h or d)")),
+    };
+    if secs == 0 {
+        return Err("must be at least 1s".into());
+    }
+    Ok(std::time::Duration::from_secs(secs))
+}
+
 impl Cli {
     pub fn parse_args() -> Self {
         Cli::parse()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn durations_parse_with_or_without_a_unit() {
+        assert_eq!(parse_duration("90"), Ok(Duration::from_secs(90)));
+        assert_eq!(parse_duration("30s"), Ok(Duration::from_secs(30)));
+        assert_eq!(parse_duration("5m"), Ok(Duration::from_secs(300)));
+        assert_eq!(parse_duration("2h"), Ok(Duration::from_secs(7200)));
+        assert_eq!(parse_duration("1d"), Ok(Duration::from_secs(86_400)));
+        for bad in ["", "m", "0", "5x", "-3", "1.5h"] {
+            assert!(parse_duration(bad).is_err(), "{bad:?} should be rejected");
+        }
     }
 }

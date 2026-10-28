@@ -24,6 +24,9 @@ pub struct Record {
     pub wan_ms: Option<f64>,
     pub wan_loss_pct: Option<f64>,
     pub rssi_dbm: Option<f64>,
+    /// Planned seconds until the next sweep, set by `--every`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_s: Option<u64>,
 }
 
 impl Record {
@@ -38,6 +41,7 @@ impl Record {
             wan_ms: latency(HopId::Wan),
             wan_loss_pct: path.get(HopId::Wan).and_then(|h| h.loss_pct),
             rssi_dbm: path.get(HopId::Link).and_then(rssi_dbm),
+            interval_s: None,
         }
     }
 
@@ -128,23 +132,10 @@ pub fn render(records: &[Record]) -> String {
         return "No recorded sweeps yet. Run `wtfi --record` (or `wtfi -w --record`) to start.\n"
             .into();
     }
-    let ms = |v: Option<f64>| v.map_or("—".into(), |v| format!("{v:.0} ms"));
     let mut out = String::new();
     for r in records {
-        let wan = match r.wan_loss_pct.filter(|l| *l > 0.0) {
-            Some(l) => format!("{} {l:.0}%", ms(r.wan_ms)),
-            None => ms(r.wan_ms),
-        };
-        out.push_str(&format!(
-            "{}  {:<7}  {:<8}  gw {:>7}  wan {:>11}  {:>8}  {}\n",
-            utc(r.ts),
-            r.status,
-            r.first_break.as_deref().unwrap_or("—"),
-            ms(r.gateway_ms),
-            wan,
-            r.rssi_dbm.map_or("—".into(), |v| format!("{v:.0} dBm")),
-            r.headline,
-        ));
+        out.push_str(&line(r));
+        out.push('\n');
     }
     let count = |s: &str| records.iter().filter(|r| r.status == s).count();
     out.push_str(&format!(
@@ -157,8 +148,27 @@ pub fn render(records: &[Record]) -> String {
     out
 }
 
+/// One record as a table row, without the newline.
+pub fn line(r: &Record) -> String {
+    let ms = |v: Option<f64>| v.map_or("—".into(), |v| format!("{v:.0} ms"));
+    let wan = match r.wan_loss_pct.filter(|l| *l > 0.0) {
+        Some(l) => format!("{} {l:.0}%", ms(r.wan_ms)),
+        None => ms(r.wan_ms),
+    };
+    format!(
+        "{}  {:<7}  {:<8}  gw {:>7}  wan {:>11}  {:>8}  {}",
+        utc(r.ts),
+        r.status,
+        r.first_break.as_deref().unwrap_or("—"),
+        ms(r.gateway_ms),
+        wan,
+        r.rssi_dbm.map_or("—".into(), |v| format!("{v:.0} dBm")),
+        r.headline,
+    )
+}
+
 /// `YYYY-MM-DD HH:MM:SSZ` (UTC; local time would need a tz database).
-fn utc(ts: u64) -> String {
+pub fn utc(ts: u64) -> String {
     let (days, secs) = (ts / 86_400, ts % 86_400);
     // Howard Hinnant's days-to-civil.
     let z = days as i64 + 719_468;
@@ -192,6 +202,7 @@ mod tests {
             wan_ms: Some(18.0),
             wan_loss_pct: None,
             rssi_dbm: Some(-52.0),
+            interval_s: None,
         }
     }
 

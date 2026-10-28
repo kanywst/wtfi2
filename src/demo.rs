@@ -256,8 +256,13 @@ pub fn spawn(scenario: Scenario, n: usize) -> mpsc::UnboundedReceiver<Hop> {
 /// Stand-in for [`crate::engine::run_once_within`]: the one-shot report's
 /// path, arriving at the pace a real sweep would.
 pub async fn run_once(scenario: Scenario) -> Path {
+    run_sweep(scenario, 0).await
+}
+
+/// Sweep `n` of `scenario`, settled, for `--every`.
+pub async fn run_sweep(scenario: Scenario, n: usize) -> Path {
     let mut path = skeleton();
-    for (delay, hop) in scenario.sweep(0) {
+    for (delay, hop) in scenario.sweep(n) {
         tokio::time::sleep(delay).await;
         path.upsert(hop);
     }

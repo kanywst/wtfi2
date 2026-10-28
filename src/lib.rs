@@ -14,5 +14,6 @@ pub mod json;
 pub mod model;
 pub mod platform;
 pub mod probe;
+pub mod recorder;
 pub mod render;
 pub mod ui;
