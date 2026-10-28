@@ -290,7 +290,7 @@ pub fn build(
                 continue;
             }
             match log(from, to) {
-                Ok(lines) if lines.is_empty() => out.push_str("Nothing logged.\n"),
+                Ok(lines) if lines.is_empty() => out.push_str("No matching entries returned.\n"),
                 Ok(lines) => out.push_str(&log_block(&lines, Some(e.start), redactor.as_ref())),
                 Err(e) => out.push_str(&format!("Couldn't read the OS log: {e}\n")),
             }
@@ -548,10 +548,20 @@ impl<'a> Redactor<'a> {
                 _ if v == key_end => continue,
                 _ => {
                     let tail = &line[v..];
-                    let end = tail
-                        .find(" BSSID ")
-                        .or_else(|| tail.find([' ', ',', ')', ';']))
-                        .map_or(line.len(), |j| v + j);
+                    // Unquoted names can have spaces, so run to a known field or the line end.
+                    let end = [
+                        " BSSID",
+                        " Security",
+                        " NetworkID",
+                        " channel",
+                        ",",
+                        ";",
+                        ")",
+                    ]
+                    .iter()
+                    .filter_map(|d| tail.find(d))
+                    .min()
+                    .map_or(line.len(), |j| v + j);
                     (v, end)
                 }
             };
@@ -570,23 +580,29 @@ impl<'a> Redactor<'a> {
 
     /// Every `'…'` value, which is how these daemons quote SSIDs and connection names.
     fn quoted(&self, line: &str) -> String {
+        let alnum = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+        let quotes: Vec<usize> = line
+            .char_indices()
+            .filter(|&(i, c)| {
+                c == '\''
+                    && !(alnum(line[..i].chars().next_back())
+                        && alnum(line[i + 1..].chars().next()))
+            })
+            .map(|(i, _)| i)
+            .collect();
         let mut out = String::with_capacity(line.len());
-        let mut rest = line;
-        while let Some(i) = rest.find('\'') {
-            let Some(j) = rest[i + 1..].find('\'') else {
-                break;
-            };
-            let name = &rest[i + 1..i + 1 + j];
-            out.push_str(&rest[..=i]);
+        let mut at = 0;
+        for &[open, close] in quotes.as_chunks::<2>().0 {
+            let name = &line[open + 1..close];
+            out.push_str(&line[at..=open]);
             if name.is_empty() || name.starts_with('<') || name.starts_with("ssid-") {
                 out.push_str(name);
             } else {
                 out.push_str(&self.ssid(name));
             }
-            out.push('\'');
-            rest = &rest[i + j + 2..];
+            at = close;
         }
-        out.push_str(rest);
+        out.push_str(&line[at..]);
         out
     }
 
@@ -837,6 +853,22 @@ mod tests {
         assert!(
             block.contains("event 399\n") && !block.contains("more lines omitted"),
             "{block}"
+        );
+    }
+
+    #[test]
+    fn contractions_dont_throw_off_the_quotes() {
+        let state = RandomState::new();
+        let r = Redactor::new(&state, &[]);
+        let out = r.log_line("12:00:00 NetworkManager: device 'wlan0' couldn't activate 'Foo Bar'");
+        assert!(
+            out.contains("couldn't activate 'ssid-") && !out.contains("Foo Bar"),
+            "{out}"
+        );
+        let out = r.log_line("en0: SSID Cafe Wifi joined");
+        assert!(
+            !out.contains("Wifi"),
+            "unquoted names run to the line end: {out}"
         );
     }
 
