@@ -30,6 +30,14 @@ pub struct Cli {
     #[arg(long = "history", value_name = "N", num_args = 0..=1, default_missing_value = "20", conflicts_with_all = ["watch", "record"])]
     pub history: Option<usize>,
 
+    /// Print recorded sweeps from the last SINCE (default 24h) as Markdown to paste into an AI agent.
+    #[arg(long = "bundle", value_name = "SINCE", num_args = 0..=1, default_missing_value = "24h", value_parser = parse_duration, conflicts_with_all = ["watch", "record", "history", "json"])]
+    pub bundle: Option<std::time::Duration>,
+
+    /// With --bundle: keep SSIDs, public IPs and portal URLs unmasked.
+    #[arg(long = "no-redact", requires = "bundle")]
+    pub no_redact: bool,
+
     /// Disable ANSI color in the text report.
     #[arg(long = "no-color")]
     pub no_color: bool,

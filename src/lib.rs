@@ -4,6 +4,7 @@
 //! link out to the internet, renders the chain as a topology diagram, and tells
 //! you in one line where the connection died and how to fix it.
 
+pub mod bundle;
 pub mod cli;
 #[cfg(feature = "demo")]
 pub mod demo;

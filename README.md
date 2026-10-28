@@ -138,9 +138,12 @@ wtfi --timeout 5  # give up on the sweep sooner and report what landed
 wtfi --record     # also append this sweep to the history file (works with -w)
 wtfi --history    # the last 20 recorded sweeps (--history 100, --history --json)
 wtfi --record --every 30s  # keep recording in the background, no dashboard
+wtfi --bundle 2h | pbcopy  # the last 2h of recordings as Markdown for an AI agent
 ```
 
 Recording is off unless you pass `--record`. Each finished sweep becomes one JSON line in `$XDG_STATE_HOME/wtfi/history.jsonl` (`~/.local/state/wtfi/history.jsonl` when that is unset, on macOS too; `WTFI_HISTORY` overrides the path). `wtfi -w --record` also starts its latency sparklines from the last recorded sweeps, so a dead zone you walked through yesterday is still on the graph today. The file trims itself to its newer half past 4 MiB. Next to it, `sweeps.jsonl` keeps the full `--json` document for the sweeps on either side of every change of state, and one every 10 minutes while the network stays broken (not merely degraded) (trimmed past 16 MiB).
+
+`--bundle` turns what was recorded into one Markdown document you can paste into Claude, ChatGPT or any other agent once you are back online: the outage episodes, gaps where the recorder wasn't running, latency percentiles, a collapsed timeline, the full sweeps around each change, and a closing request for a root-cause analysis. It defaults to the last 24 hours. SSIDs, public IPs, IPv6 host bits, MAC addresses and portal query strings are masked unless you pass `--no-redact`.
 
 `--every` keeps sweeping without the dashboard, so you can leave it running and look at what happened after the connection comes back. While the network is broken it re-probes as often as every 5 seconds (a sweep on a broken network can itself take up to `--timeout`), so the edges of an outage land close to when they happened. To start it at login, use [`contrib/dev.kanywst.wtfi.plist`](contrib/dev.kanywst.wtfi.plist) (launchd, copy to `~/Library/LaunchAgents/` and `launchctl load` it) or [`contrib/wtfi-record.service`](contrib/wtfi-record.service) (systemd, `systemctl --user enable --now`). Fix the binary path in either file first.
 

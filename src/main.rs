@@ -1,7 +1,7 @@
 use color_eyre::Result;
 use std::io::IsTerminal;
 use wtfi2::cli::Cli;
-use wtfi2::{diagnose, engine, history, json, platform, recorder, render, ui};
+use wtfi2::{bundle, diagnose, engine, history, json, platform, recorder, render, ui};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,6 +18,21 @@ async fn main() -> Result<()> {
         } else {
             print!("{}", history::render(&records));
         }
+        return Ok(());
+    }
+    if let Some(since) = cli.bundle {
+        let since = now_secs().saturating_sub(since.as_secs());
+        let (records, sweeps) = match history::default_path() {
+            Some(file) => (
+                history::load(&file, usize::MAX)?,
+                history::load_sweeps(&file, since)?,
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        print!(
+            "{}",
+            bundle::build(&records, &sweeps, since, !cli.no_redact)
+        );
         return Ok(());
     }
     let record_to = cli.record.then(history::default_path).flatten();
@@ -131,4 +146,10 @@ async fn sweep(
 #[cfg(not(feature = "demo"))]
 async fn sweep(_: Option<()>, _: usize, deadline: std::time::Duration) -> wtfi2::model::Path {
     engine::run_once_within(deadline).await
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
