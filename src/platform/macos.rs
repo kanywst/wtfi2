@@ -92,7 +92,9 @@ fn parse_log(ndjson: &str) -> Vec<LogLine> {
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .filter_map(|v| {
-            let ts = crate::history::parse_utc(v["timestamp"].as_str()?)?;
+            let stamp = v["timestamp"].as_str()?;
+            // Anything but UTC means --timezone was ignored; better unread than shifted.
+            let ts = crate::history::parse_utc(stamp.ends_with("+0000").then_some(stamp)?)?;
             let message = v["eventMessage"]
                 .as_str()?
                 .split_whitespace()
@@ -542,6 +544,11 @@ mod tests {
             }]
         );
         assert_eq!(log_stamp(0), "1970-01-01 00:00:00+0000");
+        let local = r#"{"timestamp":"2026-10-28 20:27:33.9+0900","processImagePath":"/usr/libexec/configd","eventMessage":"x"}"#;
+        assert!(
+            parse_log(local).is_empty(),
+            "a non-UTC stamp is dropped, not shifted"
+        );
     }
 
     const ROUTE: &str = "   route to: default
