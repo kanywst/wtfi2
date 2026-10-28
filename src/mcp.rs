@@ -128,9 +128,9 @@ impl Server {
             .history
             .as_ref()
             .ok_or("no history file: set WTFI_HISTORY, XDG_STATE_HOME or HOME")?;
-        let since = now.saturating_sub(since(args)?.as_secs());
-        let (from, to) = range(args, since, now)?;
-        let since = since.min(from);
+        let window = since(args)?.as_secs();
+        let (from, to) = range(args, window, now)?;
+        let since = now.saturating_sub(window).min(from);
         let records = history::load(file, usize::MAX).map_err(|e| e.to_string())?;
         let sweeps = history::load_sweeps(file, since).map_err(|e| e.to_string())?;
         let all: Vec<&Snapshot> = sweeps.iter().collect();
@@ -187,9 +187,11 @@ impl Server {
                 json!({ "omitted_older": skip, "sweeps": picked }).to_string()
             }
             "get_os_log" => {
-                let from = args["from_ts"]
-                    .as_u64()
-                    .unwrap_or(to.saturating_sub(LOG_DEFAULT_SECS));
+                let from = match (args["from_ts"].as_u64(), args["since"].is_string()) {
+                    (Some(from), _) => from,
+                    (None, true) => from,
+                    (None, false) => to.saturating_sub(LOG_DEFAULT_SECS),
+                };
                 if to.saturating_sub(from) > LOG_MAX_SECS {
                     return Err(format!(
                         "ask for at most {}h of log at a time",
@@ -228,9 +230,12 @@ fn since(args: &Value) -> Result<Duration, String> {
     crate::cli::parse_duration(args["since"].as_str().unwrap_or("24h"))
 }
 
-fn range(args: &Value, since: u64, now: u64) -> Result<(u64, u64), String> {
-    let from = args["from_ts"].as_u64().unwrap_or(since);
+/// `to_ts` defaults to now, `from_ts` to `since` before `to_ts`.
+fn range(args: &Value, window: u64, now: u64) -> Result<(u64, u64), String> {
     let to = args["to_ts"].as_u64().unwrap_or(now);
+    let from = args["from_ts"]
+        .as_u64()
+        .unwrap_or(to.saturating_sub(window));
     if from > to {
         return Err("from_ts is after to_ts".into());
     }
@@ -267,7 +272,7 @@ fn tools() -> Value {
         },
         {
             "name": "get_os_log",
-            "description": "Wi-Fi, DHCP, interface and DNS events from the OS log (log show on macOS, journalctl on Linux). Defaults to the 15 minutes before to_ts; at most 2h per call.",
+            "description": "Wi-Fi, DHCP, interface and DNS events from the OS log (log show on macOS, journalctl on Linux). Covers `since` (or 15 minutes) before to_ts; at most 2h per call.",
             "inputSchema": { "type": "object", "properties": { "since": since, "from_ts": from, "to_ts": to, "redact": redact } },
             "annotations": { "readOnlyHint": true },
         },
@@ -294,7 +299,7 @@ mod tests {
 
     fn log(from: u64, to: u64) -> Result<Vec<LogLine>, String> {
         Ok(vec![LogLine {
-            time: "00:00:00".into(),
+            ts: 0,
             source: "configd".into(),
             message: format!(
                 "window {from}-{to} SSID 'Cafe' BSSID 00:11:22:33:44:55 via 93.184.215.14"
@@ -441,6 +446,28 @@ mod tests {
         )
         .await;
         assert!(text(&raw).contains("'Cafe'"));
+    }
+
+    #[tokio::test]
+    async fn to_ts_alone_reads_back_from_there() {
+        let mut s = server("to-only");
+        s.now = Some(1030 + 7 * 86_400);
+        let r = call(&s, "get_sweeps", json!({ "to_ts": 1015 })).await;
+        assert_ne!(r["isError"], true, "{r}");
+        let v: Value = serde_json::from_str(text(&r)).unwrap();
+        assert_eq!(v["sweeps"].as_array().unwrap().len(), 2, "{v}");
+        let r = call(&s, "get_os_log", json!({ "to_ts": 1015 })).await;
+        assert!(text(&r).contains("window 115-1015"), "{}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn get_os_log_honours_since() {
+        let mut s = server("os-since");
+        s.now = Some(100_000);
+        let r = call(&s, "get_os_log", json!({ "since": "30m" })).await;
+        assert!(text(&r).contains("window 98200-100000"), "{}", text(&r));
+        let r = call(&s, "get_os_log", json!({ "since": "1d" })).await;
+        assert_eq!(r["isError"], true);
     }
 
     #[tokio::test]
