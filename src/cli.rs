@@ -60,13 +60,14 @@ pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
     let s = s.trim();
     let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
     let n: u64 = num.parse().map_err(|_| format!("not a duration: {s:?}"))?;
-    let secs = match unit {
-        "" | "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        "d" => n * 86_400,
+    let scale = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
         _ => return Err(format!("unknown unit {unit:?} (use s, m, h or d)")),
     };
+    let secs = n.checked_mul(scale).ok_or("too long")?;
     if secs == 0 {
         return Err("must be at least 1s".into());
     }
@@ -91,7 +92,16 @@ mod tests {
         assert_eq!(parse_duration("5m"), Ok(Duration::from_secs(300)));
         assert_eq!(parse_duration("2h"), Ok(Duration::from_secs(7200)));
         assert_eq!(parse_duration("1d"), Ok(Duration::from_secs(86_400)));
-        for bad in ["", "m", "0", "5x", "-3", "1.5h"] {
+        for bad in [
+            "",
+            "m",
+            "0",
+            "5x",
+            "-3",
+            "1.5h",
+            "999999999999999d",
+            "99999999999999999999",
+        ] {
             assert!(parse_duration(bad).is_err(), "{bad:?} should be rejected");
         }
     }
