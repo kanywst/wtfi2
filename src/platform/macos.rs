@@ -92,7 +92,7 @@ fn parse_log(ndjson: &str) -> Vec<LogLine> {
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .filter_map(|v| {
-            let time = v["timestamp"].as_str()?.get(11..19)?.to_string();
+            let ts = crate::history::parse_utc(v["timestamp"].as_str()?)?;
             let message = v["eventMessage"]
                 .as_str()?
                 .split_whitespace()
@@ -104,7 +104,7 @@ fn parse_log(ndjson: &str) -> Vec<LogLine> {
                 .next()?
                 .to_string();
             Some(LogLine {
-                time,
+                ts,
                 source,
                 message,
             })
@@ -132,6 +132,11 @@ impl Platform for MacOs {
         let lines = parse_log(&out);
         if lines.is_empty() && !err.trim().is_empty() {
             return Err(PlatformError::Command(format!("log: {}", err.trim())));
+        }
+        if lines.is_empty() && out.contains("\"eventMessage\"") {
+            return Err(PlatformError::Parse(
+                "log printed entries wtfi couldn't read".into(),
+            ));
         }
         Ok(lines)
     }
@@ -531,7 +536,7 @@ mod tests {
         assert_eq!(
             parse_log(ndjson),
             [LogLine {
-                time: "11:27:33".into(),
+                ts: 1_793_186_853,
                 source: "configd".into(),
                 message: "DHCP en0: status = 'media inactive'".into(),
             }]

@@ -168,8 +168,8 @@ pub struct VpnInfo {
 /// One line from the OS's network log.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogLine {
-    /// `HH:MM:SS`, UTC.
-    pub time: String,
+    /// Unix seconds.
+    pub ts: u64,
     pub source: String,
     pub message: String,
 }

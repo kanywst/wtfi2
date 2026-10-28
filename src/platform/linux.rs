@@ -83,9 +83,7 @@ fn parse_journal(json: &str) -> Vec<LogLine> {
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .filter_map(|v| {
             let micros: u64 = v["__REALTIME_TIMESTAMP"].as_str()?.parse().ok()?;
-            let time = crate::history::utc(micros / 1_000_000)
-                .get(11..19)?
-                .to_string();
+            let ts = micros / 1_000_000;
             let source = v["SYSLOG_IDENTIFIER"]
                 .as_str()
                 .or(v["_COMM"].as_str())?
@@ -103,7 +101,7 @@ fn parse_journal(json: &str) -> Vec<LogLine> {
             };
             let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
             Some(LogLine {
-                time,
+                ts,
                 source,
                 message,
             })
@@ -121,7 +119,13 @@ fn journal_result(out: &str, err: &str) -> Result<Vec<LogLine>, PlatformError> {
                 .into(),
         ));
     }
-    Ok(parse_journal(out))
+    let lines = parse_journal(out);
+    if lines.is_empty() && out.contains("\"__REALTIME_TIMESTAMP\"") {
+        return Err(PlatformError::Parse(
+            "journalctl printed entries wtfi couldn't read".into(),
+        ));
+    }
+    Ok(lines)
 }
 
 impl Platform for Linux {
@@ -705,12 +709,12 @@ mod tests {
             parse_journal(json),
             [
                 LogLine {
-                    time: "11:27:33".into(),
+                    ts: 1_793_186_853,
                     source: "NetworkManager".into(),
                     message: "<info> device (wlan0): state change".into(),
                 },
                 LogLine {
-                    time: "11:27:34".into(),
+                    ts: 1_793_186_854,
                     source: "iwd".into(),
                     message: "hi\u{fffd}".into(),
                 }
@@ -731,6 +735,10 @@ mod tests {
             .is_err()
         );
         assert_eq!(journal_result("", "").unwrap(), []);
+        assert!(
+            journal_result(r#"{"__REALTIME_TIMESTAMP":"x"}"#, "").is_err(),
+            "unreadable entries aren't silence"
+        );
     }
 
     const ROUTE: &str = r#"[{"dst":"default","gateway":"192.168.1.1","dev":"wlp2s0","protocol":"dhcp","prefsrc":"192.168.1.23","metric":600,"flags":[]},{"dst":"default","gateway":"10.0.0.1","dev":"enp3s0","protocol":"dhcp","metric":100,"flags":[]}]"#;

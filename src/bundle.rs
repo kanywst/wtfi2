@@ -15,7 +15,7 @@ const LOG_MAX_SECS: u64 = 720;
 const LOG_MAX_LINES: usize = 150;
 /// Lines kept from before an episode began; the rest of the budget goes after it.
 const LOG_LEAD_LINES: usize = 30;
-/// Total time `--bundle` spends reading OS logs.
+/// No new OS log read starts once `--bundle` has spent this long on them.
 const LOG_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 /// A recorder that planned to sweep in N seconds but didn't within N+60 wasn't running.
 const GAP_SLACK_SECS: u64 = 60;
@@ -289,10 +289,9 @@ pub fn build(
                 out.push_str("Skipped: reading the OS log was taking too long.\n");
                 continue;
             }
-            let focus = history::utc(e.start);
             match log(from, to) {
                 Ok(lines) if lines.is_empty() => out.push_str("Nothing logged.\n"),
-                Ok(lines) => out.push_str(&log_block(&lines, focus.get(11..19), redactor.as_ref())),
+                Ok(lines) => out.push_str(&log_block(&lines, Some(e.start), redactor.as_ref())),
                 Err(e) => out.push_str(&format!("Couldn't read the OS log: {e}\n")),
             }
         }
@@ -306,13 +305,10 @@ pub fn build(
 }
 
 /// A fenced block of collapsed, capped and (when asked) masked log lines.
-/// `focus` (`HH:MM:SS`) keeps the cap centred on when an episode began.
-pub fn log_block(lines: &[LogLine], focus: Option<&str>, redactor: Option<&Redactor>) -> String {
+/// `focus` keeps the cap centred on when an episode began.
+pub fn log_block(lines: &[LogLine], focus: Option<u64>, redactor: Option<&Redactor>) -> String {
     let at = focus.map_or(0, |t| {
-        lines
-            .iter()
-            .position(|l| l.time.as_str() >= t)
-            .unwrap_or(lines.len())
+        lines.iter().position(|l| l.ts >= t).unwrap_or(lines.len())
     });
     let (before, after) = (collapse(&lines[..at]), collapse(&lines[at..]));
     let lead = &before[before
@@ -356,7 +352,13 @@ fn collapse(lines: &[LogLine]) -> Vec<String> {
         } else {
             String::new()
         };
-        out.push(format!("{} {}: {}{tail}", l.time, l.source, l.message));
+        let time = history::utc(l.ts);
+        out.push(format!(
+            "{} {}: {}{tail}",
+            &time[11..19],
+            l.source,
+            l.message
+        ));
         i += run;
     }
     out
@@ -740,9 +742,9 @@ mod tests {
         Ok(Vec::new())
     }
 
-    fn line(time: &str, message: &str) -> LogLine {
+    fn line(ts: u64, message: &str) -> LogLine {
         LogLine {
-            time: time.into(),
+            ts,
             source: "configd".into(),
             message: message.into(),
         }
@@ -760,16 +762,16 @@ mod tests {
             asked.borrow_mut().push((from, to));
             Ok(vec![
                 line(
-                    "00:16:48",
+                    1008,
                     "en0: SSID Cafe Wifi BSSID 00:11:22:33:44:55 Security NONE",
                 ),
-                line("00:16:49", "DHCP en0: RENEW"),
-                line("00:16:49", "DHCP en0: RENEW"),
+                line(1009, "DHCP en0: RENEW"),
+                line(1009, "DHCP en0: RENEW"),
                 line(
-                    "00:16:50",
+                    1010,
                     "DNS 203.0.113.9 failed, 9.9.9.9 ok, router 192.168.1.1",
                 ),
-                line("00:16:51", "server 93.184.215.14 unreachable"),
+                line(1011, "server 93.184.215.14 unreachable"),
             ])
         };
         let out = build(&r, &[], 0, Some(&RandomState::new()), &log);
@@ -800,9 +802,21 @@ mod tests {
     }
 
     #[test]
+    fn the_focus_holds_across_utc_midnight() {
+        let midnight = 1_793_232_000;
+        let lines: Vec<LogLine> = (0..300)
+            .map(|i| line(midnight - 150 + i, &format!("event {i}")))
+            .collect();
+        let block = log_block(&lines, Some(midnight + 10), None);
+        assert!(block.contains("(130 earlier lines omitted)"), "{block}");
+        assert!(block.contains("23:59:40 configd: event 130\n"), "{block}");
+        assert!(block.contains("00:00:10 configd: event 160\n"), "{block}");
+    }
+
+    #[test]
     fn a_long_log_says_how_much_it_dropped() {
         let lines: Vec<LogLine> = (0..LOG_MAX_LINES + 7)
-            .map(|i| line("00:00:00", &format!("event {i}")))
+            .map(|i| line(0, &format!("event {i}")))
             .collect();
         let block = log_block(&lines, None, None);
         assert!(
@@ -813,15 +827,8 @@ mod tests {
 
     #[test]
     fn the_cap_keeps_the_lines_around_the_break() {
-        let lines: Vec<LogLine> = (0..400)
-            .map(|i| {
-                line(
-                    &format!("00:{:02}:{:02}", i / 60, i % 60),
-                    &format!("event {i}"),
-                )
-            })
-            .collect();
-        let block = log_block(&lines, Some("00:05:00"), None);
+        let lines: Vec<LogLine> = (0..400).map(|i| line(i, &format!("event {i}"))).collect();
+        let block = log_block(&lines, Some(300), None);
         assert!(block.contains("(270 earlier lines omitted)"), "{block}");
         assert!(
             block.contains("event 270\n") && block.contains("event 300\n"),

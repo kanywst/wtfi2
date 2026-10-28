@@ -305,6 +305,21 @@ pub fn line(r: &Record) -> String {
     )
 }
 
+/// Unix seconds for a UTC `YYYY-MM-DD HH:MM:SS` prefix.
+pub fn parse_utc(s: &str) -> Option<u64> {
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let (hh, mm, ss) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    // Howard Hinnant's days-from-civil.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hh * 3600 + mm * 60 + ss).ok()
+}
+
 /// `YYYY-MM-DD HH:MM:SSZ` (UTC; local time would need a tz database).
 pub fn utc(ts: u64) -> String {
     let (days, secs) = (ts / 86_400, ts % 86_400);
@@ -529,6 +544,9 @@ mod tests {
         assert_eq!(utc(0), "1970-01-01 00:00:00Z");
         assert_eq!(utc(951_782_400), "2000-02-29 00:00:00Z");
         assert_eq!(utc(1_792_078_245), "2026-10-15 15:30:45Z");
+        for ts in [0, 951_782_400, 1_792_078_245, 4_102_444_799] {
+            assert_eq!(parse_utc(&utc(ts)), Some(ts));
+        }
     }
 
     #[test]
