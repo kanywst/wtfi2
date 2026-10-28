@@ -2,7 +2,6 @@
 
 use crate::history::{self, Record, Snapshot};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 
 /// Newest full sweeps to include; older ones are counted, not shown.
@@ -78,9 +77,16 @@ pub fn gaps(records: &[Record]) -> Vec<(u64, u64)> {
         .collect()
 }
 
-pub fn build(records: &[Record], sweeps: &[Snapshot], since: u64, redact: bool) -> String {
+/// `redact` salts the masks; pass the same state to get the same tags across calls.
+pub fn build(
+    records: &[Record],
+    sweeps: &[Snapshot],
+    since: u64,
+    redact: Option<&RandomState>,
+) -> String {
     let owned: Vec<Record> = records.iter().filter(|r| r.ts >= since).cloned().collect();
     let sweeps: Vec<&Snapshot> = sweeps.iter().filter(|s| s.ts >= since).collect();
+    let redactor = redact.map(|state| Redactor::new(state, &sweeps));
     let mut out = String::new();
 
     out.push_str("# wtfi network report\n\n");
@@ -100,8 +106,8 @@ pub fn build(records: &[Record], sweeps: &[Snapshot], since: u64, redact: bool) 
         history::utc(last.ts),
         owned.len()
     ));
-    if redact {
-        out.push_str("SSIDs, public IPs, IPv6 host bits, MAC addresses and portal query strings are masked.\n");
+    if redact.is_some() {
+        out.push_str("SSIDs, MAC addresses, public IPv4 addresses other than the probe anchors, this machine's IPv6 addresses and portal query strings are masked.\n");
     }
 
     let eps = episodes(&owned);
@@ -113,7 +119,7 @@ pub fn build(records: &[Record], sweeps: &[Snapshot], since: u64, redact: bool) 
         out.push_str("| --- | --- | --- | --- | --- | --- |\n");
         for e in &eps {
             let duration = match e.end {
-                Some(end) => span(end - e.start),
+                Some(end) => span(end.saturating_sub(e.start)),
                 None => format!("ongoing at {}", history::utc(last.ts)),
             };
             out.push_str(&format!(
@@ -191,6 +197,9 @@ pub fn build(records: &[Record], sweeps: &[Snapshot], since: u64, redact: bool) 
         for s in &sweeps[skip..] {
             let mut sweep = s.sweep.clone();
             prune(&mut sweep);
+            if let Some(r) = &redactor {
+                r.sweep(&mut sweep);
+            }
             out.push_str(&format!(
                 "<sweep at=\"{}\">\n\n```json\n{}\n```\n\n</sweep>\n\n",
                 history::utc(s.ts),
@@ -200,10 +209,9 @@ pub fn build(records: &[Record], sweeps: &[Snapshot], since: u64, redact: bool) 
     }
 
     out.push_str(PROMPT);
-    if redact {
-        Redactor::new(&sweeps).apply(&out)
-    } else {
-        out
+    match redactor {
+        Some(r) => r.text(&out),
+        None => out,
     }
 }
 
@@ -254,16 +262,28 @@ fn prune(v: &mut Value) {
     }
 }
 
-struct Redactor {
-    state: RandomState,
-    swaps: HashMap<String, String>,
+/// Addresses wtfi probes itself; masking them would only hide what was measured.
+const ANCHORS: [&str; 6] = [
+    "1.1.1.1",
+    "1.0.0.1",
+    "8.8.8.8",
+    "8.8.4.4",
+    "9.9.9.9",
+    "149.112.112.112",
+];
+
+pub struct Redactor<'a> {
+    state: &'a RandomState,
+    ssids: Vec<String>,
+    swaps: Vec<(String, String)>,
 }
 
-impl Redactor {
-    fn new(sweeps: &[&Snapshot]) -> Self {
+impl<'a> Redactor<'a> {
+    pub fn new(state: &'a RandomState, sweeps: &[&Snapshot]) -> Self {
         let mut r = Redactor {
-            state: RandomState::new(),
-            swaps: HashMap::new(),
+            state,
+            ssids: Vec::new(),
+            swaps: Vec::new(),
         };
         for s in sweeps {
             let Some(hops) = s.sweep["path"].as_array() else {
@@ -277,38 +297,69 @@ impl Redactor {
                 if h["id"] == "link"
                     && let Some(ssid) = h["subtitle"].as_str()
                     && Some(ssid) != iface
+                    && !r.ssids.iter().any(|s| s == ssid)
                 {
-                    let tag = format!("ssid-{}", r.tag(ssid));
-                    r.swaps.insert(ssid.into(), tag);
+                    r.ssids.push(ssid.into());
                 }
-                if let Some(ip) = metric(h, "Public IP") {
-                    r.swaps.insert(ip.into(), mask_ip(ip));
-                }
-                if let Some(ip) = metric(h, "IPv6") {
-                    r.swaps.insert(ip.into(), mask_ip(ip));
-                }
-                if let Some(url) = metric(h, "Portal")
-                    && let Some((base, _)) = url.split_once('?')
-                {
-                    r.swaps.insert(url.into(), format!("{base}?…"));
+                for m in h["metrics"].as_array().into_iter().flatten() {
+                    let Some(value) = m["value"].as_str() else {
+                        continue;
+                    };
+                    let masked = match m["label"].as_str() {
+                        Some("IPv6" | "Public IP" | "Tunnel IP") => mask_ip(value),
+                        Some("Portal") => match value.split_once('?') {
+                            Some((base, _)) => format!("{base}?…"),
+                            None => continue,
+                        },
+                        _ => continue,
+                    };
+                    if !r.swaps.iter().any(|(k, _)| k == value) {
+                        r.swaps.push((value.into(), masked));
+                    }
                 }
             }
         }
+        r.swaps.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
         r
+    }
+
+    /// Mask a sweep in place: its SSID field, then every string in it.
+    pub fn sweep(&self, v: &mut Value) {
+        if let Some(hops) = v["path"].as_array_mut() {
+            for h in hops.iter_mut().filter(|h| h["id"] == "link") {
+                let ssid = h["subtitle"].as_str().map(str::to_string);
+                if let Some(ssid) = ssid.filter(|s| self.ssids.contains(s)) {
+                    h["subtitle"] = self.ssid(&ssid).into();
+                }
+            }
+        }
+        self.strings(v);
+    }
+
+    fn strings(&self, v: &mut Value) {
+        match v {
+            Value::String(s) => *s = self.text(s),
+            Value::Array(a) => a.iter_mut().for_each(|x| self.strings(x)),
+            Value::Object(m) => m.values_mut().for_each(|x| self.strings(x)),
+            _ => {}
+        }
+    }
+
+    /// Learned addresses and portal URLs, other public IPv4s, and MACs.
+    pub fn text(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for (k, v) in &self.swaps {
+            out = out.replace(k.as_str(), v);
+        }
+        self.macs(&mask_public_v4(&out))
+    }
+
+    fn ssid(&self, name: &str) -> String {
+        format!("ssid-{}", self.tag(name))
     }
 
     fn tag(&self, s: &str) -> String {
         format!("{:04x}", self.state.hash_one(s) & 0xffff)
-    }
-
-    fn apply(&self, text: &str) -> String {
-        let mut keys: Vec<&String> = self.swaps.keys().collect();
-        keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
-        let mut out = text.to_string();
-        for k in keys {
-            out = out.replace(k.as_str(), &self.swaps[k]);
-        }
-        self.macs(&out)
     }
 
     fn macs(&self, text: &str) -> String {
@@ -316,7 +367,11 @@ impl Redactor {
         let mut rest = text;
         while let Some((i, mac)) = find_mac(rest) {
             out.push_str(&rest[..i]);
-            out.push_str(&format!("mac-{}", self.tag(&mac.to_ascii_lowercase())));
+            let canonical: Vec<String> = mac
+                .split([':', '-'])
+                .map(|g| format!("{:0>2}", g.to_ascii_lowercase()))
+                .collect();
+            out.push_str(&format!("mac-{}", self.tag(&canonical.join(":"))));
             rest = &rest[i + mac.len()..];
         }
         out.push_str(rest);
@@ -348,19 +403,71 @@ fn mask_ip(ip: &str) -> String {
     }
 }
 
-/// The first `aa:bb:cc:dd:ee:ff` (any case, `:` or `-`) and where it starts.
+fn mask_public_v4(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(|c: char| c.is_ascii_digit()) {
+        let len = rest[i..]
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len() - i);
+        let token = &rest[i..i + len];
+        let end = token.match_indices('.').nth(3).map_or(len, |(j, _)| j);
+        let addr = &token[..end];
+        out.push_str(&rest[..i]);
+        match addr.parse::<std::net::Ipv4Addr>() {
+            Ok(ip) if is_public(ip) && !ANCHORS.contains(&addr) => {
+                out.push_str(&mask_ip(addr));
+                out.push_str(&token[end..]);
+            }
+            _ => out.push_str(token),
+        }
+        rest = &rest[i + len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn is_public(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_documentation()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || o[0] == 100 && (64..128).contains(&o[1]))
+}
+
+/// The first MAC address (`:` or `-`, leading zeros optional) and where it starts.
 fn find_mac(text: &str) -> Option<(usize, &str)> {
     let b = text.as_bytes();
-    (0..b.len().saturating_sub(16)).find_map(|i| {
-        let w = &b[i..i + 17];
-        let sep = w[2];
-        let ok = (sep == b':' || sep == b'-')
-            && (0..6).all(|g| w[g * 3].is_ascii_hexdigit() && w[g * 3 + 1].is_ascii_hexdigit())
-            && (0..5).all(|g| w[g * 3 + 2] == sep)
-            && (i == 0 || !b[i - 1].is_ascii_hexdigit() && b[i - 1] != sep)
-            && b.get(i + 17)
-                .is_none_or(|c| !c.is_ascii_hexdigit() && *c != sep);
-        ok.then(|| (i, &text[i..i + 17]))
+    let hex = |i: usize| b.get(i).is_some_and(u8::is_ascii_hexdigit);
+    (0..b.len()).find_map(|start| {
+        if !hex(start) || start > 0 && (hex(start - 1) || matches!(b[start - 1], b':' | b'-')) {
+            return None;
+        }
+        let mut i = start;
+        let mut sep = None;
+        for g in 0..6 {
+            let n = (i..i + 3).take_while(|&j| hex(j)).count();
+            if !(1..=2).contains(&n) {
+                return None;
+            }
+            i += n;
+            if g < 5 {
+                let s = *b.get(i)?;
+                if !matches!(s, b':' | b'-') || sep.is_some_and(|p| p != s) {
+                    return None;
+                }
+                sep = Some(s);
+                i += 1;
+            }
+        }
+        let clean_end = b
+            .get(i)
+            .is_none_or(|c| !c.is_ascii_hexdigit() && Some(*c) != sep);
+        clean_end.then(|| (start, &text[start..i]))
     })
 }
 
@@ -456,9 +563,38 @@ mod tests {
             find_mac("aa-bb-cc-dd-ee-ff"),
             Some((0, "aa-bb-cc-dd-ee-ff"))
         );
-        assert_eq!(find_mac("fe80::1:2:3:4:5"), None);
-        assert_eq!(find_mac("0a4:83:e7:12:34:56"), None);
-        assert_eq!(find_mac("12:34:56"), None);
+        assert_eq!(
+            find_mac("bssid a4:83:e7:2:34:56,"),
+            Some((6, "a4:83:e7:2:34:56"))
+        );
+        for none in [
+            "fe80::1:2:3:4:5",
+            "0a4:83:e7:12:34:56",
+            "12:34:56",
+            "2026-10-28 11:27:33",
+            "aa:bb:cc:dd:ee:ff:00",
+            "a:b:c:d:e-f",
+        ] {
+            assert_eq!(find_mac(none), None, "{none}");
+        }
+        assert_eq!(
+            find_mac("あaa:bb:cc:dd:ee:ffい"),
+            Some((3, "aa:bb:cc:dd:ee:ff"))
+        );
+    }
+
+    #[test]
+    fn public_ipv4_is_masked_but_anchors_and_private_ranges_are_not() {
+        assert_eq!(
+            mask_public_v4(
+                "hop 3 93.184.215.14 · dst 93.184.215.14.53 ok, 8.8.8.8 and 10.0.0.1, 100.64.1.1."
+            ),
+            "hop 3 93.184.215.x · dst 93.184.215.x.53 ok, 8.8.8.8 and 10.0.0.1, 100.64.1.1."
+        );
+        assert_eq!(
+            mask_public_v4("v1.2 at 日本93.184.215.14語"),
+            "v1.2 at 日本93.184.215.x語"
+        );
     }
 
     fn sweep_with(ssid: &str, public: &str, portal: &str) -> Snapshot {
@@ -469,52 +605,106 @@ mod tests {
                 "path": [
                     { "id": "host", "metrics": [
                         { "label": "Interface", "value": "en0" },
+                        { "label": "IPv6", "value": "2001:db8:1:2::1" },
                         { "label": "IPv6", "value": "2001:db8:1:2:aaaa:bbbb:cccc:dddd" }
                     ]},
                     { "id": "link", "subtitle": ssid, "metrics": [] },
-                    { "id": "wan", "metrics": [{ "label": "Public IP", "value": public }] },
+                    { "id": "uplink", "metrics": [{ "label": "hop 3", "value": "93.184.215.14 · 12 ms" }] },
+                    { "id": "wan", "subtitle": "1.1.1.1 (Cloudflare)", "metrics": [{ "label": "Public IP", "value": public }] },
+                    { "id": "vpn", "metrics": [{ "label": "Tunnel IP", "value": "2606:4700:110:8::5" }] },
                     { "id": "captive", "metrics": [{ "label": "Portal", "value": portal }] }
                 ]
             }),
         }
     }
 
-    #[test]
-    fn redaction_masks_identity_but_keeps_shape() {
+    fn redacted(ssid: &str) -> String {
         let s = sweep_with(
-            "Home Net",
+            ssid,
             "198.51.100.77",
             "http://portal.example/login?mac=00:11:22:33:44:55&t=abc",
         );
-        let out = build(&[rec(5, "fail", Some("captive"), None)], &[s], 0, true);
+        build(
+            &[rec(5, "fail", Some("captive"), None)],
+            &[s],
+            0,
+            Some(&RandomState::new()),
+        )
+    }
+
+    #[test]
+    fn redaction_masks_identity_but_keeps_shape() {
+        let out = redacted("Home Net");
         for leak in [
             "Home Net",
             "198.51.100.77",
             "aaaa:bbbb",
+            "2001:db8:1:2::1\"",
+            "110:8::5",
             "00:11:22:33:44:55",
             "t=abc",
+            "93.184.215.14",
         ] {
             assert!(!out.contains(leak), "{leak} leaked:\n{out}");
         }
-        assert!(out.contains("198.51.100.x"));
-        assert!(out.contains("2001:db8:1:2::x"));
-        assert!(out.contains("http://portal.example/login?…"));
-        assert!(out.contains("\"subtitle\":\"ssid-"));
+        for kept in [
+            "198.51.100.x",
+            "2001:db8:1:2::x",
+            "2606:4700:110:8::x",
+            "http://portal.example/login?…",
+            "\"subtitle\":\"ssid-",
+            "93.184.215.x",
+            "1.1.1.1 (Cloudflare)",
+        ] {
+            assert!(out.contains(kept), "{kept} missing:\n{out}");
+        }
+    }
+
+    #[test]
+    fn awkward_ssids_are_masked_without_touching_the_rest() {
+        let out = redacted(r#"Bob's "Home" \ Net"#);
+        assert!(!out.contains("Bob's"), "{out}");
+        let out = redacted("Internet");
+        assert!(out.contains("| Internet RTT (ms) |"), "{out}");
+        assert!(!out.contains("\"subtitle\":\"Internet\""), "{out}");
+        let out = redacted("ok");
+        assert!(out.contains("\"status\":\"fail\""), "{out}");
+    }
+
+    #[test]
+    fn the_same_salt_gives_the_same_tags() {
+        let state = RandomState::new();
+        let s = [sweep_with("Home Net", "198.51.100.77", "x")];
+        let tag = |out: String| out.split("ssid-").nth(1).unwrap()[..4].to_string();
+        let a = build(&[rec(5, "fail", None, None)], &s, 0, Some(&state));
+        let b = build(&[rec(5, "fail", None, None)], &s, 0, Some(&state));
+        assert_eq!(tag(a), tag(b));
     }
 
     #[test]
     fn an_interface_name_is_not_mistaken_for_an_ssid() {
         let mut s = sweep_with("en0", "198.51.100.77", "x");
         s.sweep["path"][1]["subtitle"] = "en0".into();
-        let out = build(&[rec(5, "ok", None, None)], &[s], 0, true);
+        let out = build(
+            &[rec(5, "ok", None, None)],
+            &[s],
+            0,
+            Some(&RandomState::new()),
+        );
         assert!(out.contains("\"subtitle\":\"en0\""));
     }
 
     #[test]
     fn no_redact_leaves_everything() {
         let s = sweep_with("Home Net", "198.51.100.77", "x");
-        let out = build(&[rec(5, "fail", None, None)], &[s], 0, false);
+        let out = build(&[rec(5, "fail", None, None)], &[s], 0, None);
         assert!(out.contains("Home Net") && out.contains("198.51.100.77"));
+    }
+
+    #[test]
+    fn timestamps_going_backwards_dont_panic() {
+        let r = [rec(100, "fail", None, None), rec(90, "ok", None, None)];
+        assert!(build(&r, &[], 0, None).contains("| 0s |"));
     }
 
     #[test]
@@ -523,13 +713,13 @@ mod tests {
             rec(0, "fail", Some("dns"), None),
             rec(100, "ok", None, None),
         ];
-        let out = build(&r, &[], 50, true);
+        let out = build(&r, &[], 50, Some(&RandomState::new()));
         assert!(
             !out.contains("## Episodes\n\n|"),
             "the old outage is outside the window"
         );
         assert!(out.trim_end().ends_with("what is still open."));
-        let empty = build(&r, &[], 500, true);
+        let empty = build(&r, &[], 500, Some(&RandomState::new()));
         assert!(empty.contains("No sweeps were recorded"));
     }
 }

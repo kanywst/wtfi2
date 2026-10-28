@@ -29,9 +29,10 @@ async fn main() -> Result<()> {
             ),
             None => (Vec::new(), Vec::new()),
         };
+        let redact = (!cli.no_redact).then(std::hash::RandomState::new);
         print!(
             "{}",
-            bundle::build(&records, &sweeps, since, !cli.no_redact)
+            bundle::build(&records, &sweeps, since, redact.as_ref())
         );
         return Ok(());
     }
