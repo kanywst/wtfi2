@@ -18,6 +18,10 @@ pub struct Episode {
     pub start: u64,
     /// The first healthy sweep after it, if there was one.
     pub end: Option<u64>,
+    /// The last unhealthy sweep in it.
+    pub last: u64,
+    /// The recorder stopped before it ended, so its true length is unknown.
+    pub cut: bool,
     pub worst: String,
     pub first_break: Option<String>,
     pub headline: String,
@@ -27,18 +31,30 @@ pub struct Episode {
 pub fn episodes(records: &[Record]) -> Vec<Episode> {
     let mut out: Vec<Episode> = Vec::new();
     let mut open = false;
+    let mut prev: Option<&Record> = None;
     for r in records {
-        if r.status == "ok" {
-            if open {
-                out.last_mut().unwrap().end = Some(r.ts);
-                open = false;
+        if open && prev.is_some_and(|p| is_gap(p, r)) {
+            out.last_mut().unwrap().cut = true;
+            open = false;
+        }
+        prev = Some(r);
+        match r.status.as_str() {
+            "ok" => {
+                if open {
+                    out.last_mut().unwrap().end = Some(r.ts);
+                    open = false;
+                }
+                continue;
             }
-            continue;
+            "warn" | "fail" => {}
+            _ => continue,
         }
         if !open {
             out.push(Episode {
                 start: r.ts,
                 end: None,
+                last: r.ts,
+                cut: false,
                 worst: r.status.clone(),
                 first_break: r.first_break.clone(),
                 headline: r.headline.clone(),
@@ -48,6 +64,7 @@ pub fn episodes(records: &[Record]) -> Vec<Episode> {
         }
         let e = out.last_mut().unwrap();
         e.sweeps += 1;
+        e.last = r.ts;
         if rank(&r.status) > rank(&e.worst) {
             e.worst = r.status.clone();
             e.first_break = r.first_break.clone();
@@ -70,11 +87,14 @@ fn rank(status: &str) -> u8 {
 pub fn gaps(records: &[Record]) -> Vec<(u64, u64)> {
     records
         .windows(2)
-        .filter_map(|w| {
-            let planned = w[0].interval_s?;
-            (w[1].ts > w[0].ts + planned + GAP_SLACK_SECS).then_some((w[0].ts, w[1].ts))
-        })
+        .filter(|w| is_gap(&w[0], &w[1]))
+        .map(|w| (w[0].ts, w[1].ts))
         .collect()
+}
+
+fn is_gap(a: &Record, b: &Record) -> bool {
+    a.interval_s
+        .is_some_and(|planned| b.ts > a.ts + planned + GAP_SLACK_SECS)
 }
 
 /// `redact` salts the masks; pass the same state to get the same tags across calls.
@@ -120,6 +140,10 @@ pub fn build(
         for e in &eps {
             let duration = match e.end {
                 Some(end) => span(end.saturating_sub(e.start)),
+                None if e.cut => format!(
+                    "at least {}, then the recorder stopped",
+                    span(e.last.saturating_sub(e.start))
+                ),
                 None => format!("ongoing at {}", history::utc(last.ts)),
             };
             out.push_str(&format!(
@@ -150,19 +174,24 @@ pub fn build(
     }
 
     out.push_str("\n## Latency and signal\n\n");
-    out.push_str("| Metric | Samples | p50 | p95 | Max |\n| --- | --- | --- | --- | --- |\n");
-    let rows: [(&str, Field); 4] = [
-        ("Gateway RTT (ms)", |r| r.gateway_ms),
-        ("Internet RTT (ms)", |r| r.wan_ms),
-        ("Internet loss (%)", |r| r.wan_loss_pct),
-        ("Wi-Fi RSSI (dBm)", |r| r.rssi_dbm),
+    out.push_str(
+        "| Metric | Samples | p50 | Worst 5% | Worst |\n| --- | --- | --- | --- | --- |\n",
+    );
+    let rows: [(&str, Field, bool); 4] = [
+        ("Gateway RTT (ms)", |r| r.gateway_ms, true),
+        ("Internet RTT (ms)", |r| r.wan_ms, true),
+        ("Internet loss (%)", |r| r.wan_loss_pct, true),
+        ("Wi-Fi RSSI (dBm)", |r| r.rssi_dbm, false),
     ];
-    for (label, get) in rows {
+    for (label, get, higher_is_worse) in rows {
         let mut v: Vec<f64> = owned.iter().filter_map(get).collect();
         v.sort_by(f64::total_cmp);
+        if !higher_is_worse {
+            v.reverse();
+        }
         match (pct(&v, 50.0), pct(&v, 95.0), v.last()) {
-            (Some(p50), Some(p95), Some(max)) => out.push_str(&format!(
-                "| {label} | {} | {p50:.0} | {p95:.0} | {max:.0} |\n",
+            (Some(p50), Some(p95), Some(worst)) => out.push_str(&format!(
+                "| {label} | {} | {p50:.0} | {p95:.0} | {worst:.0} |\n",
                 v.len()
             )),
             _ => out.push_str(&format!("| {label} | 0 | — | — | — |\n")),
@@ -519,6 +548,48 @@ mod tests {
             "named by the worst sweep"
         );
         assert_eq!((e[1].start, e[1].end), (40, None));
+    }
+
+    #[test]
+    fn a_recorder_gap_ends_an_episode_instead_of_stretching_it() {
+        let r = [
+            rec(0, "ok", None, Some(30)),
+            rec(30, "fail", Some("dns"), Some(5)),
+            rec(35, "fail", Some("dns"), Some(5)),
+            rec(9000, "ok", None, Some(30)),
+        ];
+        let e = episodes(&r);
+        assert_eq!((e[0].end, e[0].last, e[0].cut), (None, 35, true));
+        let out = build(&r, &[], 0, None);
+        assert!(
+            out.contains("at least 5s, then the recorder stopped"),
+            "{out}"
+        );
+        let row = out.lines().find(|l| l.contains("| dns |")).unwrap();
+        assert!(!row.contains("2h"), "{row}");
+    }
+
+    #[test]
+    fn unmeasured_sweeps_are_not_outages() {
+        let r = [
+            rec(0, "ok", None, None),
+            rec(10, "skipped", None, None),
+            rec(20, "ok", None, None),
+        ];
+        assert!(episodes(&r).is_empty());
+    }
+
+    #[test]
+    fn rssi_reports_its_weakest_readings_as_worst() {
+        let mut r: Vec<Record> = (0..20).map(|i| rec(i, "ok", None, None)).collect();
+        for (i, x) in r.iter_mut().enumerate() {
+            x.rssi_dbm = Some(-40.0 - i as f64);
+        }
+        let out = build(&r, &[], 0, None);
+        assert!(
+            out.contains("| Wi-Fi RSSI (dBm) | 20 | -50 | -58 | -59 |"),
+            "{out}"
+        );
     }
 
     #[test]
