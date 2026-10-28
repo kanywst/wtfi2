@@ -4,6 +4,7 @@ use crate::diagnose::diagnose;
 use crate::history::{self, Record};
 use crate::model::{Path, Status};
 use std::future::Future;
+use std::io::Write;
 use std::time::Duration;
 
 /// The cadence while something is wrong, so an outage gets fine-grained edges.
@@ -39,7 +40,8 @@ pub fn record(every: Duration, file: &std::path::Path, path: &Path) -> Duration 
     if let Err(e) = history::append(file, &record) {
         eprintln!("wtfi: could not record to {}: {e}", file.display());
     }
-    println!("{}", history::line(&record));
+    // Best effort: a closed stdout must not stop the recording.
+    let _ = writeln!(std::io::stdout(), "{}", history::line(&record));
     wait
 }
 
