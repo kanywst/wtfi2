@@ -14,6 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Past this size the file is cut back to its newer half.
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 const SWEEPS_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// Failed snapshot writes kept for retry; older ones are dropped.
+const MAX_UNWRITTEN: usize = 4;
 /// While broken, keep a full sweep at least this often.
 const RESNAPSHOT_SECS: u64 = 600;
 
@@ -121,14 +123,16 @@ impl Log {
     }
 
     pub fn push(&mut self, record: &Record, sweep: Value) -> io::Result<()> {
-        append(&self.file, record).map_err(|e| at(&self.file, e))?;
+        let appended = append(&self.file, record).map_err(|e| at(&self.file, e));
         let snapshot = Snapshot {
             ts: record.ts,
             sweep,
         };
         let state = state_of(record);
         let changed = self.state.as_ref() != Some(&state);
-        let stale = record.status == "fail" && record.ts >= self.last_snapshot + RESNAPSHOT_SECS;
+        let stale = record.status == "fail"
+            && record.ts >= self.last_snapshot + RESNAPSHOT_SECS
+            && self.unwritten.is_empty();
         self.state = Some(state);
         if changed || stale {
             let before = self.held.take();
@@ -136,6 +140,8 @@ impl Log {
                 self.unwritten.push(before);
             }
             self.unwritten.push(snapshot);
+            let excess = self.unwritten.len().saturating_sub(MAX_UNWRITTEN);
+            self.unwritten.drain(..excess);
             self.last_snapshot = record.ts;
         } else {
             self.held = Some(snapshot);
@@ -145,7 +151,7 @@ impl Log {
             append_line(&to, next, SWEEPS_MAX_BYTES).map_err(|e| at(&to, e))?;
             self.unwritten.remove(0);
         }
-        Ok(())
+        appended
     }
 }
 
@@ -476,6 +482,30 @@ mod tests {
             [10],
             "the real edge lands once the file is writable again"
         );
+    }
+
+    #[test]
+    fn a_failed_history_write_still_snapshots_the_edge() {
+        let f = tempfile("history-fails");
+        let mut log = Log::open(f.clone());
+        log.push(&record(0, "ok"), Value::Null).unwrap();
+        log.push(&record(5, "ok"), Value::Null).unwrap();
+        fs::remove_file(&f).unwrap();
+        fs::create_dir(&f).unwrap();
+        assert!(log.push(&record(10, "fail"), Value::Null).is_err());
+        let ts: Vec<u64> = load_sweeps(&f, 0).unwrap().iter().map(|s| s.ts).collect();
+        assert_eq!(ts, [0, 5, 10], "both sides of the edge are kept");
+    }
+
+    #[test]
+    fn an_unwritable_sweeps_file_doesnt_grow_the_queue_forever() {
+        let f = tempfile("queue");
+        let mut log = Log::open(f.clone());
+        fs::create_dir_all(sweeps_path(&f)).unwrap();
+        for (i, status) in ["ok", "fail"].iter().cycle().take(20).enumerate() {
+            let _ = log.push(&record(i as u64, status), Value::Null);
+        }
+        assert!(log.unwritten.len() <= MAX_UNWRITTEN);
     }
 
     #[test]
