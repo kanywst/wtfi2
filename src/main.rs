@@ -65,7 +65,10 @@ async fn main() -> Result<()> {
             std::process::exit(64);
         };
         let deadline = cli.sweep_deadline();
-        recorder::run(every, &file, |n| sweep(demo, n, deadline)).await;
+        recorder::run(every, history::Log::open(file), |n| {
+            sweep(demo, n, deadline)
+        })
+        .await;
         return Ok(());
     }
 
@@ -76,8 +79,11 @@ async fn main() -> Result<()> {
     let path = sweep(demo, 0, cli.sweep_deadline()).await;
     let verdict = diagnose::diagnose(&path);
 
-    if let Some(file) = &record_to
-        && let Err(e) = history::append(file, &history::Record::now(&path, &verdict))
+    if let Some(file) = record_to
+        && let Err(e) = history::Log::open(file.clone()).push(
+            &history::Record::now(&path, &verdict),
+            json::to_value(&path, &verdict),
+        )
     {
         eprintln!("wtfi: could not record to {}: {e}", file.display());
     }

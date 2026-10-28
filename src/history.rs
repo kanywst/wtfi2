@@ -1,9 +1,11 @@
-//! Sweep history on disk (`--record` / `--history`), one JSON line per sweep.
+//! Sweep history on disk (`--record` / `--history`), one JSON line per sweep,
+//! plus full sweeps from around each change of state in `sweeps.jsonl`.
 
 use crate::diagnose::Verdict;
 use crate::json::{hop_id_str, status_str};
 use crate::model::{Fault, Hop, HopId, Path};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -11,6 +13,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Past this size the file is cut back to its newer half.
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
+const SWEEPS_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// While unhealthy, keep a full sweep at least this often.
+const RESNAPSHOT_SECS: u64 = 600;
 
 /// One finished sweep, flattened to the numbers a trend is drawn from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -79,11 +84,85 @@ pub fn default_path() -> Option<PathBuf> {
     Some(state.join("wtfi").join("history.jsonl"))
 }
 
+/// A full sweep (the `--json` document) and when it ran.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub ts: u64,
+    pub sweep: Value,
+}
+
+pub fn sweeps_path(history: &std::path::Path) -> PathBuf {
+    history.with_file_name("sweeps.jsonl")
+}
+
+/// Appends records, and full sweeps on either side of every change of state.
+pub struct Log {
+    file: PathBuf,
+    state: Option<String>,
+    held: Option<Snapshot>,
+    last_snapshot: u64,
+}
+
+impl Log {
+    pub fn open(file: PathBuf) -> Self {
+        let last = load(&file, 1).ok().and_then(|mut r| r.pop());
+        Log {
+            state: last.as_ref().map(state_of),
+            last_snapshot: last.map_or(0, |r| r.ts),
+            file,
+            held: None,
+        }
+    }
+
+    pub fn push(&mut self, record: &Record, sweep: Value) -> io::Result<()> {
+        append(&self.file, record)?;
+        let snapshot = Snapshot {
+            ts: record.ts,
+            sweep,
+        };
+        let state = state_of(record);
+        let changed = self.state.as_ref() != Some(&state);
+        let stale = record.status != "ok" && record.ts >= self.last_snapshot + RESNAPSHOT_SECS;
+        self.state = Some(state);
+        if !changed && !stale {
+            self.held = Some(snapshot);
+            return Ok(());
+        }
+        let to = sweeps_path(&self.file);
+        if let Some(before) = self.held.take().filter(|_| changed) {
+            append_line(&to, &before, SWEEPS_MAX_BYTES)?;
+        }
+        self.last_snapshot = record.ts;
+        append_line(&to, &snapshot, SWEEPS_MAX_BYTES)
+    }
+}
+
+fn state_of(r: &Record) -> String {
+    format!(
+        "{}|{}|{}",
+        r.status,
+        r.first_break.as_deref().unwrap_or(""),
+        r.headline
+    )
+}
+
+/// Every snapshot taken at or after `since`, oldest first.
+pub fn load_sweeps(history: &std::path::Path, since: u64) -> io::Result<Vec<Snapshot>> {
+    Ok(read_lines(&sweeps_path(history))?
+        .into_iter()
+        .filter(|s: &Snapshot| s.ts >= since)
+        .collect())
+}
+
 pub fn append(file: &std::path::Path, record: &Record) -> io::Result<()> {
+    append_line(file, record, MAX_BYTES)
+}
+
+fn append_line<T: Serialize>(file: &std::path::Path, record: &T, max: u64) -> io::Result<()> {
     if let Some(dir) = file.parent() {
         fs::create_dir_all(dir)?;
     }
-    if fs::metadata(file).is_ok_and(|m| m.len() > MAX_BYTES) {
+    if fs::metadata(file).is_ok_and(|m| m.len() > max) {
         trim(file)?;
     }
     let mut out = OpenOptions::new()
@@ -117,18 +196,22 @@ fn trim(file: &std::path::Path) -> io::Result<()> {
 
 /// The newest `n` records, oldest first. Unparseable lines are skipped.
 pub fn load(file: &std::path::Path, n: usize) -> io::Result<Vec<Record>> {
+    let mut records: Vec<Record> = read_lines(file)?;
+    let skip = records.len().saturating_sub(n);
+    records.drain(..skip);
+    Ok(records)
+}
+
+fn read_lines<T: serde::de::DeserializeOwned>(file: &std::path::Path) -> io::Result<Vec<T>> {
     let text = match fs::read_to_string(file) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
-    let mut records: Vec<Record> = text
+    Ok(text
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    let skip = records.len().saturating_sub(n);
-    records.drain(..skip);
-    Ok(records)
+        .collect())
 }
 
 pub fn render(records: &[Record]) -> String {
@@ -269,6 +352,52 @@ mod tests {
             "the new record survives the trim"
         );
         assert!(fs::metadata(&f).unwrap().len() <= MAX_BYTES);
+    }
+
+    #[test]
+    fn full_sweeps_are_kept_around_each_change_only() {
+        let f = tempfile("sweeps");
+        let mut log = Log::open(f.clone());
+        let statuses = ["ok", "ok", "ok", "fail", "fail", "ok"];
+        for (ts, status) in statuses.iter().enumerate() {
+            let r = record(ts as u64, status);
+            log.push(&r, serde_json::json!({ "n": ts })).unwrap();
+        }
+        let ts: Vec<u64> = load_sweeps(&f, 0).unwrap().iter().map(|s| s.ts).collect();
+        assert_eq!(ts, [0, 2, 3, 4, 5], "first, then both sides of each change");
+        assert_eq!(load(&f, 10).unwrap().len(), 6, "every record still lands");
+        assert_eq!(load_sweeps(&f, 4).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_long_outage_is_resnapshotted() {
+        let f = tempfile("resnapshot");
+        let mut log = Log::open(f.clone());
+        for ts in (0..=1200).step_by(300) {
+            log.push(&record(ts, "fail"), Value::Null).unwrap();
+        }
+        let ts: Vec<u64> = load_sweeps(&f, 0).unwrap().iter().map(|s| s.ts).collect();
+        assert_eq!(ts, [0, 600, 1200]);
+    }
+
+    #[test]
+    fn a_reopened_log_remembers_the_last_state() {
+        let f = tempfile("reopen");
+        Log::open(f.clone())
+            .push(&record(0, "fail"), Value::Null)
+            .unwrap();
+        Log::open(f.clone())
+            .push(&record(1, "fail"), Value::Null)
+            .unwrap();
+        Log::open(f.clone())
+            .push(&record(2, "ok"), Value::Null)
+            .unwrap();
+        let ts: Vec<u64> = load_sweeps(&f, 0).unwrap().iter().map(|s| s.ts).collect();
+        assert_eq!(
+            ts,
+            [0, 2],
+            "a one-shot run can't hold, so it only skips repeats"
+        );
     }
 
     #[test]

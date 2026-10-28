@@ -1,7 +1,8 @@
 //! `wtfi --record --every`: keep sweeping on a cadence without the dashboard.
 
 use crate::diagnose::diagnose;
-use crate::history::{self, Record};
+use crate::history::{self, Log, Record};
+use crate::json;
 use crate::model::{Path, Status};
 use std::future::Future;
 use std::io::Write;
@@ -29,7 +30,7 @@ pub fn next_wait(every: Duration, status: Status) -> Duration {
     }
 }
 
-pub async fn run<F, Fut>(every: Duration, file: &std::path::Path, mut sweep: F)
+pub async fn run<F, Fut>(every: Duration, mut log: Log, mut sweep: F)
 where
     F: FnMut(usize) -> Fut,
     Fut: Future<Output = Path>,
@@ -37,24 +38,20 @@ where
     let mut n = 0;
     loop {
         let started = tokio::time::Instant::now();
-        let period = record(every, file, &sweep(n).await);
+        let period = record(every, &mut log, &sweep(n).await);
         n = n.wrapping_add(1);
         tokio::time::sleep_until(next_start(started, period, tokio::time::Instant::now())).await;
     }
 }
 
 /// Append and print one sweep; returns the period until the next one starts.
-pub fn record(every: Duration, file: &std::path::Path, path: &Path) -> Duration {
+pub fn record(every: Duration, log: &mut Log, path: &Path) -> Duration {
     let verdict = diagnose(path);
     let wait = next_wait(every, verdict.status);
     let mut record = Record::now(path, &verdict);
     record.interval_s = Some(wait.as_secs());
-    if let Err(e) = history::append(file, &record) {
-        let _ = writeln!(
-            std::io::stderr(),
-            "wtfi: could not record to {}: {e}",
-            file.display()
-        );
+    if let Err(e) = log.push(&record, json::to_value(path, &verdict)) {
+        let _ = writeln!(std::io::stderr(), "wtfi: could not record: {e}");
     }
     // Best effort: a closed stdout must not stop the recording.
     let _ = writeln!(std::io::stdout(), "{}", history::line(&record));
@@ -108,16 +105,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let file = dir.join("history.jsonl");
         let every = Duration::from_secs(60);
+        let mut log = Log::open(file.clone());
         let mut path = skeleton();
         for hop in &mut path.hops {
             hop.status = Status::Ok;
         }
-        assert_eq!(record(every, &file, &path), every);
+        assert_eq!(record(every, &mut log, &path), every);
         path.get_mut(HopId::Wan).unwrap().status = Status::Fail;
-        assert_eq!(record(every, &file, &path), FAST);
+        assert_eq!(record(every, &mut log, &path), FAST);
         let got = history::load(&file, 10).unwrap();
         let intervals: Vec<_> = got.iter().map(|r| r.interval_s).collect();
         assert_eq!(intervals, [Some(60), Some(5)]);
         assert_eq!(got[1].status, "fail");
+        assert_eq!(history::load_sweeps(&file, 0).unwrap().len(), 2);
     }
 }
