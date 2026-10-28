@@ -1,12 +1,18 @@
 //! `wtfi --bundle`: recorded sweeps as one Markdown document for an AI agent.
 
 use crate::history::{self, Record, Snapshot};
+use crate::platform::LogLine;
 use serde_json::Value;
 use std::hash::{BuildHasher, RandomState};
 
 /// Newest full sweeps to include; older ones are counted, not shown.
 const MAX_SWEEPS: usize = 12;
 const MAX_TIMELINE: usize = 200;
+/// OS log is read for the newest episodes only, from a little before each began.
+const LOG_EPISODES: usize = 5;
+const LOG_LEAD_SECS: u64 = 120;
+const LOG_MAX_SECS: u64 = 720;
+const LOG_MAX_LINES: usize = 150;
 /// A recorder that planned to sweep in N seconds but didn't within N+60 wasn't running.
 const GAP_SLACK_SECS: u64 = 60;
 /// Assumed spacing for records that don't say (one-shot runs, older history).
@@ -107,12 +113,15 @@ fn stale(last: &Record, now: u64) -> bool {
     now > last.ts + last.interval_s.unwrap_or(UNKNOWN_INTERVAL_SECS) + GAP_SLACK_SECS
 }
 
+pub type LogReader<'a> = &'a dyn Fn(u64, u64) -> Result<Vec<LogLine>, String>;
+
 /// `redact` salts the masks; pass the same state to get the same tags across calls.
 pub fn build(
     records: &[Record],
     sweeps: &[Snapshot],
     since: u64,
     redact: Option<&RandomState>,
+    log: LogReader,
 ) -> String {
     let owned: Vec<Record> = records.iter().filter(|r| r.ts >= since).cloned().collect();
     let sweeps: Vec<&Snapshot> = sweeps.iter().filter(|s| s.ts >= since).collect();
@@ -261,11 +270,71 @@ pub fn build(
         }
     }
 
+    if !eps.is_empty() {
+        out.push_str("\n## OS network log\n\nWi-Fi, DHCP, interface and DNS events the OS logged around the newest episodes. Repeated lines are collapsed.\n");
+        for e in eps.iter().skip(eps.len().saturating_sub(LOG_EPISODES)) {
+            let from = e.start.saturating_sub(LOG_LEAD_SECS);
+            let to = e.end.unwrap_or(last.ts).min(e.start + LOG_MAX_SECS) + 60;
+            out.push_str(&format!(
+                "\n### {} to {}\n\n",
+                history::utc(from),
+                history::utc(to)
+            ));
+            match log(from, to) {
+                Ok(lines) if lines.is_empty() => out.push_str("Nothing logged.\n"),
+                Ok(lines) => out.push_str(&log_block(&lines, redactor.as_ref())),
+                Err(e) => out.push_str(&format!("Couldn't read the OS log: {e}\n")),
+            }
+        }
+    }
+
     out.push_str(PROMPT);
     match redactor {
         Some(r) => r.text(&out),
         None => out,
     }
+}
+
+/// A fenced block of collapsed, capped and (when asked) masked log lines.
+pub fn log_block(lines: &[LogLine], redactor: Option<&Redactor>) -> String {
+    let lines = collapse(lines);
+    let mut out = String::from("```text\n");
+    for line in lines.iter().take(LOG_MAX_LINES) {
+        match redactor {
+            Some(r) => out.push_str(&r.text(&r.log_line(line))),
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    if lines.len() > LOG_MAX_LINES {
+        out.push_str(&format!(
+            "({} more lines omitted)\n",
+            lines.len() - LOG_MAX_LINES
+        ));
+    }
+    out.push_str("```\n");
+    out
+}
+
+/// Consecutive identical lines become one, with `×N`.
+fn collapse(lines: &[LogLine]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let l = &lines[i];
+        let run = lines[i..]
+            .iter()
+            .take_while(|o| o.source == l.source && o.message == l.message)
+            .count();
+        let tail = if run > 1 {
+            format!(" ×{run}")
+        } else {
+            String::new()
+        };
+        out.push(format!("{} {}: {}{tail}", l.time, l.source, l.message));
+        i += run;
+    }
+    out
 }
 
 fn timeline(records: &[Record]) -> Vec<String> {
@@ -409,6 +478,63 @@ impl<'a> Redactor<'a> {
         self.macs(&mask_public_v4(&out))
     }
 
+    /// SSIDs named in a log line, in the forms configd, wpa_supplicant and NetworkManager print.
+    pub fn log_line(&self, line: &str) -> String {
+        let mut line = line.to_string();
+        for known in self.ssids.iter().filter(|s| s.chars().count() >= 4) {
+            line = replace_word(&line, known, &self.ssid(known));
+        }
+        let lower = line.to_ascii_lowercase();
+        let b = line.as_bytes();
+        let mut out = String::with_capacity(line.len());
+        let (mut at, mut from) = (0, 0);
+        while let Some(k) = lower[from..].find("ssid").map(|k| k + from) {
+            from = k + 4;
+            if lower[..k]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphabetic())
+            {
+                continue;
+            }
+            let mut v = k + 4;
+            if matches!(b.get(v), Some(b'\'' | b'"')) && lower[v + 1..].starts_with(" value ") {
+                v += 7;
+            }
+            let key_end = v;
+            while matches!(b.get(v), Some(b' ' | b'=' | b':')) {
+                v += 1;
+            }
+            let (start, end) = match b.get(v) {
+                Some(&q @ (b'\'' | b'"')) => {
+                    let end = line[v + 1..]
+                        .find(q as char)
+                        .map_or(line.len(), |j| v + 1 + j);
+                    (v + 1, end)
+                }
+                _ if v == key_end => continue,
+                _ => {
+                    let tail = &line[v..];
+                    let end = tail
+                        .find(" BSSID ")
+                        .or_else(|| tail.find([' ', ',', ')', ';']))
+                        .map_or(line.len(), |j| v + j);
+                    (v, end)
+                }
+            };
+            let name = &line[start..end];
+            if name.is_empty() || name.starts_with('<') || name.starts_with("ssid-") {
+                continue;
+            }
+            out.push_str(&line[at..start]);
+            out.push_str(&self.ssid(name));
+            at = end;
+            from = end;
+        }
+        out.push_str(&line[at..]);
+        out
+    }
+
     fn ssid(&self, name: &str) -> String {
         format!("ssid-{}", self.tag(name))
     }
@@ -432,6 +558,22 @@ impl<'a> Redactor<'a> {
         out.push_str(rest);
         out
     }
+}
+
+/// Replace `word` only where it isn't part of a longer word.
+fn replace_word(text: &str, word: &str, with: &str) -> String {
+    let edge = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(word) {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + word.len()..];
+        let whole = edge(out.chars().next_back()) && edge(after.chars().next());
+        out.push_str(if whole { with } else { word });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 fn metric<'a>(hop: &'a Value, label: &str) -> Option<&'a str> {
@@ -531,7 +673,7 @@ const PROMPT: &str = "
 
 The data above was recorded by wtfi, a network-path diagnostic, while my connection was failing or slow. Each sweep probes the path in order: host (my machine), link (Wi-Fi), gateway (my router), wan (reachability of public anchors), dns, captive (portal check), and a vpn hop when a tunnel is up. `first_break` is the first hop that failed; `evidence` says how each hop was measured.
 
-1. For each episode, say which layer broke first and what most likely caused it. Quote the records or sweep fields you rely on.
+1. For each episode, say which layer broke first (the OS network log, when present, often shows the Wi-Fi or DHCP event behind it) and what most likely caused it. Quote the records or sweep fields you rely on.
 2. Say whether the episodes share a cause or look unrelated.
 3. Keep what the data shows apart from what you infer, and say when it can't decide between causes.
 4. List concrete next steps, most likely fix first, and what I should capture next time to settle what is still open.
@@ -540,6 +682,125 @@ The data above was recorded by wtfi, a network-path diagnostic, while my connect
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn no_log(_: u64, _: u64) -> Result<Vec<LogLine>, String> {
+        Ok(Vec::new())
+    }
+
+    fn line(time: &str, message: &str) -> LogLine {
+        LogLine {
+            time: time.into(),
+            source: "configd".into(),
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn os_log_is_read_around_each_episode_and_collapsed() {
+        let r = [
+            rec(1000, "ok", None, None),
+            rec(1010, "fail", Some("link"), None),
+            rec(5000, "ok", None, None),
+        ];
+        let asked = std::cell::RefCell::new(Vec::new());
+        let log = |from, to| {
+            asked.borrow_mut().push((from, to));
+            Ok(vec![
+                line(
+                    "00:16:48",
+                    "en0: SSID Cafe Wifi BSSID 00:11:22:33:44:55 Security NONE",
+                ),
+                line("00:16:49", "DHCP en0: RENEW"),
+                line("00:16:49", "DHCP en0: RENEW"),
+                line(
+                    "00:16:50",
+                    "DNS 203.0.113.9 failed, 9.9.9.9 ok, router 192.168.1.1",
+                ),
+                line("00:16:51", "server 93.184.215.14 unreachable"),
+            ])
+        };
+        let out = build(&r, &[], 0, Some(&RandomState::new()), &log);
+        assert_eq!(
+            *asked.borrow(),
+            [(890, 1790)],
+            "2 min before, capped 12 min after, +1 min"
+        );
+        assert!(out.contains("DHCP en0: RENEW ×2"), "{out}");
+        assert!(
+            !out.contains("Cafe Wifi") && !out.contains("00:11:22"),
+            "{out}"
+        );
+        assert!(
+            out.contains("SSID ssid-") && out.contains("BSSID mac-"),
+            "{out}"
+        );
+        assert!(out.contains("93.184.215.x unreachable"), "{out}");
+        assert!(
+            out.contains("9.9.9.9 ok") && out.contains("192.168.1.1"),
+            "{out}"
+        );
+
+        let failing = |_, _| Err("log: permission denied".to_string());
+        let out = build(&r, &[], 0, Some(&RandomState::new()), &failing);
+        assert!(out.contains("Couldn't read the OS log: log: permission denied"));
+        assert!(build(&r, &[], 0, None, &log).contains("Cafe Wifi"));
+    }
+
+    #[test]
+    fn a_long_log_says_how_much_it_dropped() {
+        let lines: Vec<LogLine> = (0..LOG_MAX_LINES + 7)
+            .map(|i| line("00:00:00", &format!("event {i}")))
+            .collect();
+        let block = log_block(&lines, None);
+        assert!(
+            block.contains("event 149\n(7 more lines omitted)"),
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn ssids_are_masked_in_every_log_form() {
+        let state = RandomState::new();
+        let s = sweep_with("Known Net", "198.51.100.77", "x");
+        let r = Redactor::new(&state, &[&s]);
+        for (input, leak) in [
+            (
+                "Trying to associate with SSID 'My Home' freq=5180",
+                "My Home",
+            ),
+            (
+                "wlan0: SME: Trying to authenticate (SSID='My Home' freq=2412 MHz)",
+                "My Home",
+            ),
+            (
+                "CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid=\"My Home\" auth_failures=1",
+                "My Home",
+            ),
+            ("Config: added 'ssid' value 'My Home'", "My Home"),
+            ("en0: SSID Cafe Wifi BSSID x", "Cafe Wifi"),
+            ("ssid: \\xe8\\x87\\xaa\\xe5 connected", "xe8"),
+            ("roamed to Known Net on ch 36", "Known Net"),
+        ] {
+            let out = r.log_line(input);
+            assert!(!out.contains(leak), "{input:?} -> {out:?}");
+            assert!(out.contains("ssid-"), "{input:?} -> {out:?}");
+        }
+        assert!(
+            r.log_line("CTRL-EVENT-SSID-TEMP-DISABLED id=0")
+                .contains("-TEMP-DISABLED")
+        );
+        for same in [
+            "en0: no SSID",
+            "NetworkID <redacted> SSID <redacted>",
+            "BSSID 00:11:22:33:44:55",
+        ] {
+            assert_eq!(r.log_line(same), same);
+        }
+        assert!(
+            r.log_line("SSID 自宅のWi-Fi BSSID x")
+                .starts_with("SSID ssid-")
+        );
+    }
 
     fn rec(ts: u64, status: &str, brk: Option<&str>, interval: Option<u64>) -> Record {
         Record {
@@ -587,7 +848,7 @@ mod tests {
         ];
         let e = episodes(&r);
         assert_eq!((e[0].end, e[0].last, e[0].cut), (None, 35, true));
-        let out = build(&r, &[], 0, None);
+        let out = build(&r, &[], 0, None, &no_log);
         assert!(
             out.contains("at least 5s, then the recorder stopped"),
             "{out}"
@@ -682,7 +943,7 @@ mod tests {
         for (i, x) in r.iter_mut().enumerate() {
             x.rssi_dbm = Some(-40.0 - i as f64);
         }
-        let out = build(&r, &[], 0, None);
+        let out = build(&r, &[], 0, None, &no_log);
         assert!(
             out.contains("| Wi-Fi RSSI (dBm) | 20 | -50 | -58 | -59 |"),
             "{out}"
@@ -802,6 +1063,7 @@ mod tests {
             &[s],
             0,
             Some(&RandomState::new()),
+            &no_log,
         )
     }
 
@@ -849,8 +1111,8 @@ mod tests {
         let state = RandomState::new();
         let s = [sweep_with("Home Net", "198.51.100.77", "x")];
         let tag = |out: String| out.split("ssid-").nth(1).unwrap()[..4].to_string();
-        let a = build(&[rec(5, "fail", None, None)], &s, 0, Some(&state));
-        let b = build(&[rec(5, "fail", None, None)], &s, 0, Some(&state));
+        let a = build(&[rec(5, "fail", None, None)], &s, 0, Some(&state), &no_log);
+        let b = build(&[rec(5, "fail", None, None)], &s, 0, Some(&state), &no_log);
         assert_eq!(tag(a), tag(b));
     }
 
@@ -863,6 +1125,7 @@ mod tests {
             &[s],
             0,
             Some(&RandomState::new()),
+            &no_log,
         );
         assert!(out.contains("\"subtitle\":\"en0\""));
     }
@@ -870,14 +1133,14 @@ mod tests {
     #[test]
     fn no_redact_leaves_everything() {
         let s = sweep_with("Home Net", "198.51.100.77", "x");
-        let out = build(&[rec(5, "fail", None, None)], &[s], 0, None);
+        let out = build(&[rec(5, "fail", None, None)], &[s], 0, None, &no_log);
         assert!(out.contains("Home Net") && out.contains("198.51.100.77"));
     }
 
     #[test]
     fn timestamps_going_backwards_dont_panic() {
         let r = [rec(100, "fail", None, None), rec(90, "ok", None, None)];
-        assert!(build(&r, &[], 0, None).contains("| 0s |"));
+        assert!(build(&r, &[], 0, None, &no_log).contains("| 0s |"));
     }
 
     #[test]
@@ -886,13 +1149,13 @@ mod tests {
             rec(0, "fail", Some("dns"), None),
             rec(100, "ok", None, None),
         ];
-        let out = build(&r, &[], 50, Some(&RandomState::new()));
+        let out = build(&r, &[], 50, Some(&RandomState::new()), &no_log);
         assert!(
             !out.contains("## Episodes\n\n|"),
             "the old outage is outside the window"
         );
         assert!(out.trim_end().ends_with("what is still open."));
-        let empty = build(&r, &[], 500, Some(&RandomState::new()));
+        let empty = build(&r, &[], 500, Some(&RandomState::new()), &no_log);
         assert!(empty.contains("No sweeps were recorded"));
     }
 }

@@ -11,6 +11,8 @@
 //!   is missing.
 //! - `/etc/resolv.conf`, or systemd-resolved's upstream list when that file
 //!   only names the local stub.
+//! - `journalctl` — NetworkManager, networkd, resolved, DHCP client and Wi-Fi
+//!   supplicant logs, for `--bundle` (needs the `systemd-journal` group to see them)
 //!
 //! Unlike macOS, nothing here is redacted: `iw` reports the SSID and BSSID to
 //! any user.
@@ -18,7 +20,9 @@
 use super::shared::{
     TOOL_DEADLINE, is_link_local, output_within, parse_addr, vendor_from_ip, vendor_from_processes,
 };
-use super::{AddrInfo, LinkInfo, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo};
+use super::{
+    AddrInfo, LinkInfo, LogLine, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo,
+};
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -63,7 +67,60 @@ fn is_wireless(iface: &str) -> bool {
     base.join("wireless").exists() || base.join("phy80211").exists()
 }
 
+const LOG_IDENTIFIERS: [&str; 7] = [
+    "NetworkManager",
+    "systemd-networkd",
+    "systemd-resolved",
+    "wpa_supplicant",
+    "iwd",
+    "dhclient",
+    "dhcpcd",
+];
+
+fn parse_journal(json: &str) -> Vec<LogLine> {
+    json.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| {
+            let micros: u64 = v["__REALTIME_TIMESTAMP"].as_str()?.parse().ok()?;
+            let time = crate::history::utc(micros / 1_000_000)
+                .get(11..19)?
+                .to_string();
+            let source = v["SYSLOG_IDENTIFIER"]
+                .as_str()
+                .or(v["_COMM"].as_str())?
+                .to_string();
+            let message = v["MESSAGE"]
+                .as_str()?
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(LogLine {
+                time,
+                source,
+                message,
+            })
+        })
+        .collect()
+}
+
 impl Platform for Linux {
+    fn network_log(&self, from: u64, to: u64) -> Result<Vec<LogLine>, PlatformError> {
+        let (since, until) = (format!("@{from}"), format!("@{to}"));
+        let mut args = vec![
+            "--no-pager",
+            "-o",
+            "json",
+            "--since",
+            &since,
+            "--until",
+            &until,
+        ];
+        for id in LOG_IDENTIFIERS {
+            args.extend(["-t", id]);
+        }
+        Ok(parse_journal(&run("journalctl", &args)?))
+    }
+
     fn route(&self) -> Result<RouteInfo, PlatformError> {
         let mut info = match ip_default_route() {
             Ok(info) => info,
@@ -614,6 +671,23 @@ fn is_resolved_stub(ip: &IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_lines_keep_time_unit_and_message() {
+        let json = concat!(
+            r#"{"__REALTIME_TIMESTAMP":"1793186853000000","SYSLOG_IDENTIFIER":"NetworkManager","MESSAGE":"<info>  device (wlan0): state change"}"#,
+            "\n",
+            r#"{"__REALTIME_TIMESTAMP":"1793186854000000","_COMM":"iwd","MESSAGE":[1,2]}"#,
+        );
+        assert_eq!(
+            parse_journal(json),
+            [LogLine {
+                time: "11:27:33".into(),
+                source: "NetworkManager".into(),
+                message: "<info> device (wlan0): state change".into(),
+            }]
+        );
+    }
 
     const ROUTE: &str = r#"[{"dst":"default","gateway":"192.168.1.1","dev":"wlp2s0","protocol":"dhcp","prefsrc":"192.168.1.23","metric":600,"flags":[]},{"dst":"default","gateway":"10.0.0.1","dev":"enp3s0","protocol":"dhcp","metric":100,"flags":[]}]"#;
 

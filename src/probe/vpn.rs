@@ -92,7 +92,7 @@ pub fn probe(platform: &impl Platform, route: &RouteInfo) -> Hop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::{AddrInfo, LinkInfo, PlatformError, ResolverInfo, VpnInfo};
+    use crate::platform::{AddrInfo, LinkInfo, LogLine, PlatformError, ResolverInfo, VpnInfo};
 
     struct MockPlatform(VpnInfo);
     impl Platform for MockPlatform {
@@ -113,6 +113,9 @@ mod tests {
         }
         fn vpn(&self, _route: &RouteInfo) -> Result<VpnInfo, PlatformError> {
             Ok(self.0.clone())
+        }
+        fn network_log(&self, _: u64, _: u64) -> Result<Vec<LogLine>, PlatformError> {
+            Ok(Vec::new())
         }
     }
 
@@ -150,6 +153,9 @@ mod tests {
         }
         fn vpn(&self, _route: &RouteInfo) -> Result<VpnInfo, PlatformError> {
             Err(PlatformError::Command("scutil: refused".into()))
+        }
+        fn network_log(&self, _: u64, _: u64) -> Result<Vec<LogLine>, PlatformError> {
+            Ok(Vec::new())
         }
     }
 

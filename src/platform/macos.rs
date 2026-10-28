@@ -6,6 +6,7 @@
 //! - `route -n get default` — gateway, interface, MTU
 //! - `system_profiler SPAirPortDataType` — RSSI, noise, channel, PHY, security
 //! - `scutil --dns` — configured resolvers
+//! - `log show` — Wi-Fi, DHCP and DNS events, for `--bundle`
 //!
 //! Note: since macOS 14 the OS redacts SSID/BSSID unless the calling app holds
 //! Location permission, so those fields are best-effort. RSSI/noise are not
@@ -14,7 +15,9 @@
 use super::shared::{
     TOOL_DEADLINE, is_link_local, output_within, parse_addr, vendor_from_ip, vendor_from_processes,
 };
-use super::{AddrInfo, LinkInfo, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo};
+use super::{
+    AddrInfo, LinkInfo, LogLine, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo,
+};
 use std::net::IpAddr;
 
 pub struct MacOs;
@@ -76,7 +79,57 @@ fn classify_failure(cmd: &str, stderr: &str) -> PlatformError {
     PlatformError::Command(format!("{cmd}: {detail}"))
 }
 
+/// Wi-Fi, DHCP, interface and captive-portal events, plus DNS errors.
+const LOG_PREDICATE: &str = r#"subsystem IN {"com.apple.wifi", "com.apple.IPConfiguration", "com.apple.captive"} OR (subsystem == "com.apple.SystemConfiguration" AND category IN {"IPMonitor", "KernelEventMonitor"}) OR process == "airportd" OR (process == "mDNSResponder" AND messageType IN {16, 17})"#;
+
+fn log_stamp(ts: u64) -> String {
+    crate::history::utc(ts).replace('Z', "+0000")
+}
+
+fn parse_log(ndjson: &str) -> Vec<LogLine> {
+    ndjson
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| {
+            let time = v["timestamp"].as_str()?.get(11..19)?.to_string();
+            let message = v["eventMessage"]
+                .as_str()?
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let source = v["processImagePath"]
+                .as_str()?
+                .rsplit('/')
+                .next()?
+                .to_string();
+            Some(LogLine {
+                time,
+                source,
+                message,
+            })
+        })
+        .collect()
+}
+
 impl Platform for MacOs {
+    fn network_log(&self, from: u64, to: u64) -> Result<Vec<LogLine>, PlatformError> {
+        let (start, end) = (log_stamp(from), log_stamp(to));
+        let args = [
+            "show",
+            "--style",
+            "ndjson",
+            "--timezone",
+            "UTC",
+            "--start",
+            &start,
+            "--end",
+            &end,
+            "--predicate",
+            LOG_PREDICATE,
+        ];
+        Ok(parse_log(&run("/usr/bin/log", &args)?))
+    }
+
     fn route(&self) -> Result<RouteInfo, PlatformError> {
         let mut info = match run("route", &["-n", "get", "default"]).and_then(|t| parse_route(&t)) {
             Ok(i) => i,
@@ -461,6 +514,24 @@ fn is_scoped(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_lines_keep_time_process_and_message() {
+        let ndjson = concat!(
+            r#"{"timestamp":"2026-10-28 11:27:33.921674+0000","processImagePath":"/usr/libexec/configd","eventMessage":"DHCP en0: status = 'media\n  inactive'"}"#,
+            "\n",
+            r#"{"count":1,"finished":1}"#,
+        );
+        assert_eq!(
+            parse_log(ndjson),
+            [LogLine {
+                time: "11:27:33".into(),
+                source: "configd".into(),
+                message: "DHCP en0: status = 'media inactive'".into(),
+            }]
+        );
+        assert_eq!(log_stamp(0), "1970-01-01 00:00:00+0000");
+    }
 
     const ROUTE: &str = "   route to: default
   destination: default
