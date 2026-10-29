@@ -4,7 +4,99 @@
 //! same way: which address is only link-local, and which VPN a tunnel belongs
 //! to. Keeping one copy means a vendor added for one OS reaches the others.
 
+use super::PlatformError;
+use std::io::Read;
 use std::net::IpAddr;
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
+
+/// Ceiling on one system tool: past the probe's own deadline nobody is waiting for it.
+pub(super) const TOOL_DEADLINE: Duration = crate::engine::PROBE_DEADLINE;
+
+/// Run `cmd`, killing it at `deadline`; returns its status, stdout and stderr.
+pub(super) fn output_within(
+    cmd: &str,
+    args: &[&str],
+    deadline: Duration,
+) -> Result<(ExitStatus, String, String), PlatformError> {
+    let fail = |e: std::io::Error| PlatformError::Command(format!("{cmd}: {e}"));
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(fail)?;
+    let out = drain(Box::new(child.stdout.take().unwrap()));
+    let err = drain(Box::new(child.stderr.take().unwrap()));
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(fail)? {
+            break status;
+        }
+        if start.elapsed() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(PlatformError::Command(format!(
+                "{cmd}: gave up after {}s",
+                deadline.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // A helper the tool left behind can hold the pipes open past the deadline.
+    let until = Instant::now()
+        + deadline
+            .saturating_sub(start.elapsed())
+            .max(Duration::from_millis(100));
+    match (out.collect(until), err.collect(until)) {
+        (Some(out), Some(err)) => Ok((status, out, err)),
+        _ => Err(PlatformError::Command(format!(
+            "{cmd}: output still open after exit"
+        ))),
+    }
+}
+
+struct Drain {
+    buf: Arc<Mutex<Vec<u8>>>,
+    done: mpsc::Receiver<()>,
+}
+
+impl Drain {
+    /// Everything the pipe carried, or `None` if it wasn't read to the end by `until`.
+    fn collect(self, until: Instant) -> Option<String> {
+        self.done
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+            .ok()?;
+        let buf = self.buf.lock().ok()?.clone();
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    }
+}
+
+fn drain(mut pipe: Box<dyn Read + Send>) -> Drain {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let (tx, done) = mpsc::channel();
+    let sink = buf.clone();
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Ok(mut b) = sink.lock() {
+                        b.extend_from_slice(&chunk[..n]);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                // Dropping `tx` unsent marks the read as incomplete.
+                Err(_) => return,
+            }
+        }
+        let _ = tx.send(());
+    });
+    Drain { buf, done }
+}
 
 /// Parse an address token, dropping any `%zone` scope suffix (`fe80::1%utun4`).
 pub(super) fn parse_addr(tok: &str) -> Option<IpAddr> {
@@ -63,6 +155,49 @@ pub(super) fn vendor_from_processes(ps: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wedged_tool_is_killed_at_its_deadline() {
+        let (status, out, err) = output_within(
+            "sh",
+            &["-c", "echo hi; echo oops >&2; exit 3"],
+            TOOL_DEADLINE,
+        )
+        .unwrap();
+        assert_eq!(
+            (status.code(), out.trim(), err.trim()),
+            (Some(3), "hi", "oops")
+        );
+        let start = Instant::now();
+        let slow = output_within("sleep", &["5"], Duration::from_millis(200));
+        assert!(matches!(slow, Err(PlatformError::Command(m)) if m.contains("gave up")));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_helper_holding_the_pipe_doesnt_outlast_the_deadline() {
+        let start = Instant::now();
+        let held = output_within(
+            "sh",
+            &["-c", "echo hi; (sleep 5 &) ; exit 0"],
+            Duration::from_millis(500),
+        );
+        assert!(
+            matches!(held, Err(PlatformError::Command(m)) if m.contains("still open")),
+            "half-read output isn't passed off as complete"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn tools_get_no_stdin() {
+        let (_, out, _) = output_within("sh", &["-c", "cat; echo done"], TOOL_DEADLINE).unwrap();
+        assert_eq!(out.trim(), "done");
+    }
 
     #[test]
     fn vendor_detects_tailscale_cgnat() {

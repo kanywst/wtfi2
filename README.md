@@ -137,9 +137,12 @@ wtfi --no-color   # plain text, no ANSI
 wtfi --timeout 5  # give up on the sweep sooner and report what landed
 wtfi --record     # also append this sweep to the history file (works with -w)
 wtfi --history    # the last 20 recorded sweeps (--history 100, --history --json)
+wtfi --record --every 30s  # keep recording in the background, no dashboard
 ```
 
 Recording is off unless you pass `--record`. Each finished sweep becomes one JSON line in `$XDG_STATE_HOME/wtfi/history.jsonl` (`~/.local/state/wtfi/history.jsonl` when that is unset, on macOS too; `WTFI_HISTORY` overrides the path). `wtfi -w --record` also starts its latency sparklines from the last recorded sweeps, so a dead zone you walked through yesterday is still on the graph today. The file trims itself to its newer half past 4 MiB.
+
+`--every` keeps sweeping without the dashboard, so you can leave it running and look at what happened after the connection comes back. While the network is broken it re-probes as often as every 5 seconds (a sweep on a broken network can itself take up to `--timeout`), so the edges of an outage land close to when they happened. To start it at login, use [`contrib/dev.kanywst.wtfi.plist`](contrib/dev.kanywst.wtfi.plist) (launchd, copy to `~/Library/LaunchAgents/` and `launchctl load` it) or [`contrib/wtfi-record.service`](contrib/wtfi-record.service) (systemd, `systemctl --user enable --now`). Fix the binary path in either file first.
 
 The exit code reflects health, so scripts can branch on it:
 

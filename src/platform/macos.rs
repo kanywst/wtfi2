@@ -11,10 +11,11 @@
 //! Location permission, so those fields are best-effort. RSSI/noise are not
 //! redacted, which is what actually matters for signal diagnosis.
 
-use super::shared::{is_link_local, parse_addr, vendor_from_ip, vendor_from_processes};
+use super::shared::{
+    TOOL_DEADLINE, is_link_local, output_within, parse_addr, vendor_from_ip, vendor_from_processes,
+};
 use super::{AddrInfo, LinkInfo, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo};
 use std::net::IpAddr;
-use std::process::Command;
 
 pub struct MacOs;
 
@@ -41,13 +42,9 @@ impl Default for MacOs {
 /// report a perfectly good answer and then exit non-zero (`route` does it for
 /// a lookup that found nothing), and that answer is one we want.
 fn run(cmd: &str, args: &[&str]) -> Result<String, PlatformError> {
-    let out = Command::new(cmd)
-        .args(args)
-        .output()
-        .map_err(|e| PlatformError::Command(format!("{cmd}: {e}")))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    if !out.status.success() && stdout.trim().is_empty() {
-        return Err(classify_failure(cmd, &String::from_utf8_lossy(&out.stderr)));
+    let (status, stdout, stderr) = output_within(cmd, args, TOOL_DEADLINE)?;
+    if !status.success() && stdout.trim().is_empty() {
+        return Err(classify_failure(cmd, &stderr));
     }
     Ok(stdout)
 }

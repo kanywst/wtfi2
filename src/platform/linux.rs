@@ -15,12 +15,13 @@
 //! Unlike macOS, nothing here is redacted: `iw` reports the SSID and BSSID to
 //! any user.
 
-use super::shared::{is_link_local, parse_addr, vendor_from_ip, vendor_from_processes};
+use super::shared::{
+    TOOL_DEADLINE, is_link_local, output_within, parse_addr, vendor_from_ip, vendor_from_processes,
+};
 use super::{AddrInfo, LinkInfo, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo};
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
-use std::process::Command;
 
 pub struct Linux;
 
@@ -41,13 +42,8 @@ impl Default for Linux {
 /// Same contract as the macOS module's: a tool that refused to run is a
 /// failure to observe (`Command`), never evidence of an outage.
 fn run(cmd: &str, args: &[&str]) -> Result<String, PlatformError> {
-    let out = Command::new(cmd)
-        .args(args)
-        .output()
-        .map_err(|e| PlatformError::Command(format!("{cmd}: {e}")))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    if !out.status.success() && stdout.trim().is_empty() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    let (status, stdout, stderr) = output_within(cmd, args, TOOL_DEADLINE)?;
+    if !status.success() && stdout.trim().is_empty() {
         let detail = stderr
             .lines()
             .map(str::trim)

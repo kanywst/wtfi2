@@ -2,7 +2,7 @@
 
 use crate::diagnose::Verdict;
 use crate::json::{hop_id_str, status_str};
-use crate::model::{Hop, HopId, Path};
+use crate::model::{Fault, Hop, HopId, Path};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -24,6 +24,12 @@ pub struct Record {
     pub wan_ms: Option<f64>,
     pub wan_loss_pct: Option<f64>,
     pub rssi_dbm: Option<f64>,
+    /// Planned seconds until the next sweep, set by `--every`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_s: Option<u64>,
+    /// Some hop never reported (the sweep hit its deadline or a tool didn't run).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 impl Record {
@@ -38,6 +44,8 @@ impl Record {
             wan_ms: latency(HopId::Wan),
             wan_loss_pct: path.get(HopId::Wan).and_then(|h| h.loss_pct),
             rssi_dbm: path.get(HopId::Link).and_then(rssi_dbm),
+            interval_s: None,
+            partial: path.hops.iter().any(|h| h.fault == Some(Fault::Unobserved)),
         }
     }
 
@@ -128,23 +136,10 @@ pub fn render(records: &[Record]) -> String {
         return "No recorded sweeps yet. Run `wtfi --record` (or `wtfi -w --record`) to start.\n"
             .into();
     }
-    let ms = |v: Option<f64>| v.map_or("—".into(), |v| format!("{v:.0} ms"));
     let mut out = String::new();
     for r in records {
-        let wan = match r.wan_loss_pct.filter(|l| *l > 0.0) {
-            Some(l) => format!("{} {l:.0}%", ms(r.wan_ms)),
-            None => ms(r.wan_ms),
-        };
-        out.push_str(&format!(
-            "{}  {:<7}  {:<8}  gw {:>7}  wan {:>11}  {:>8}  {}\n",
-            utc(r.ts),
-            r.status,
-            r.first_break.as_deref().unwrap_or("—"),
-            ms(r.gateway_ms),
-            wan,
-            r.rssi_dbm.map_or("—".into(), |v| format!("{v:.0} dBm")),
-            r.headline,
-        ));
+        out.push_str(&line(r));
+        out.push('\n');
     }
     let count = |s: &str| records.iter().filter(|r| r.status == s).count();
     out.push_str(&format!(
@@ -157,8 +152,31 @@ pub fn render(records: &[Record]) -> String {
     out
 }
 
+/// One record as a table row, without the newline.
+pub fn line(r: &Record) -> String {
+    let ms = |v: Option<f64>| v.map_or("—".into(), |v| format!("{v:.0} ms"));
+    let wan = match r.wan_loss_pct.filter(|l| *l > 0.0) {
+        Some(l) => format!("{} {l:.0}%", ms(r.wan_ms)),
+        None => ms(r.wan_ms),
+    };
+    format!(
+        "{}  {:<7}  {:<8}  gw {:>7}  wan {:>11}  {:>8}  {}",
+        utc(r.ts),
+        r.status,
+        r.first_break.as_deref().unwrap_or("—"),
+        ms(r.gateway_ms),
+        wan,
+        r.rssi_dbm.map_or("—".into(), |v| format!("{v:.0} dBm")),
+        if r.partial {
+            format!("{} (partial sweep)", r.headline)
+        } else {
+            r.headline.clone()
+        },
+    )
+}
+
 /// `YYYY-MM-DD HH:MM:SSZ` (UTC; local time would need a tz database).
-fn utc(ts: u64) -> String {
+pub fn utc(ts: u64) -> String {
     let (days, secs) = (ts / 86_400, ts % 86_400);
     // Howard Hinnant's days-to-civil.
     let z = days as i64 + 719_468;
@@ -192,6 +210,8 @@ mod tests {
             wan_ms: Some(18.0),
             wan_loss_pct: None,
             rssi_dbm: Some(-52.0),
+            interval_s: None,
+            partial: false,
         }
     }
 
@@ -256,6 +276,22 @@ mod tests {
         assert_eq!(utc(0), "1970-01-01 00:00:00Z");
         assert_eq!(utc(951_782_400), "2000-02-29 00:00:00Z");
         assert_eq!(utc(1_792_078_245), "2026-10-15 15:30:45Z");
+    }
+
+    #[test]
+    fn a_cut_off_sweep_is_marked_partial() {
+        let mut path = crate::engine::skeleton();
+        path.get_mut(HopId::Wan).unwrap().fault = Some(Fault::Unobserved);
+        let verdict = crate::diagnose::diagnose(&path);
+        let r = Record::new(&path, &verdict, 7);
+        assert!(r.partial);
+        assert!(line(&r).ends_with("(partial sweep)"));
+        assert!(
+            serde_json::to_string(&record(0, "ok"))
+                .unwrap()
+                .find("partial")
+                .is_none()
+        );
     }
 
     #[test]

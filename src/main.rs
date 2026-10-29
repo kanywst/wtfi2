@@ -1,7 +1,7 @@
 use color_eyre::Result;
 use std::io::IsTerminal;
 use wtfi2::cli::Cli;
-use wtfi2::{diagnose, engine, history, json, platform, render, ui};
+use wtfi2::{diagnose, engine, history, json, platform, recorder, render, ui};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
     #[cfg(feature = "demo")]
     let demo = match cli.demo.as_deref() {
         None => None,
-        Some(v) => match wtfi2::demo::Scenario::parse(v, cli.watch) {
+        Some(v) => match wtfi2::demo::Scenario::parse(v, cli.watch || cli.every.is_some()) {
             Some(s) => Some(s),
             None => {
                 eprintln!("wtfi: unknown --demo scenario {v:?} (healthy, dns, isp)");
@@ -54,21 +54,28 @@ async fn main() -> Result<()> {
         std::process::exit(3);
     }
 
+    // The demo only records into an explicit WTFI_HISTORY, never the real file.
+    #[cfg(feature = "demo")]
+    let record_to =
+        record_to.filter(|_| demo.is_none() || std::env::var_os("WTFI_HISTORY").is_some());
+
+    if let Some(every) = cli.every {
+        let Some(file) = record_to else {
+            eprintln!("wtfi: --every needs somewhere to record (set WTFI_HISTORY)");
+            std::process::exit(64);
+        };
+        let deadline = cli.sweep_deadline();
+        recorder::run(every, &file, |n| sweep(demo, n, deadline)).await;
+        return Ok(());
+    }
+
     if cli.watch {
         return ui::run(cli.sweep_deadline(), record_to).await;
     }
 
-    #[cfg(feature = "demo")]
-    let path = match demo {
-        Some(scenario) => wtfi2::demo::run_once(scenario).await,
-        None => engine::run_once_within(cli.sweep_deadline()).await,
-    };
-    #[cfg(not(feature = "demo"))]
-    let path = engine::run_once_within(cli.sweep_deadline()).await;
+    let path = sweep(demo, 0, cli.sweep_deadline()).await;
     let verdict = diagnose::diagnose(&path);
 
-    #[cfg(feature = "demo")]
-    let record_to = record_to.filter(|_| demo.is_none());
     if let Some(file) = &record_to
         && let Err(e) = history::append(file, &history::Record::now(&path, &verdict))
     {
@@ -101,4 +108,21 @@ async fn main() -> Result<()> {
         wtfi2::model::Status::Skipped => 4,
         _ => 2,
     });
+}
+
+#[cfg(feature = "demo")]
+async fn sweep(
+    demo: Option<wtfi2::demo::Scenario>,
+    n: usize,
+    deadline: std::time::Duration,
+) -> wtfi2::model::Path {
+    match demo {
+        Some(scenario) => wtfi2::demo::run_sweep(scenario, n).await,
+        None => engine::run_once_within(deadline).await,
+    }
+}
+
+#[cfg(not(feature = "demo"))]
+async fn sweep(_: Option<()>, _: usize, deadline: std::time::Duration) -> wtfi2::model::Path {
+    engine::run_once_within(deadline).await
 }
