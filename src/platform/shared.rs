@@ -8,6 +8,7 @@ use super::PlatformError;
 use std::io::Read;
 use std::net::IpAddr;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 /// Ceiling on one system tool, so a wedged one can't pile up under `--every`.
@@ -22,17 +23,11 @@ pub(super) fn output_within(
     let fail = |e: std::io::Error| PlatformError::Command(format!("{cmd}: {e}"));
     let mut child = Command::new(cmd)
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(fail)?;
-    let drain = |mut pipe: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            String::from_utf8_lossy(&buf).into_owned()
-        })
-    };
     let out = drain(Box::new(child.stdout.take().unwrap()));
     let err = drain(Box::new(child.stderr.take().unwrap()));
     let start = Instant::now();
@@ -50,11 +45,43 @@ pub(super) fn output_within(
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    Ok((
-        status,
-        out.join().unwrap_or_default(),
-        err.join().unwrap_or_default(),
-    ))
+    // A helper the tool left behind can hold the pipes open; take what arrived by the deadline.
+    let left = deadline
+        .saturating_sub(start.elapsed())
+        .max(Duration::from_millis(100));
+    Ok((status, out.collect(left), err.collect(left)))
+}
+
+struct Drain {
+    buf: Arc<Mutex<Vec<u8>>>,
+    done: mpsc::Receiver<()>,
+}
+
+impl Drain {
+    fn collect(self, wait: Duration) -> String {
+        let _ = self.done.recv_timeout(wait);
+        let buf = self.buf.lock().map(|b| b.clone()).unwrap_or_default();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+}
+
+fn drain(mut pipe: Box<dyn Read + Send>) -> Drain {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let (tx, done) = mpsc::channel();
+    let sink = buf.clone();
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = pipe.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            if let Ok(mut b) = sink.lock() {
+                b.extend_from_slice(&chunk[..n]);
+            }
+        }
+        let _ = tx.send(());
+    });
+    Drain { buf, done }
 }
 
 /// Parse an address token, dropping any `%zone` scope suffix (`fe80::1%utun4`).
@@ -131,6 +158,29 @@ mod tests {
         let slow = output_within("sleep", &["5"], Duration::from_millis(200));
         assert!(matches!(slow, Err(PlatformError::Command(m)) if m.contains("gave up")));
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_helper_holding_the_pipe_doesnt_outlast_the_deadline() {
+        let start = Instant::now();
+        let (status, out, _) = output_within(
+            "sh",
+            &["-c", "echo hi; (sleep 5 &) ; exit 0"],
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(status.success() && out.trim() == "hi", "{out:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn tools_get_no_stdin() {
+        let (_, out, _) = output_within("sh", &["-c", "cat; echo done"], TOOL_DEADLINE).unwrap();
+        assert_eq!(out.trim(), "done");
     }
 
     #[test]
