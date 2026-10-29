@@ -38,6 +38,10 @@ pub struct Cli {
     #[arg(long = "no-redact", requires = "bundle")]
     pub no_redact: bool,
 
+    /// Serve the recorded history to an AI agent as an MCP server on stdio.
+    #[arg(long = "mcp", conflicts_with_all = ["watch", "record", "history", "json", "bundle"])]
+    pub mcp: bool,
+
     /// Disable ANSI color in the text report.
     #[arg(long = "no-color")]
     pub no_color: bool,

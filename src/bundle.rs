@@ -113,7 +113,7 @@ fn is_gap(a: &Record, b: &Record) -> bool {
 }
 
 /// Whether nothing has been recorded since `last` for longer than its planned interval.
-fn stale(last: &Record, now: u64) -> bool {
+pub fn stale(last: &Record, now: u64) -> bool {
     now > last.ts + last.interval_s.unwrap_or(UNKNOWN_INTERVAL_SECS) + GAP_SLACK_SECS
 }
 
@@ -413,7 +413,7 @@ fn span(secs: u64) -> String {
 }
 
 /// Drop nulls and empty arrays so each sweep costs fewer tokens.
-fn prune(v: &mut Value) {
+pub fn prune(v: &mut Value) {
     match v {
         Value::Object(map) => {
             map.retain(|_, x| !x.is_null() && !matches!(x, Value::Array(a) if a.is_empty()));

@@ -12,6 +12,7 @@ pub mod diagnose;
 pub mod engine;
 pub mod history;
 pub mod json;
+pub mod mcp;
 pub mod model;
 pub mod platform;
 pub mod probe;

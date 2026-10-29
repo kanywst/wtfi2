@@ -1,7 +1,7 @@
 use color_eyre::Result;
 use std::io::IsTerminal;
 use wtfi2::cli::Cli;
-use wtfi2::{bundle, diagnose, engine, history, json, platform, recorder, render, ui};
+use wtfi2::{bundle, diagnose, engine, history, json, mcp, platform, recorder, render, ui};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,6 +18,22 @@ async fn main() -> Result<()> {
         } else {
             print!("{}", history::render(&records));
         }
+        return Ok(());
+    }
+    if cli.mcp {
+        let log = |from, to, deadline| {
+            platform::Platform::network_log(&platform::current(), from, to, deadline)
+                .map_err(|e| e.to_string())
+        };
+        let server = mcp::Server {
+            history: history::default_path(),
+            log: std::sync::Arc::new(log),
+            now: None,
+            salt: std::hash::RandomState::new(),
+            sweeping: Default::default(),
+            reading: Default::default(),
+        };
+        mcp::serve(std::sync::Arc::new(server)).await?;
         return Ok(());
     }
     if let Some(since) = cli.bundle {

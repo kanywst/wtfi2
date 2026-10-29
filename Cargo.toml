@@ -27,7 +27,7 @@ path = "src/lib.rs"
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 # async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "net", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "net", "time", "sync", "io-std", "io-util"] }
 futures = "0.3"
 # errors
 color-eyre = "0.6"
