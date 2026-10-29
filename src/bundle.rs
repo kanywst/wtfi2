@@ -9,6 +9,8 @@ const MAX_SWEEPS: usize = 12;
 const MAX_TIMELINE: usize = 200;
 /// A recorder that planned to sweep in N seconds but didn't within N+60 wasn't running.
 const GAP_SLACK_SECS: u64 = 60;
+/// Assumed spacing for records that don't say (one-shot runs, older history).
+const UNKNOWN_INTERVAL_SECS: u64 = 600;
 
 type Field = fn(&Record) -> Option<f64>;
 
@@ -38,6 +40,10 @@ pub fn episodes(records: &[Record]) -> Vec<Episode> {
             open = false;
         }
         prev = Some(r);
+        // Only partly measured: neither proof of recovery nor of an outage.
+        if r.partial {
+            continue;
+        }
         match r.status.as_str() {
             "ok" => {
                 if open {
@@ -93,8 +99,12 @@ pub fn gaps(records: &[Record]) -> Vec<(u64, u64)> {
 }
 
 fn is_gap(a: &Record, b: &Record) -> bool {
-    a.interval_s
-        .is_some_and(|planned| b.ts > a.ts + planned + GAP_SLACK_SECS)
+    b.ts > a.ts + a.interval_s.unwrap_or(UNKNOWN_INTERVAL_SECS) + GAP_SLACK_SECS
+}
+
+/// Whether nothing has been recorded since `last` for longer than its planned interval.
+fn stale(last: &Record, now: u64) -> bool {
+    now > last.ts + last.interval_s.unwrap_or(UNKNOWN_INTERVAL_SECS) + GAP_SLACK_SECS
 }
 
 /// `redact` salts the masks; pass the same state to get the same tags across calls.
@@ -130,10 +140,21 @@ pub fn build(
         out.push_str("SSIDs, MAC addresses, public IPv4 addresses other than the probe anchors, this machine's IPv6 addresses and portal query strings are masked.\n");
     }
 
-    let eps = episodes(&owned);
+    let now = history::now_secs();
+    let mut eps = episodes(&owned);
+    if stale(last, now)
+        && let Some(e) = eps.last_mut().filter(|e| e.end.is_none())
+    {
+        e.cut = true;
+    }
     out.push_str("\n## Episodes\n\n");
-    if eps.is_empty() {
+    let partial = owned.iter().filter(|r| r.partial).count();
+    if eps.is_empty() && partial == 0 {
         out.push_str("Every sweep in this window was healthy.\n");
+    } else if eps.is_empty() {
+        out.push_str(&format!(
+            "No outage was measured, but {partial} sweeps were only partly measured.\n"
+        ));
     } else {
         out.push_str("| Start | Duration | Sweeps | Worst | First break | Headline |\n");
         out.push_str("| --- | --- | --- | --- | --- | --- |\n");
@@ -157,7 +178,10 @@ pub fn build(
         }
     }
 
-    let gaps = gaps(&owned);
+    let mut gaps = gaps(&owned);
+    if stale(last, now) {
+        gaps.push((last.ts, now));
+    }
     if !gaps.is_empty() {
         out.push_str("\n## Recorder not running\n\n");
         out.push_str(
@@ -177,13 +201,13 @@ pub fn build(
     out.push_str(
         "| Metric | Samples | p50 | Worst 5% | Worst |\n| --- | --- | --- | --- | --- |\n",
     );
-    let rows: [(&str, Field, bool); 4] = [
-        ("Gateway RTT (ms)", |r| r.gateway_ms, true),
-        ("Internet RTT (ms)", |r| r.wan_ms, true),
-        ("Internet loss (%)", |r| r.wan_loss_pct, true),
-        ("Wi-Fi RSSI (dBm)", |r| r.rssi_dbm, false),
+    let rows: [(&str, Field, bool, usize); 4] = [
+        ("Gateway RTT (ms)", |r| r.gateway_ms, true, 1),
+        ("Internet RTT (ms)", |r| r.wan_ms, true, 1),
+        ("Internet loss (%)", |r| r.wan_loss_pct, true, 1),
+        ("Wi-Fi RSSI (dBm)", |r| r.rssi_dbm, false, 0),
     ];
-    for (label, get, higher_is_worse) in rows {
+    for (label, get, higher_is_worse, dp) in rows {
         let mut v: Vec<f64> = owned.iter().filter_map(get).collect();
         v.sort_by(f64::total_cmp);
         if !higher_is_worse {
@@ -191,7 +215,7 @@ pub fn build(
         }
         match (pct(&v, 50.0), pct(&v, 95.0), v.last()) {
             (Some(p50), Some(p95), Some(worst)) => out.push_str(&format!(
-                "| {label} | {} | {p50:.0} | {p95:.0} | {worst:.0} |\n",
+                "| {label} | {} | {p50:.dp$} | {p95:.dp$} | {worst:.dp$} |\n",
                 v.len()
             )),
             _ => out.push_str(&format!("| {label} | 0 | — | — | — |\n")),
@@ -333,7 +357,7 @@ impl<'a> Redactor<'a> {
                     r.ssids.push(ssid.into());
                 }
                 for m in h["metrics"].as_array().into_iter().flatten() {
-                    let Some(value) = m["value"].as_str() else {
+                    let Some(value) = m["value"].as_str().filter(|v| !v.is_empty()) else {
                         continue;
                     };
                     let masked = match m["label"].as_str() {
@@ -585,6 +609,64 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_sweep_neither_starts_nor_ends_an_episode() {
+        let mut middle = rec(10, "ok", None, None);
+        middle.partial = true;
+        let r = [
+            rec(0, "fail", Some("dns"), None),
+            middle,
+            rec(20, "fail", Some("dns"), None),
+            rec(30, "ok", None, None),
+        ];
+        let e = episodes(&r);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert_eq!((e[0].start, e[0].end), (0, Some(30)));
+        let mut lone = rec(10, "warn", None, None);
+        lone.partial = true;
+        assert!(episodes(&[rec(0, "ok", None, None), lone, rec(20, "ok", None, None)]).is_empty());
+    }
+
+    #[test]
+    fn a_stale_tail_is_not_called_ongoing() {
+        let now = history::now_secs();
+        let old = [rec(now - 86_400, "fail", Some("dns"), Some(30))];
+        let out = build(&old, &[], 0, None);
+        assert!(!out.contains("ongoing"), "{out}");
+        assert!(
+            out.contains("then the recorder stopped") && out.contains("## Recorder not running"),
+            "{out}"
+        );
+        let fresh = [rec(now - 5, "fail", Some("dns"), Some(30))];
+        assert!(build(&fresh, &[], 0, None).contains("ongoing at"));
+    }
+
+    #[test]
+    fn small_losses_and_rtts_keep_a_decimal() {
+        let mut r = rec(0, "ok", None, None);
+        r.gateway_ms = Some(0.4);
+        r.wan_loss_pct = Some(0.4);
+        let out = build(&[r], &[], 0, None);
+        assert!(
+            out.contains("| Gateway RTT (ms) | 1 | 0.4 | 0.4 | 0.4 |"),
+            "{out}"
+        );
+        assert!(
+            out.contains("| Internet loss (%) | 1 | 0.4 | 0.4 | 0.4 |"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn an_empty_address_is_not_a_mask() {
+        let s = Snapshot {
+            ts: 0,
+            sweep: serde_json::json!({ "path": [{ "id": "host", "metrics": [{ "label": "IPv6", "value": "" }] }] }),
+        };
+        let state = RandomState::new();
+        assert_eq!(Redactor::new(&state, &[&s]).text("abc"), "abc");
+    }
+
+    #[test]
     fn unmeasured_sweeps_are_not_outages() {
         let r = [
             rec(0, "ok", None, None),
@@ -613,9 +695,14 @@ mod tests {
             rec(0, "ok", None, Some(30)),
             rec(30, "ok", None, Some(30)),
             rec(1000, "ok", None, None),
+            rec(1500, "ok", None, None),
             rec(9000, "ok", None, None),
         ];
-        assert_eq!(gaps(&r), [(30, 1000)], "no interval, no claim");
+        assert_eq!(
+            gaps(&r),
+            [(30, 1000), (1500, 9000)],
+            "without an interval, assume 10 minutes"
+        );
     }
 
     #[test]

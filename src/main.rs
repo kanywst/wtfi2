@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if let Some(since) = cli.bundle {
-        let since = now_secs().saturating_sub(since.as_secs());
+        let since = history::now_secs().saturating_sub(since.as_secs());
         let (records, sweeps) = match history::default_path() {
             Some(file) => (
                 history::load(&file, usize::MAX)?,
@@ -147,10 +147,4 @@ async fn sweep(
 #[cfg(not(feature = "demo"))]
 async fn sweep(_: Option<()>, _: usize, deadline: std::time::Duration) -> wtfi2::model::Path {
     engine::run_once_within(deadline).await
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }

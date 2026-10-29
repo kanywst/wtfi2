@@ -57,12 +57,14 @@ impl Record {
     }
 
     pub fn now(path: &Path, verdict: &Verdict) -> Self {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        Self::new(path, verdict, ts)
+        Self::new(path, verdict, now_secs())
     }
+}
+
+pub fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn rssi_dbm(link: &Hop) -> Option<f64> {
