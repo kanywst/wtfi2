@@ -11,8 +11,8 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-/// Ceiling on one system tool, so a wedged one can't pile up under `--every`.
-pub(super) const TOOL_DEADLINE: Duration = Duration::from_secs(10);
+/// Ceiling on one system tool: past the probe's own deadline nobody is waiting for it.
+pub(super) const TOOL_DEADLINE: Duration = crate::engine::PROBE_DEADLINE;
 
 /// Run `cmd`, killing it at `deadline`; returns its status, stdout and stderr.
 pub(super) fn output_within(
@@ -46,10 +46,11 @@ pub(super) fn output_within(
         std::thread::sleep(Duration::from_millis(20));
     };
     // A helper the tool left behind can hold the pipes open past the deadline.
-    let left = deadline
-        .saturating_sub(start.elapsed())
-        .max(Duration::from_millis(100));
-    match (out.collect(left), err.collect(left)) {
+    let until = Instant::now()
+        + deadline
+            .saturating_sub(start.elapsed())
+            .max(Duration::from_millis(100));
+    match (out.collect(until), err.collect(until)) {
         (Some(out), Some(err)) => Ok((status, out, err)),
         _ => Err(PlatformError::Command(format!(
             "{cmd}: output still open after exit"
@@ -63,9 +64,11 @@ struct Drain {
 }
 
 impl Drain {
-    /// Everything the pipe carried, or `None` if it was still open after `wait`.
-    fn collect(self, wait: Duration) -> Option<String> {
-        self.done.recv_timeout(wait).ok()?;
+    /// Everything the pipe carried, or `None` if it wasn't read to the end by `until`.
+    fn collect(self, until: Instant) -> Option<String> {
+        self.done
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+            .ok()?;
         let buf = self.buf.lock().ok()?.clone();
         Some(String::from_utf8_lossy(&buf).into_owned())
     }
@@ -77,12 +80,17 @@ fn drain(mut pipe: Box<dyn Read + Send>) -> Drain {
     let sink = buf.clone();
     std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
-        while let Ok(n) = pipe.read(&mut chunk) {
-            if n == 0 {
-                break;
-            }
-            if let Ok(mut b) = sink.lock() {
-                b.extend_from_slice(&chunk[..n]);
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Ok(mut b) = sink.lock() {
+                        b.extend_from_slice(&chunk[..n]);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                // Dropping `tx` unsent marks the read as incomplete.
+                Err(_) => return,
             }
         }
         let _ = tx.send(());
