@@ -35,7 +35,7 @@ struct App {
     wan_hist: VecDeque<f64>,
     scanning: bool,
     /// Feeds the history writer thread, under `--record`.
-    record_tx: Option<std::sync::mpsc::Sender<history::Record>>,
+    record_tx: Option<std::sync::mpsc::Sender<(history::Record, serde_json::Value)>>,
     /// Sweeps started so far; picks which scripted sweep `--demo` plays.
     #[cfg(feature = "demo")]
     sweeps: usize,
@@ -75,7 +75,10 @@ impl App {
             if self.scanning
                 && let Some(tx) = &self.record_tx
             {
-                let _ = tx.send(history::Record::now(&self.path, &self.verdict));
+                let _ = tx.send((
+                    history::Record::now(&self.path, &self.verdict),
+                    crate::json::to_value(&self.path, &self.verdict),
+                ));
             }
             self.scanning = false;
         }
@@ -89,10 +92,11 @@ impl App {
         }
         // One writer thread: file I/O stays off the render loop and appends
         // land in sweep order.
-        let (tx, rx) = std::sync::mpsc::channel::<history::Record>();
+        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            for record in rx {
-                let _ = history::append(&file, &record);
+            let mut log = history::Log::open(file);
+            for (record, sweep) in rx {
+                let _ = log.push(&record, sweep);
             }
         });
         self.record_tx = Some(tx);
@@ -143,9 +147,12 @@ pub async fn run(sweep_deadline: Duration, record_to: Option<PathBuf>) -> Result
         let path = engine::run_once_within(sweep_deadline).await;
         let verdict = diagnose(&path);
         if let Some(file) = &record_to
-            && let Err(e) = history::append(file, &history::Record::now(&path, &verdict))
+            && let Err(e) = history::Log::open(file.clone()).push(
+                &history::Record::now(&path, &verdict),
+                crate::json::to_value(&path, &verdict),
+            )
         {
-            eprintln!("wtfi: could not record to {}: {e}", file.display());
+            eprintln!("wtfi: could not record to {e}");
         }
         print!("{}", crate::render::report(&path, &verdict, true, false));
         return Ok(());

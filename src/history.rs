@@ -1,9 +1,11 @@
-//! Sweep history on disk (`--record` / `--history`), one JSON line per sweep.
+//! Sweep history on disk (`--record` / `--history`), one JSON line per sweep,
+//! plus full sweeps from around each change of state in `sweeps.jsonl`.
 
 use crate::diagnose::Verdict;
 use crate::json::{hop_id_str, status_str};
 use crate::model::{Fault, Hop, HopId, Path};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -11,6 +13,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Past this size the file is cut back to its newer half.
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
+const SWEEPS_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// Failed snapshot writes kept for retry; older ones are dropped.
+const MAX_UNWRITTEN: usize = 4;
+/// While broken, keep a full sweep at least this often.
+const RESNAPSHOT_SECS: u64 = 600;
 
 /// One finished sweep, flattened to the numbers a trend is drawn from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -79,11 +86,128 @@ pub fn default_path() -> Option<PathBuf> {
     Some(state.join("wtfi").join("history.jsonl"))
 }
 
+/// A full sweep (the `--json` document) and when it ran.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub ts: u64,
+    pub sweep: Value,
+}
+
+pub fn sweeps_path(history: &std::path::Path) -> PathBuf {
+    history.with_file_name("sweeps.jsonl")
+}
+
+/// Appends records, and full sweeps on either side of every change of state.
+pub struct Log {
+    file: PathBuf,
+    state: Option<String>,
+    held: Option<Snapshot>,
+    /// Snapshots whose write failed, retried first so the real edge still lands.
+    unwritten: Vec<Snapshot>,
+    last_snapshot: u64,
+}
+
+impl Log {
+    pub fn open(file: PathBuf) -> Self {
+        let last: Option<Record> = last_line(&file);
+        Log {
+            state: last.as_ref().map(state_of),
+            last_snapshot: last_line::<Snapshot>(&sweeps_path(&file))
+                .map(|s| s.ts)
+                .or_else(|| modified_secs(&sweeps_path(&file)))
+                .unwrap_or(0),
+            file,
+            held: None,
+            unwritten: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, record: &Record, sweep: Value) -> io::Result<()> {
+        let appended = append(&self.file, record).map_err(|e| at(&self.file, e));
+        let snapshot = Snapshot {
+            ts: record.ts,
+            sweep,
+        };
+        let state = state_of(record);
+        let changed = self.state.as_ref() != Some(&state);
+        let stale = record.status == "fail"
+            && record.ts >= self.last_snapshot + RESNAPSHOT_SECS
+            && self.unwritten.is_empty();
+        self.state = Some(state);
+        if changed || stale {
+            let before = self.held.take();
+            if changed && let Some(before) = before {
+                self.unwritten.push(before);
+            }
+            self.unwritten.push(snapshot);
+            let excess = self.unwritten.len().saturating_sub(MAX_UNWRITTEN);
+            self.unwritten.drain(..excess);
+            self.last_snapshot = record.ts;
+        } else {
+            self.held = Some(snapshot);
+        }
+        let to = sweeps_path(&self.file);
+        let mut flushed = Ok(());
+        while let Some(next) = self.unwritten.first() {
+            flushed = append_line(&to, next, SWEEPS_MAX_BYTES).map_err(|e| at(&to, e));
+            if flushed.is_err() {
+                break;
+            }
+            self.unwritten.remove(0);
+        }
+        appended.and(flushed)
+    }
+}
+
+fn at(file: &std::path::Path, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("{}: {e}", file.display()))
+}
+
+/// The last parseable line, read from the file's tail.
+fn last_line<T: serde::de::DeserializeOwned>(file: &std::path::Path) -> Option<T> {
+    let mut f = fs::File::open(file).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(64 * 1024)))
+        .ok()?;
+    let mut tail = Vec::new();
+    f.read_to_end(&mut tail).ok()?;
+    String::from_utf8_lossy(&tail)
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str(l).ok())
+}
+
+fn modified_secs(file: &std::path::Path) -> Option<u64> {
+    let modified = fs::metadata(file).ok()?.modified().ok()?;
+    Some(modified.duration_since(UNIX_EPOCH).ok()?.as_secs())
+}
+
+fn state_of(r: &Record) -> String {
+    format!(
+        "{}|{}|{}",
+        r.status,
+        r.first_break.as_deref().unwrap_or(""),
+        r.headline
+    )
+}
+
+/// Every snapshot taken at or after `since`, oldest first.
+pub fn load_sweeps(history: &std::path::Path, since: u64) -> io::Result<Vec<Snapshot>> {
+    Ok(read_lines(&sweeps_path(history))?
+        .into_iter()
+        .filter(|s: &Snapshot| s.ts >= since)
+        .collect())
+}
+
 pub fn append(file: &std::path::Path, record: &Record) -> io::Result<()> {
+    append_line(file, record, MAX_BYTES)
+}
+
+fn append_line<T: Serialize>(file: &std::path::Path, record: &T, max: u64) -> io::Result<()> {
     if let Some(dir) = file.parent() {
         fs::create_dir_all(dir)?;
     }
-    if fs::metadata(file).is_ok_and(|m| m.len() > MAX_BYTES) {
+    if fs::metadata(file).is_ok_and(|m| m.len() > max) {
         trim(file)?;
     }
     let mut out = OpenOptions::new()
@@ -117,18 +241,22 @@ fn trim(file: &std::path::Path) -> io::Result<()> {
 
 /// The newest `n` records, oldest first. Unparseable lines are skipped.
 pub fn load(file: &std::path::Path, n: usize) -> io::Result<Vec<Record>> {
+    let mut records: Vec<Record> = read_lines(file)?;
+    let skip = records.len().saturating_sub(n);
+    records.drain(..skip);
+    Ok(records)
+}
+
+fn read_lines<T: serde::de::DeserializeOwned>(file: &std::path::Path) -> io::Result<Vec<T>> {
     let text = match fs::read_to_string(file) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
-    let mut records: Vec<Record> = text
+    Ok(text
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    let skip = records.len().saturating_sub(n);
-    records.drain(..skip);
-    Ok(records)
+        .collect())
 }
 
 pub fn render(records: &[Record]) -> String {
@@ -269,6 +397,129 @@ mod tests {
             "the new record survives the trim"
         );
         assert!(fs::metadata(&f).unwrap().len() <= MAX_BYTES);
+    }
+
+    #[test]
+    fn full_sweeps_are_kept_around_each_change_only() {
+        let f = tempfile("sweeps");
+        let mut log = Log::open(f.clone());
+        let statuses = ["ok", "ok", "ok", "fail", "fail", "ok"];
+        for (ts, status) in statuses.iter().enumerate() {
+            let r = record(ts as u64, status);
+            log.push(&r, serde_json::json!({ "n": ts })).unwrap();
+        }
+        let ts: Vec<u64> = load_sweeps(&f, 0).unwrap().iter().map(|s| s.ts).collect();
+        assert_eq!(ts, [0, 2, 3, 4, 5], "first, then both sides of each change");
+        assert_eq!(load(&f, 10).unwrap().len(), 6, "every record still lands");
+        assert_eq!(load_sweeps(&f, 4).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_long_outage_is_resnapshotted() {
+        let f = tempfile("resnapshot");
+        let mut log = Log::open(f.clone());
+        for ts in (0..=1200).step_by(300) {
+            log.push(&record(ts, "fail"), Value::Null).unwrap();
+        }
+        let ts: Vec<u64> = load_sweeps(&f, 0).unwrap().iter().map(|s| s.ts).collect();
+        assert_eq!(ts, [0, 600, 1200]);
+    }
+
+    #[test]
+    fn a_reopened_log_remembers_the_last_state() {
+        let f = tempfile("reopen");
+        Log::open(f.clone())
+            .push(&record(0, "fail"), Value::Null)
+            .unwrap();
+        Log::open(f.clone())
+            .push(&record(1, "fail"), Value::Null)
+            .unwrap();
+        Log::open(f.clone())
+            .push(&record(2, "ok"), Value::Null)
+            .unwrap();
+        let ts: Vec<u64> = load_sweeps(&f, 0).unwrap().iter().map(|s| s.ts).collect();
+        assert_eq!(
+            ts,
+            [0, 2],
+            "a one-shot run can't hold, so it only skips repeats"
+        );
+    }
+
+    #[test]
+    fn reopening_on_a_short_cadence_still_resnapshots_a_long_outage() {
+        let f = tempfile("cadence");
+        for ts in (0..=1500).step_by(300) {
+            Log::open(f.clone())
+                .push(&record(ts, "fail"), Value::Null)
+                .unwrap();
+        }
+        let ts: Vec<u64> = load_sweeps(&f, 0).unwrap().iter().map(|s| s.ts).collect();
+        assert_eq!(ts, [0, 600, 1200]);
+    }
+
+    #[test]
+    fn snapshots_stay_in_order_around_a_resnapshot() {
+        let f = tempfile("resnapshot-order");
+        let mut log = Log::open(f.clone());
+        for (ts, status) in [(0, "fail"), (300, "fail"), (600, "fail"), (605, "ok")] {
+            log.push(&record(ts, status), Value::Null).unwrap();
+        }
+        let ts: Vec<u64> = load_sweeps(&f, 0).unwrap().iter().map(|s| s.ts).collect();
+        assert_eq!(ts, [0, 600, 605]);
+    }
+
+    #[test]
+    fn a_failed_snapshot_write_is_retried_on_the_next_sweep() {
+        let f = tempfile("retry");
+        let mut log = Log::open(f.clone());
+        log.push(&record(0, "ok"), Value::Null).unwrap();
+        let sweeps = sweeps_path(&f);
+        fs::remove_file(&sweeps).unwrap();
+        fs::create_dir(&sweeps).unwrap();
+        let err = log.push(&record(10, "fail"), Value::Null).unwrap_err();
+        assert!(err.to_string().contains("sweeps.jsonl"), "{err}");
+        fs::remove_dir(&sweeps).unwrap();
+        log.push(&record(20, "fail"), Value::Null).unwrap();
+        let ts: Vec<u64> = load_sweeps(&f, 0).unwrap().iter().map(|s| s.ts).collect();
+        assert_eq!(
+            ts,
+            [10],
+            "the real edge lands once the file is writable again"
+        );
+    }
+
+    #[test]
+    fn a_failed_history_write_still_snapshots_the_edge() {
+        let f = tempfile("history-fails");
+        let mut log = Log::open(f.clone());
+        log.push(&record(0, "ok"), Value::Null).unwrap();
+        log.push(&record(5, "ok"), Value::Null).unwrap();
+        fs::remove_file(&f).unwrap();
+        fs::create_dir(&f).unwrap();
+        assert!(log.push(&record(10, "fail"), Value::Null).is_err());
+        let ts: Vec<u64> = load_sweeps(&f, 0).unwrap().iter().map(|s| s.ts).collect();
+        assert_eq!(ts, [0, 5, 10], "both sides of the edge are kept");
+    }
+
+    #[test]
+    fn an_unwritable_sweeps_file_doesnt_grow_the_queue_forever() {
+        let f = tempfile("queue");
+        let mut log = Log::open(f.clone());
+        fs::create_dir_all(sweeps_path(&f)).unwrap();
+        for (i, status) in ["ok", "fail"].iter().cycle().take(20).enumerate() {
+            let _ = log.push(&record(i as u64, status), Value::Null);
+        }
+        assert!(log.unwritten.len() <= MAX_UNWRITTEN);
+    }
+
+    #[test]
+    fn a_steady_degradation_is_not_resnapshotted() {
+        let f = tempfile("warn");
+        let mut log = Log::open(f.clone());
+        for ts in (0..=1200).step_by(300) {
+            log.push(&record(ts, "warn"), Value::Null).unwrap();
+        }
+        assert_eq!(load_sweeps(&f, 0).unwrap().len(), 1);
     }
 
     #[test]
