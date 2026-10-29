@@ -2,6 +2,7 @@
 //! internet. This is the model the topology diagram renders.
 
 use super::Status;
+use std::net::IpAddr;
 
 /// OSI-ish layer a hop lives at, used for grouping and coloring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,14 +239,47 @@ impl Path {
     pub fn upsert(&mut self, hop: Hop) {
         if let Some(slot) = self.get_mut(hop.id) {
             *slot = hop;
+        } else {
+            let pos = self
+                .hops
+                .iter()
+                .position(|h| (h.id as usize) > (hop.id as usize))
+                .unwrap_or(self.hops.len());
+            self.hops.insert(pos, hop);
+        }
+        self.excuse_silent_gateway();
+    }
+
+    /// A gateway that ignores every probe is still forwarding if the internet answers through it.
+    fn excuse_silent_gateway(&mut self) {
+        let family = |subtitle: &Option<String>| {
+            subtitle
+                .as_deref()
+                .and_then(|s| s.split_whitespace().next()?.parse::<IpAddr>().ok())
+                .map(|ip| ip.is_ipv4())
+        };
+        let Some(gw) = self.get(HopId::Gateway) else {
+            return;
+        };
+        let forwarding = self.get(HopId::Wan).is_some_and(|w| {
+            matches!(w.status, Status::Ok | Status::Warn)
+                && !matches!(w.fault, Some(Fault::Unobserved | Fault::HandshakeOnly))
+                && family(&w.subtitle).is_some()
+                && family(&w.subtitle) == family(&gw.subtitle)
+        });
+        if !forwarding || gw.status != Status::Fail || gw.fault != Some(Fault::GatewaySilent) {
             return;
         }
-        let pos = self
-            .hops
-            .iter()
-            .position(|h| (h.id as usize) > (hop.id as usize))
-            .unwrap_or(self.hops.len());
-        self.hops.insert(pos, hop);
+        let gw = self.get_mut(HopId::Gateway).unwrap();
+        gw.status = Status::Ok;
+        gw.fault = None;
+        gw.loss_pct = None;
+        gw.jitter_ms = None;
+        gw.metrics
+            .retain(|m| m.label != "Loss" && m.label != "Jitter");
+        gw.metrics
+            .push(Metric::new("Probes", "unanswered (filtered)"));
+        gw.summary = Some("Router doesn't answer probes, but traffic passes through it".into());
     }
 
     /// The first hop (closest to the host) that is broken, if any.
@@ -270,6 +304,88 @@ impl Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn silent_gateway() -> Hop {
+        let mut gw = Hop::new(HopId::Gateway, Layer::Network, "Gateway");
+        gw.subtitle = Some("10.0.0.1".into());
+        gw.fail(Fault::GatewaySilent, "Router isn't answering");
+        gw.loss_pct = Some(100.0);
+        gw.metrics.push(Metric::new("Loss", "100% (5/5 lost)"));
+        gw
+    }
+
+    fn wan(status: Status) -> Hop {
+        let mut w = Hop::new(HopId::Wan, Layer::Internet, "Internet");
+        w.status = status;
+        w.subtitle = Some("8.8.8.8 (Google)".into());
+        w
+    }
+
+    #[test]
+    fn a_silent_gateway_that_forwards_is_not_a_break() {
+        for gateway_first in [true, false] {
+            let mut p = Path::default();
+            if gateway_first {
+                p.upsert(silent_gateway());
+                p.upsert(wan(Status::Ok));
+            } else {
+                p.upsert(wan(Status::Warn));
+                p.upsert(silent_gateway());
+            }
+            let gw = p.get(HopId::Gateway).unwrap();
+            assert_eq!(gw.status, Status::Ok, "gateway_first={gateway_first}");
+            assert_eq!(gw.fault, None);
+            assert_eq!(gw.loss_pct, None);
+            assert!(gw.metrics.iter().all(|m| m.label != "Loss"));
+            assert!(p.first_break().is_none());
+        }
+    }
+
+    #[test]
+    fn a_silent_gateway_stays_broken_when_nothing_gets_through() {
+        for wan_status in [Status::Fail, Status::Skipped, Status::Pending] {
+            let mut p = Path::default();
+            p.upsert(silent_gateway());
+            p.upsert(wan(wan_status));
+            assert_eq!(
+                p.first_break().map(|h| h.id),
+                Some(HopId::Gateway),
+                "{wan_status:?}"
+            );
+        }
+        for fault in [Fault::Unobserved, Fault::HandshakeOnly] {
+            let mut w = wan(Status::Warn);
+            w.fault = Some(fault);
+            let mut p = Path::default();
+            p.upsert(silent_gateway());
+            p.upsert(w);
+            assert_eq!(
+                p.first_break().map(|h| h.id),
+                Some(HopId::Gateway),
+                "{fault:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_wan_success_over_the_gateways_family_counts() {
+        let mut w = wan(Status::Warn);
+        w.subtitle = Some("2606:4700:4700::1111 (Cloudflare v6)".into());
+        let mut p = Path::default();
+        p.upsert(silent_gateway());
+        p.upsert(w);
+        assert_eq!(p.first_break().map(|h| h.id), Some(HopId::Gateway));
+    }
+
+    #[test]
+    fn a_pending_gateway_keeps_waiting_for_its_own_result() {
+        let mut gw = silent_gateway();
+        gw.status = Status::Pending;
+        let mut p = Path::default();
+        p.upsert(gw);
+        p.upsert(wan(Status::Ok));
+        assert_eq!(p.get(HopId::Gateway).unwrap().status, Status::Pending);
+    }
 
     #[test]
     fn first_break_returns_earliest_fail() {

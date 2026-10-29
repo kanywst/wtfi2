@@ -505,7 +505,10 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
                 // in practice the LAN is always clean here and the loss starts
                 // past your own kit — worth saying out loud. Guarded anyway so
                 // a future gateway grade can't make the claim retroactively.
-                let lan = if hop_status(path, HopId::Gateway) == Status::Ok {
+                let measured = path
+                    .get(HopId::Gateway)
+                    .is_some_and(|g| g.status == Status::Ok && g.latency_ms.is_some());
+                let lan = if measured {
                     " Your LAN is clean — the router answers every probe — so this starts past your own equipment."
                 } else {
                     ""
@@ -1252,10 +1255,12 @@ mod tests {
 
     #[test]
     fn clean_lan_with_lossy_wan_blames_the_uplink() {
-        let p = Path {
+        let mut gw = hop(HopId::Gateway, Layer::Network, Status::Ok);
+        gw.latency_ms = Some(3.0);
+        let mut p = Path {
             hops: vec![
                 hop(HopId::Link, Layer::Link, Status::Ok),
-                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                gw,
                 lossy(HopId::Wan, Layer::Internet, 40.0),
                 hop(HopId::Dns, Layer::Application, Status::Ok),
             ],
@@ -1268,6 +1273,12 @@ mod tests {
         );
         assert!(v.cause.contains("LAN is clean"));
         assert!(v.fix.as_deref().unwrap().contains("ISP"));
+
+        p.get_mut(HopId::Gateway).unwrap().latency_ms = None;
+        assert!(
+            !diagnose(&p).cause.contains("LAN is clean"),
+            "a gateway that never answered can't vouch for the LAN"
+        );
     }
 
     #[test]
