@@ -113,7 +113,7 @@ fn is_gap(a: &Record, b: &Record) -> bool {
 }
 
 /// Whether nothing has been recorded since `last` for longer than its planned interval.
-fn stale(last: &Record, now: u64) -> bool {
+pub fn stale(last: &Record, now: u64) -> bool {
     now > last.ts + last.interval_s.unwrap_or(UNKNOWN_INTERVAL_SECS) + GAP_SLACK_SECS
 }
 

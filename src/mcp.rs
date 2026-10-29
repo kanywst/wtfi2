@@ -152,7 +152,13 @@ impl Server {
         let windowed: Vec<_> = records.iter().filter(|r| r.ts >= since).cloned().collect();
         Ok(match name {
             "list_episodes" => {
-                let eps: Vec<Value> = bundle::episodes(&windowed)
+                let mut eps = bundle::episodes(&windowed);
+                if windowed.last().is_some_and(|l| bundle::stale(l, now))
+                    && let Some(e) = eps.last_mut().filter(|e| e.end.is_none())
+                {
+                    e.cut = true;
+                }
+                let eps: Vec<Value> = eps
                     .iter()
                     .map(|e| {
                         json!({
