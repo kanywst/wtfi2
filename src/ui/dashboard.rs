@@ -75,10 +75,9 @@ impl App {
             if self.scanning
                 && let Some(tx) = &self.record_tx
             {
-                let _ = tx.send((
-                    history::Record::now(&self.path, &self.verdict),
-                    crate::json::to_value(&self.path, &self.verdict),
-                ));
+                let mut record = history::Record::now(&self.path, &self.verdict);
+                record.interval_s = Some(REPROBE_SECS);
+                let _ = tx.send((record, crate::json::to_value(&self.path, &self.verdict)));
             }
             self.scanning = false;
         }

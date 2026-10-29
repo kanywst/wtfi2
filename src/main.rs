@@ -1,7 +1,7 @@
 use color_eyre::Result;
 use std::io::IsTerminal;
 use wtfi2::cli::Cli;
-use wtfi2::{diagnose, engine, history, json, platform, recorder, render, ui};
+use wtfi2::{bundle, diagnose, engine, history, json, platform, recorder, render, ui};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,6 +18,22 @@ async fn main() -> Result<()> {
         } else {
             print!("{}", history::render(&records));
         }
+        return Ok(());
+    }
+    if let Some(since) = cli.bundle {
+        let since = history::now_secs().saturating_sub(since.as_secs());
+        let (records, sweeps) = match history::default_path() {
+            Some(file) => (
+                history::load(&file, usize::MAX)?,
+                history::load_sweeps(&file, since)?,
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        let redact = (!cli.no_redact).then(std::hash::RandomState::new);
+        print!(
+            "{}",
+            bundle::build(&records, &sweeps, since, redact.as_ref())
+        );
         return Ok(());
     }
     let record_to = cli.record.then(history::default_path).flatten();
