@@ -4,7 +4,58 @@
 //! same way: which address is only link-local, and which VPN a tunnel belongs
 //! to. Keeping one copy means a vendor added for one OS reaches the others.
 
+use super::PlatformError;
+use std::io::Read;
 use std::net::IpAddr;
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+/// Ceiling on one system tool, so a wedged one can't pile up under `--every`.
+pub(super) const TOOL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Run `cmd`, killing it at `deadline`; returns its status, stdout and stderr.
+pub(super) fn output_within(
+    cmd: &str,
+    args: &[&str],
+    deadline: Duration,
+) -> Result<(ExitStatus, String, String), PlatformError> {
+    let fail = |e: std::io::Error| PlatformError::Command(format!("{cmd}: {e}"));
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(fail)?;
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    };
+    let out = drain(Box::new(child.stdout.take().unwrap()));
+    let err = drain(Box::new(child.stderr.take().unwrap()));
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(fail)? {
+            break status;
+        }
+        if start.elapsed() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(PlatformError::Command(format!(
+                "{cmd}: gave up after {}s",
+                deadline.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Ok((
+        status,
+        out.join().unwrap_or_default(),
+        err.join().unwrap_or_default(),
+    ))
+}
 
 /// Parse an address token, dropping any `%zone` scope suffix (`fe80::1%utun4`).
 pub(super) fn parse_addr(tok: &str) -> Option<IpAddr> {
@@ -63,6 +114,24 @@ pub(super) fn vendor_from_processes(ps: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wedged_tool_is_killed_at_its_deadline() {
+        let (status, out, err) = output_within(
+            "sh",
+            &["-c", "echo hi; echo oops >&2; exit 3"],
+            TOOL_DEADLINE,
+        )
+        .unwrap();
+        assert_eq!(
+            (status.code(), out.trim(), err.trim()),
+            (Some(3), "hi", "oops")
+        );
+        let start = Instant::now();
+        let slow = output_within("sleep", &["5"], Duration::from_millis(200));
+        assert!(matches!(slow, Err(PlatformError::Command(m)) if m.contains("gave up")));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn vendor_detects_tailscale_cgnat() {
