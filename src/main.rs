@@ -30,9 +30,14 @@ async fn main() -> Result<()> {
             None => (Vec::new(), Vec::new()),
         };
         let redact = (!cli.no_redact).then(std::hash::RandomState::new);
+        let platform = platform::current();
+        let log = |from, to, deadline| {
+            platform::Platform::network_log(&platform, from, to, deadline)
+                .map_err(|e| e.to_string())
+        };
         print!(
             "{}",
-            bundle::build(&records, &sweeps, since, redact.as_ref())
+            bundle::build(&records, &sweeps, since, redact.as_ref(), &log)
         );
         return Ok(());
     }

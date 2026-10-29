@@ -3,7 +3,9 @@
 //! Exists so the crate compiles off macOS — crates.io and docs.rs both build
 //! there. Every query refuses rather than inventing a reading.
 
-use super::{AddrInfo, LinkInfo, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo};
+use super::{
+    AddrInfo, LinkInfo, LogLine, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo,
+};
 
 pub struct Unsupported;
 
@@ -29,6 +31,15 @@ impl Platform for Unsupported {
     }
 
     fn vpn(&self, _route: &RouteInfo) -> Result<VpnInfo, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    fn network_log(
+        &self,
+        _from: u64,
+        _to: u64,
+        _deadline: std::time::Duration,
+    ) -> Result<LogRead, PlatformError> {
         Err(PlatformError::Unsupported)
     }
 }

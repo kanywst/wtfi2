@@ -11,14 +11,19 @@
 //!   is missing.
 //! - `/etc/resolv.conf`, or systemd-resolved's upstream list when that file
 //!   only names the local stub.
+//! - `journalctl` — NetworkManager, networkd, resolved, DHCP client and Wi-Fi
+//!   supplicant logs, for `--bundle` (needs the `systemd-journal` group to see them)
 //!
 //! Unlike macOS, nothing here is redacted: `iw` reports the SSID and BSSID to
 //! any user.
 
 use super::shared::{
-    TOOL_DEADLINE, is_link_local, output_within, parse_addr, vendor_from_ip, vendor_from_processes,
+    LOG_DEADLINE, TOOL_DEADLINE, is_link_local, output_within, parse_addr, run_bounded,
+    vendor_from_ip, vendor_from_processes,
 };
-use super::{AddrInfo, LinkInfo, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo};
+use super::{
+    AddrInfo, LinkInfo, LogLine, LogRead, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo,
+};
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -63,7 +68,111 @@ fn is_wireless(iface: &str) -> bool {
     base.join("wireless").exists() || base.join("phy80211").exists()
 }
 
+const LOG_IDENTIFIERS: [&str; 7] = [
+    "NetworkManager",
+    "systemd-networkd",
+    "systemd-resolved",
+    "wpa_supplicant",
+    "iwd",
+    "dhclient",
+    "dhcpcd",
+];
+
+/// Parsed lines, and how many entries couldn't be read.
+fn parse_journal(json: &str) -> (Vec<LogLine>, usize) {
+    let entries = json
+        .lines()
+        .filter(|l| l.contains("\"__REALTIME_TIMESTAMP\""))
+        .count();
+    let lines: Vec<LogLine> = json
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| {
+            let micros: u64 = v["__REALTIME_TIMESTAMP"].as_str()?.parse().ok()?;
+            let ts = micros / 1_000_000;
+            let source = v["SYSLOG_IDENTIFIER"]
+                .as_str()
+                .or(v["_COMM"].as_str())?
+                .to_string();
+            let message = match &v["MESSAGE"] {
+                Value::String(m) => m.clone(),
+                Value::Array(bytes) => String::from_utf8_lossy(
+                    &bytes
+                        .iter()
+                        .filter_map(|b| b.as_u64().map(|b| b as u8))
+                        .collect::<Vec<_>>(),
+                )
+                .into_owned(),
+                // journald stores oversized or binary messages without the text.
+                Value::Null => "(message not captured)".into(),
+                _ => return None,
+            };
+            let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+            Some(LogLine {
+                ts,
+                source,
+                message,
+            })
+        })
+        .collect();
+    let unreadable = entries.saturating_sub(lines.len());
+    (lines, unreadable)
+}
+
+/// Lines read, or an error when journalctl could only see this user's own journal.
+fn journal_result(
+    out: &str,
+    err: &str,
+    incomplete: Option<String>,
+) -> Result<LogRead, PlatformError> {
+    if err.contains("not seeing messages from other users")
+        || err.contains("insufficient permissions")
+    {
+        return Err(PlatformError::Command(
+            "journalctl can't read the system journal (add yourself to the systemd-journal group)"
+                .into(),
+        ));
+    }
+    let (lines, unreadable) = parse_journal(out);
+    if lines.is_empty() && unreadable > 0 {
+        return Err(PlatformError::Parse(
+            "journalctl printed entries wtfi couldn't read".into(),
+        ));
+    }
+    Ok(LogRead {
+        lines,
+        unreadable,
+        incomplete,
+    })
+}
+
 impl Platform for Linux {
+    fn network_log(
+        &self,
+        from: u64,
+        to: u64,
+        deadline: std::time::Duration,
+    ) -> Result<LogRead, PlatformError> {
+        let (since, until) = (format!("@{from}"), format!("@{to}"));
+        // C locale, so the permission hint below matches whatever the user's language is.
+        let mut args = vec![
+            "LC_ALL=C",
+            "journalctl",
+            "--no-pager",
+            "-o",
+            "json",
+            "--since",
+            &since,
+            "--until",
+            &until,
+        ];
+        for id in LOG_IDENTIFIERS {
+            args.extend(["-t", id]);
+        }
+        let (out, err, incomplete) = run_bounded("env", &args, deadline.min(LOG_DEADLINE))?;
+        journal_result(&out, &err, incomplete)
+    }
+
     fn route(&self) -> Result<RouteInfo, PlatformError> {
         let mut info = match ip_default_route() {
             Ok(info) => info,
@@ -614,6 +723,61 @@ fn is_resolved_stub(ip: &IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_lines_keep_time_unit_and_message() {
+        let json = concat!(
+            r#"{"__REALTIME_TIMESTAMP":"1793186853000000","SYSLOG_IDENTIFIER":"NetworkManager","MESSAGE":"<info>  device (wlan0): state change"}"#,
+            "\n",
+            r#"{"__REALTIME_TIMESTAMP":"1793186854000000","_COMM":"iwd","MESSAGE":[104,105,255]}"#,
+        );
+        assert_eq!(
+            parse_journal(json).0,
+            [
+                LogLine {
+                    ts: 1_793_186_853,
+                    source: "NetworkManager".into(),
+                    message: "<info> device (wlan0): state change".into(),
+                },
+                LogLine {
+                    ts: 1_793_186_854,
+                    source: "iwd".into(),
+                    message: "hi\u{fffd}".into(),
+                }
+            ]
+        );
+        assert!(
+            journal_result(
+                "",
+                "Hint: You are currently not seeing messages from other users and the system.",
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            journal_result(
+                "",
+                "No journal files were opened due to insufficient permissions.",
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(journal_result("", "", None).unwrap(), LogRead::default());
+        assert!(
+            journal_result(r#"{"__REALTIME_TIMESTAMP":"x"}"#, "", None).is_err(),
+            "unreadable entries aren't silence"
+        );
+        let null = r#"{"__REALTIME_TIMESTAMP":"1793186853000000","SYSLOG_IDENTIFIER":"iwd","MESSAGE":null}"#;
+        assert_eq!(parse_journal(null).0[0].message, "(message not captured)");
+        let mixed = r#"{"__REALTIME_TIMESTAMP":"1793186853000000","SYSLOG_IDENTIFIER":"iwd","MESSAGE":"ok"}
+{"__REALTIME_TIMESTAMP":"x"}"#;
+        assert_eq!(
+            journal_result(mixed, "", Some("journalctl exited early".into()))
+                .unwrap()
+                .unreadable,
+            1
+        );
+    }
 
     const ROUTE: &str = r#"[{"dst":"default","gateway":"192.168.1.1","dev":"wlp2s0","protocol":"dhcp","prefsrc":"192.168.1.23","metric":600,"flags":[]},{"dst":"default","gateway":"10.0.0.1","dev":"enp3s0","protocol":"dhcp","metric":100,"flags":[]}]"#;
 

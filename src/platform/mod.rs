@@ -165,6 +165,25 @@ pub struct VpnInfo {
     pub vendor: Option<String>,
 }
 
+/// One line from the OS's network log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogLine {
+    /// Unix seconds.
+    pub ts: u64,
+    pub source: String,
+    pub message: String,
+}
+
+/// What one OS log read returned.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LogRead {
+    pub lines: Vec<LogLine>,
+    /// Entries the log printed that couldn't be parsed.
+    pub unreadable: usize,
+    /// Why the read may have stopped short.
+    pub incomplete: Option<String>,
+}
+
 /// Errors from platform data acquisition.
 #[derive(Debug)]
 pub enum PlatformError {
@@ -216,6 +235,13 @@ pub trait Platform: Send + Sync {
     /// independently lets the two reads disagree, and the VPN hop then grades
     /// one tunnel's mode against another's route.
     fn vpn(&self, route: &RouteInfo) -> Result<VpnInfo, PlatformError>;
+    /// Network-related OS log lines between two Unix times, oldest first.
+    fn network_log(
+        &self,
+        from: u64,
+        to: u64,
+        deadline: std::time::Duration,
+    ) -> Result<LogRead, PlatformError>;
 }
 
 /// Return the platform implementation for the current OS.
