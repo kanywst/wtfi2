@@ -1022,14 +1022,14 @@ mod tests {
     fn a_stale_tail_is_not_called_ongoing() {
         let now = history::now_secs();
         let old = [rec(now - 86_400, "fail", Some("dns"), Some(30))];
-        let out = build(&old, &[], 0, None);
+        let out = build(&old, &[], 0, None, &no_log);
         assert!(!out.contains("ongoing"), "{out}");
         assert!(
             out.contains("then the recorder stopped") && out.contains("## Recorder not running"),
             "{out}"
         );
         let fresh = [rec(now - 5, "fail", Some("dns"), Some(30))];
-        assert!(build(&fresh, &[], 0, None).contains("ongoing at"));
+        assert!(build(&fresh, &[], 0, None, &no_log).contains("ongoing at"));
     }
 
     #[test]
@@ -1037,7 +1037,7 @@ mod tests {
         let mut r = rec(0, "ok", None, None);
         r.gateway_ms = Some(0.4);
         r.wan_loss_pct = Some(0.4);
-        let out = build(&[r], &[], 0, None);
+        let out = build(&[r], &[], 0, None, &no_log);
         assert!(
             out.contains("| Gateway RTT (ms) | 1 | 0.4 | 0.4 | 0.4 |"),
             "{out}"
