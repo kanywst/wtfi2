@@ -307,9 +307,17 @@ pub fn line(r: &Record) -> String {
 
 /// Unix seconds for a UTC `YYYY-MM-DD HH:MM:SS` prefix.
 pub fn parse_utc(s: &str) -> Option<u64> {
-    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let n = |r: std::ops::Range<usize>| {
+        let f = s.get(r)?;
+        f.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| f.parse::<i64>().ok())?
+    };
     let (y, m, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
     let (hh, mm, ss) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
     // Howard Hinnant's days-from-civil.
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -546,6 +554,15 @@ mod tests {
         assert_eq!(utc(1_792_078_245), "2026-10-15 15:30:45Z");
         for ts in [0, 951_782_400, 1_792_078_245, 4_102_444_799] {
             assert_eq!(parse_utc(&utc(ts)), Some(ts));
+        }
+        for bad in [
+            "2026-13-01 00:00:00",
+            "2026-00-10 00:00:00",
+            "2026-01-99 00:00:00",
+            "2026-01-01 24:00:00",
+            "+026-01-01 00:00:00",
+        ] {
+            assert_eq!(parse_utc(bad), None, "{bad}");
         }
     }
 

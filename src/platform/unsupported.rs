@@ -34,7 +34,12 @@ impl Platform for Unsupported {
         Err(PlatformError::Unsupported)
     }
 
-    fn network_log(&self, _from: u64, _to: u64) -> Result<Vec<LogLine>, PlatformError> {
+    fn network_log(
+        &self,
+        _from: u64,
+        _to: u64,
+        _deadline: std::time::Duration,
+    ) -> Result<LogRead, PlatformError> {
         Err(PlatformError::Unsupported)
     }
 }

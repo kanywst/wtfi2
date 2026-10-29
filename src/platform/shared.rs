@@ -18,11 +18,12 @@ pub(super) const TOOL_DEADLINE: Duration = crate::engine::PROBE_DEADLINE;
 pub(super) const LOG_DEADLINE: Duration = Duration::from_secs(30);
 
 /// [`output_within`], treating a non-zero exit with no output as an error.
+/// The third value says why a non-zero exit may have cut the output short.
 pub(super) fn run_bounded(
     cmd: &str,
     args: &[&str],
     deadline: Duration,
-) -> Result<(String, String), PlatformError> {
+) -> Result<(String, String, Option<String>), PlatformError> {
     let (status, out, err) = output_within(cmd, args, deadline)?;
     if !status.success() && out.trim().is_empty() {
         let why = err.trim();
@@ -32,7 +33,11 @@ pub(super) fn run_bounded(
             format!("{cmd}: {why}")
         }));
     }
-    Ok((out, err))
+    let early = (!status.success()).then(|| match err.trim() {
+        "" => format!("{cmd} exited with {status}"),
+        why => format!("{cmd}: {why}"),
+    });
+    Ok((out, err, early))
 }
 
 /// Run `cmd`, killing it at `deadline`; returns its status, stdout and stderr.
@@ -224,8 +229,9 @@ mod tests {
     fn a_silent_failure_is_an_error() {
         let silent = run_bounded("sh", &["-c", "exit 3"], LOG_DEADLINE);
         assert!(matches!(silent, Err(PlatformError::Command(m)) if m.contains("3")));
-        let (out, _) = run_bounded("sh", &["-c", "echo hi; exit 1"], LOG_DEADLINE).unwrap();
+        let (out, _, early) = run_bounded("sh", &["-c", "echo hi; exit 1"], LOG_DEADLINE).unwrap();
         assert_eq!(out.trim(), "hi", "output wins over the exit code");
+        assert!(early.is_some(), "but the early exit is reported");
     }
 
     #[test]

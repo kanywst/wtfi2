@@ -22,7 +22,7 @@ use super::shared::{
     vendor_from_ip, vendor_from_processes,
 };
 use super::{
-    AddrInfo, LinkInfo, LogLine, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo,
+    AddrInfo, LinkInfo, LogLine, LogRead, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo,
 };
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -78,8 +78,14 @@ const LOG_IDENTIFIERS: [&str; 7] = [
     "dhcpcd",
 ];
 
-fn parse_journal(json: &str) -> Vec<LogLine> {
-    json.lines()
+/// Parsed lines, and how many entries couldn't be read.
+fn parse_journal(json: &str) -> (Vec<LogLine>, usize) {
+    let entries = json
+        .lines()
+        .filter(|l| l.contains("\"__REALTIME_TIMESTAMP\""))
+        .count();
+    let lines: Vec<LogLine> = json
+        .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .filter_map(|v| {
             let micros: u64 = v["__REALTIME_TIMESTAMP"].as_str()?.parse().ok()?;
@@ -97,6 +103,8 @@ fn parse_journal(json: &str) -> Vec<LogLine> {
                         .collect::<Vec<_>>(),
                 )
                 .into_owned(),
+                // journald stores oversized or binary messages without the text.
+                Value::Null => "(message not captured)".into(),
                 _ => return None,
             };
             let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -106,11 +114,17 @@ fn parse_journal(json: &str) -> Vec<LogLine> {
                 message,
             })
         })
-        .collect()
+        .collect();
+    let unreadable = entries.saturating_sub(lines.len());
+    (lines, unreadable)
 }
 
 /// Lines read, or an error when journalctl could only see this user's own journal.
-fn journal_result(out: &str, err: &str) -> Result<Vec<LogLine>, PlatformError> {
+fn journal_result(
+    out: &str,
+    err: &str,
+    incomplete: Option<String>,
+) -> Result<LogRead, PlatformError> {
     if err.contains("not seeing messages from other users")
         || err.contains("insufficient permissions")
     {
@@ -119,19 +133,31 @@ fn journal_result(out: &str, err: &str) -> Result<Vec<LogLine>, PlatformError> {
                 .into(),
         ));
     }
-    let lines = parse_journal(out);
-    if lines.is_empty() && out.contains("\"__REALTIME_TIMESTAMP\"") {
+    let (lines, unreadable) = parse_journal(out);
+    if lines.is_empty() && unreadable > 0 {
         return Err(PlatformError::Parse(
             "journalctl printed entries wtfi couldn't read".into(),
         ));
     }
-    Ok(lines)
+    Ok(LogRead {
+        lines,
+        unreadable,
+        incomplete,
+    })
 }
 
 impl Platform for Linux {
-    fn network_log(&self, from: u64, to: u64) -> Result<Vec<LogLine>, PlatformError> {
+    fn network_log(
+        &self,
+        from: u64,
+        to: u64,
+        deadline: std::time::Duration,
+    ) -> Result<LogRead, PlatformError> {
         let (since, until) = (format!("@{from}"), format!("@{to}"));
+        // C locale, so the permission hint below matches whatever the user's language is.
         let mut args = vec![
+            "LC_ALL=C",
+            "journalctl",
             "--no-pager",
             "-o",
             "json",
@@ -143,8 +169,8 @@ impl Platform for Linux {
         for id in LOG_IDENTIFIERS {
             args.extend(["-t", id]);
         }
-        let (out, err) = run_bounded("journalctl", &args, LOG_DEADLINE)?;
-        journal_result(&out, &err)
+        let (out, err, incomplete) = run_bounded("env", &args, deadline.min(LOG_DEADLINE))?;
+        journal_result(&out, &err, incomplete)
     }
 
     fn route(&self) -> Result<RouteInfo, PlatformError> {
@@ -706,7 +732,7 @@ mod tests {
             r#"{"__REALTIME_TIMESTAMP":"1793186854000000","_COMM":"iwd","MESSAGE":[104,105,255]}"#,
         );
         assert_eq!(
-            parse_journal(json),
+            parse_journal(json).0,
             [
                 LogLine {
                     ts: 1_793_186_853,
@@ -723,21 +749,33 @@ mod tests {
         assert!(
             journal_result(
                 "",
-                "Hint: You are currently not seeing messages from other users and the system."
+                "Hint: You are currently not seeing messages from other users and the system.",
+                None
             )
             .is_err()
         );
         assert!(
             journal_result(
                 "",
-                "No journal files were opened due to insufficient permissions."
+                "No journal files were opened due to insufficient permissions.",
+                None
             )
             .is_err()
         );
-        assert_eq!(journal_result("", "").unwrap(), []);
+        assert_eq!(journal_result("", "", None).unwrap(), LogRead::default());
         assert!(
-            journal_result(r#"{"__REALTIME_TIMESTAMP":"x"}"#, "").is_err(),
+            journal_result(r#"{"__REALTIME_TIMESTAMP":"x"}"#, "", None).is_err(),
             "unreadable entries aren't silence"
+        );
+        let null = r#"{"__REALTIME_TIMESTAMP":"1793186853000000","SYSLOG_IDENTIFIER":"iwd","MESSAGE":null}"#;
+        assert_eq!(parse_journal(null).0[0].message, "(message not captured)");
+        let mixed = r#"{"__REALTIME_TIMESTAMP":"1793186853000000","SYSLOG_IDENTIFIER":"iwd","MESSAGE":"ok"}
+{"__REALTIME_TIMESTAMP":"x"}"#;
+        assert_eq!(
+            journal_result(mixed, "", Some("journalctl exited early".into()))
+                .unwrap()
+                .unreadable,
+            1
         );
     }
 

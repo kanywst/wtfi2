@@ -1,7 +1,7 @@
 //! `wtfi --bundle`: recorded sweeps as one Markdown document for an AI agent.
 
 use crate::history::{self, Record, Snapshot};
-use crate::platform::LogLine;
+use crate::platform::{LogLine, LogRead};
 use serde_json::Value;
 use std::hash::{BuildHasher, RandomState};
 
@@ -15,7 +15,7 @@ const LOG_MAX_SECS: u64 = 720;
 const LOG_MAX_LINES: usize = 150;
 /// Lines kept from before an episode began; the rest of the budget goes after it.
 const LOG_LEAD_LINES: usize = 30;
-/// No new OS log read starts once `--bundle` has spent this long on them.
+/// Total time `--bundle` spends reading OS logs; each read gets what is left.
 const LOG_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 /// A recorder that planned to sweep in N seconds but didn't within N+60 wasn't running.
 const GAP_SLACK_SECS: u64 = 60;
@@ -117,7 +117,8 @@ fn stale(last: &Record, now: u64) -> bool {
     now > last.ts + last.interval_s.unwrap_or(UNKNOWN_INTERVAL_SECS) + GAP_SLACK_SECS
 }
 
-pub type LogReader<'a> = &'a dyn Fn(u64, u64) -> Result<Vec<LogLine>, String>;
+/// Reads the OS network log between two times, giving up at the deadline.
+pub type LogReader<'a> = &'a dyn Fn(u64, u64, std::time::Duration) -> Result<LogRead, String>;
 
 /// `redact` salts the masks; pass the same state to get the same tags across calls.
 pub fn build(
@@ -285,13 +286,13 @@ pub fn build(
                 history::utc(from),
                 history::utc(to)
             ));
-            if started.elapsed() > LOG_BUDGET {
-                out.push_str("Skipped: reading the OS log was taking too long.\n");
+            let left = LOG_BUDGET.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                out.push_str("Skipped: the time set aside for reading the OS log ran out.\n");
                 continue;
             }
-            match log(from, to) {
-                Ok(lines) if lines.is_empty() => out.push_str("No matching entries returned.\n"),
-                Ok(lines) => out.push_str(&log_block(&lines, Some(e.start), redactor.as_ref())),
+            match log(from, to, left) {
+                Ok(read) => out.push_str(&log_block(&read, Some(e.start), redactor.as_ref())),
                 Err(e) => out.push_str(&format!("Couldn't read the OS log: {e}\n")),
             }
         }
@@ -306,7 +307,20 @@ pub fn build(
 
 /// A fenced block of collapsed, capped and (when asked) masked log lines.
 /// `focus` keeps the cap centred on when an episode began.
-pub fn log_block(lines: &[LogLine], focus: Option<u64>, redactor: Option<&Redactor>) -> String {
+pub fn log_block(read: &LogRead, focus: Option<u64>, redactor: Option<&Redactor>) -> String {
+    let lines = &read.lines;
+    let mut notes = String::new();
+    if read.unreadable > 0 {
+        notes.push_str(&format!("{} entries couldn't be read.\n", read.unreadable));
+    }
+    if let Some(why) = &read.incomplete {
+        notes.push_str(&format!(
+            "The read ended early ({why}), so this may be incomplete.\n"
+        ));
+    }
+    if lines.is_empty() {
+        return notes + "None returned. The log may not reach back this far, or nothing matched.\n";
+    }
     let at = focus.map_or(0, |t| {
         lines.iter().position(|l| l.ts >= t).unwrap_or(lines.len())
     });
@@ -316,7 +330,7 @@ pub fn log_block(lines: &[LogLine], focus: Option<u64>, redactor: Option<&Redact
         .saturating_sub(LOG_LEAD_LINES.min(LOG_MAX_LINES))..];
     let skipped = before.len() - lead.len();
     let lines: Vec<String> = lead.iter().chain(&after).cloned().collect();
-    let mut out = String::from("```text\n");
+    let mut out = notes + "```text\n";
     if skipped > 0 {
         out.push_str(&format!("({skipped} earlier lines omitted)\n"));
     }
@@ -353,12 +367,9 @@ fn collapse(lines: &[LogLine]) -> Vec<String> {
             String::new()
         };
         let time = history::utc(l.ts);
-        out.push(format!(
-            "{} {}: {}{tail}",
-            &time[11..19],
-            l.source,
-            l.message
-        ));
+        // A message can't close the fence it is quoted in.
+        let message = l.message.replace('`', "'");
+        out.push(format!("{} {}: {message}{tail}", &time[11..19], l.source));
         i += run;
     }
     out
@@ -517,6 +528,19 @@ impl<'a> Redactor<'a> {
         {
             line = self.quoted(&line);
         }
+        // systemd-networkd: `Connected WiFi access point: NAME (BSSID)`.
+        if let Some(i) = line.find("access point: ") {
+            let start = i + "access point: ".len();
+            let end = line[start..].find(" (").map_or(line.len(), |j| start + j);
+            if start < end {
+                line = format!(
+                    "{}{}{}",
+                    &line[..start],
+                    self.ssid(&line[start..end]),
+                    &line[end..]
+                );
+            }
+        }
         let lower = line.to_ascii_lowercase();
         let b = line.as_bytes();
         let mut out = String::with_capacity(line.len());
@@ -547,21 +571,13 @@ impl<'a> Redactor<'a> {
                 }
                 _ if v == key_end => continue,
                 _ => {
-                    let tail = &line[v..];
-                    // Unquoted names can have spaces, so run to a known field or the line end.
-                    let end = [
-                        " BSSID",
-                        " Security",
-                        " NetworkID",
-                        " channel",
-                        ",",
-                        ";",
-                        ")",
-                    ]
-                    .iter()
-                    .filter_map(|d| tail.find(d))
-                    .min()
-                    .map_or(line.len(), |j| v + j);
+                    // SSIDs may contain spaces and `,` `;` `)`, so only a field label ends one.
+                    let tail = &lower[v..];
+                    let end = [" bssid", " security", " networkid", " channel", " freq"]
+                        .iter()
+                        .filter_map(|d| tail.find(d))
+                        .min()
+                        .map_or(line.len(), |j| v + j);
                     (v, end)
                 }
             };
@@ -754,8 +770,15 @@ The data above was recorded by wtfi, a network-path diagnostic, while my connect
 mod tests {
     use super::*;
 
-    fn no_log(_: u64, _: u64) -> Result<Vec<LogLine>, String> {
-        Ok(Vec::new())
+    fn no_log(_: u64, _: u64, _: std::time::Duration) -> Result<LogRead, String> {
+        Ok(LogRead::default())
+    }
+
+    fn read(lines: Vec<LogLine>) -> LogRead {
+        LogRead {
+            lines,
+            ..Default::default()
+        }
     }
 
     fn line(ts: u64, message: &str) -> LogLine {
@@ -774,9 +797,9 @@ mod tests {
             rec(5000, "ok", None, None),
         ];
         let asked = std::cell::RefCell::new(Vec::new());
-        let log = |from, to| {
+        let log = |from, to, _| {
             asked.borrow_mut().push((from, to));
-            Ok(vec![
+            Ok(read(vec![
                 line(
                     1008,
                     "en0: SSID Cafe Wifi BSSID 00:11:22:33:44:55 Security NONE",
@@ -788,7 +811,7 @@ mod tests {
                     "DNS 203.0.113.9 failed, 9.9.9.9 ok, router 192.168.1.1",
                 ),
                 line(1011, "server 93.184.215.14 unreachable"),
-            ])
+            ]))
         };
         let out = build(&r, &[], 0, Some(&RandomState::new()), &log);
         assert_eq!(
@@ -811,7 +834,7 @@ mod tests {
             "{out}"
         );
 
-        let failing = |_, _| Err("log: permission denied".to_string());
+        let failing = |_, _, _| Err("log: permission denied".to_string());
         let out = build(&r, &[], 0, Some(&RandomState::new()), &failing);
         assert!(out.contains("Couldn't read the OS log: log: permission denied"));
         assert!(build(&r, &[], 0, None, &log).contains("Cafe Wifi"));
@@ -823,7 +846,7 @@ mod tests {
         let lines: Vec<LogLine> = (0..300)
             .map(|i| line(midnight - 150 + i, &format!("event {i}")))
             .collect();
-        let block = log_block(&lines, Some(midnight + 10), None);
+        let block = log_block(&read(lines), Some(midnight + 10), None);
         assert!(block.contains("(130 earlier lines omitted)"), "{block}");
         assert!(block.contains("23:59:40 configd: event 130\n"), "{block}");
         assert!(block.contains("00:00:10 configd: event 160\n"), "{block}");
@@ -834,7 +857,7 @@ mod tests {
         let lines: Vec<LogLine> = (0..LOG_MAX_LINES + 7)
             .map(|i| line(0, &format!("event {i}")))
             .collect();
-        let block = log_block(&lines, None, None);
+        let block = log_block(&read(lines), None, None);
         assert!(
             block.contains("event 149\n(7 more lines omitted)"),
             "{block}"
@@ -844,7 +867,7 @@ mod tests {
     #[test]
     fn the_cap_keeps_the_lines_around_the_break() {
         let lines: Vec<LogLine> = (0..400).map(|i| line(i, &format!("event {i}"))).collect();
-        let block = log_block(&lines, Some(300), None);
+        let block = log_block(&read(lines), Some(300), None);
         assert!(block.contains("(270 earlier lines omitted)"), "{block}");
         assert!(
             block.contains("event 270\n") && block.contains("event 300\n"),
@@ -853,6 +876,47 @@ mod tests {
         assert!(
             block.contains("event 399\n") && !block.contains("more lines omitted"),
             "{block}"
+        );
+    }
+
+    #[test]
+    fn a_read_says_what_it_couldnt_see() {
+        let empty = log_block(&LogRead::default(), None, None);
+        assert!(empty.contains("may not reach back this far"), "{empty}");
+        let partial = LogRead {
+            lines: vec![line(0, "x ```rm -rf``` y")],
+            unreadable: 2,
+            incomplete: Some("log exited with 1".into()),
+        };
+        let block = log_block(&partial, None, None);
+        assert!(block.contains("2 entries couldn't be read"), "{block}");
+        assert!(block.contains("ended early (log exited with 1)"), "{block}");
+        assert_eq!(
+            block.matches("```").count(),
+            2,
+            "messages can't close the fence: {block}"
+        );
+    }
+
+    #[test]
+    fn ssids_with_punctuation_and_networkd_names_are_masked_whole() {
+        let state = RandomState::new();
+        let r = Redactor::new(&state, &[]);
+        for (input, leak) in [
+            ("en0: SSID Joe's Cafe, 2nd Floor BSSID x", "2nd Floor"),
+            ("en0: SSID Smith; Family (2.4G) security wpa2", "Family"),
+            (
+                "wlan0: Connected WiFi access point: Cafe Wifi (aa:bb:cc:dd:ee:ff)",
+                "Cafe Wifi",
+            ),
+        ] {
+            let out = r.log_line(input);
+            assert!(!out.contains(leak), "{input:?} -> {out:?}");
+        }
+        let out = r.log_line("ssid=Foo Bar bssid=x");
+        assert!(
+            out.ends_with(" bssid=x"),
+            "a lowercase label still ends the name: {out}"
         );
     }
 

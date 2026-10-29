@@ -31,8 +31,9 @@ async fn main() -> Result<()> {
         };
         let redact = (!cli.no_redact).then(std::hash::RandomState::new);
         let platform = platform::current();
-        let log = |from, to| {
-            platform::Platform::network_log(&platform, from, to).map_err(|e| e.to_string())
+        let log = |from, to, deadline| {
+            platform::Platform::network_log(&platform, from, to, deadline)
+                .map_err(|e| e.to_string())
         };
         print!(
             "{}",

@@ -17,7 +17,7 @@ use super::shared::{
     vendor_from_ip, vendor_from_processes,
 };
 use super::{
-    AddrInfo, LinkInfo, LogLine, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo,
+    AddrInfo, LinkInfo, LogLine, LogRead, Platform, PlatformError, ResolverInfo, RouteInfo, VpnInfo,
 };
 use std::net::IpAddr;
 
@@ -87,8 +87,13 @@ fn log_stamp(ts: u64) -> String {
     crate::history::utc(ts).replace('Z', "+0000")
 }
 
-fn parse_log(ndjson: &str) -> Vec<LogLine> {
-    ndjson
+/// Parsed lines, and how many entries couldn't be read.
+fn parse_log(ndjson: &str) -> (Vec<LogLine>, usize) {
+    let entries = ndjson
+        .lines()
+        .filter(|l| l.contains("\"eventMessage\""))
+        .count();
+    let lines: Vec<LogLine> = ndjson
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .filter_map(|v| {
@@ -111,14 +116,22 @@ fn parse_log(ndjson: &str) -> Vec<LogLine> {
                 message,
             })
         })
-        .collect()
+        .collect();
+    let unreadable = entries.saturating_sub(lines.len());
+    (lines, unreadable)
 }
 
 impl Platform for MacOs {
-    fn network_log(&self, from: u64, to: u64) -> Result<Vec<LogLine>, PlatformError> {
+    fn network_log(
+        &self,
+        from: u64,
+        to: u64,
+        deadline: std::time::Duration,
+    ) -> Result<LogRead, PlatformError> {
         let (start, end) = (log_stamp(from), log_stamp(to));
         let args = [
             "show",
+            "--info",
             "--style",
             "ndjson",
             "--timezone",
@@ -130,17 +143,18 @@ impl Platform for MacOs {
             "--predicate",
             LOG_PREDICATE,
         ];
-        let (out, err) = run_bounded("/usr/bin/log", &args, LOG_DEADLINE)?;
-        let lines = parse_log(&out);
-        if lines.is_empty() && !err.trim().is_empty() {
-            return Err(PlatformError::Command(format!("log: {}", err.trim())));
-        }
-        if lines.is_empty() && out.contains("\"eventMessage\"") {
+        let (out, _, incomplete) = run_bounded("/usr/bin/log", &args, deadline.min(LOG_DEADLINE))?;
+        let (lines, unreadable) = parse_log(&out);
+        if lines.is_empty() && unreadable > 0 {
             return Err(PlatformError::Parse(
                 "log printed entries wtfi couldn't read".into(),
             ));
         }
-        Ok(lines)
+        Ok(LogRead {
+            lines,
+            unreadable,
+            incomplete,
+        })
     }
 
     fn route(&self) -> Result<RouteInfo, PlatformError> {
@@ -536,7 +550,7 @@ mod tests {
             r#"{"count":1,"finished":1}"#,
         );
         assert_eq!(
-            parse_log(ndjson),
+            parse_log(ndjson).0,
             [LogLine {
                 ts: 1_793_186_853,
                 source: "configd".into(),
@@ -545,9 +559,10 @@ mod tests {
         );
         assert_eq!(log_stamp(0), "1970-01-01 00:00:00+0000");
         let local = r#"{"timestamp":"2026-10-28 20:27:33.9+0900","processImagePath":"/usr/libexec/configd","eventMessage":"x"}"#;
-        assert!(
-            parse_log(local).is_empty(),
-            "a non-UTC stamp is dropped, not shifted"
+        assert_eq!(
+            parse_log(local),
+            (vec![], 1),
+            "a non-UTC stamp is unread, not shifted"
         );
     }
 
