@@ -2,7 +2,7 @@
 
 use crate::bundle::{self, Redactor};
 use crate::history::{self, Snapshot};
-use crate::platform::LogLine;
+use crate::platform::LogRead;
 use crate::{diagnose, engine, json};
 use serde_json::{Value, json};
 use std::hash::RandomState;
@@ -15,8 +15,9 @@ const PROTOCOLS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11
 const MAX_SWEEPS: usize = 20;
 const LOG_DEFAULT_SECS: u64 = 900;
 const LOG_MAX_SECS: u64 = 7200;
+const LOG_READ_DEADLINE: Duration = Duration::from_secs(30);
 
-pub type SharedLog = Arc<dyn Fn(u64, u64) -> Result<Vec<LogLine>, String> + Send + Sync>;
+pub type SharedLog = Arc<dyn Fn(u64, u64, Duration) -> Result<LogRead, String> + Send + Sync>;
 
 pub struct Server {
     pub history: Option<PathBuf>,
@@ -26,6 +27,8 @@ pub struct Server {
     /// One salt per session, so a masked SSID or MAC reads the same in every tool.
     pub salt: RandomState,
     pub sweeping: tokio::sync::Mutex<()>,
+    /// OS log scans are heavy and can't be cancelled, so one at a time.
+    pub reading: tokio::sync::Mutex<()>,
 }
 
 /// Requests run concurrently, so a slow tool doesn't hold up `ping`.
@@ -131,15 +134,19 @@ impl Server {
         let since = now.saturating_sub(window).min(from);
         // The OS log stands on its own; the recording only adds SSIDs to mask.
         let log_only = name == "get_os_log";
+        let mut unreadable = None;
         let (records, sweeps) = match &self.history {
             Some(file) if !log_only => (
                 history::load(file, usize::MAX).map_err(|e| e.to_string())?,
                 history::load_sweeps(file, since).map_err(|e| e.to_string())?,
             ),
-            Some(file) => (
-                Vec::new(),
-                history::load_sweeps(file, since).unwrap_or_default(),
-            ),
+            Some(file) => match history::load_sweeps(file, since) {
+                Ok(sweeps) => (Vec::new(), sweeps),
+                Err(e) => {
+                    unreadable = Some(e.to_string());
+                    (Vec::new(), Vec::new())
+                }
+            },
             None if log_only => (Vec::new(), Vec::new()),
             None => return Err("no history file: set WTFI_HISTORY, XDG_STATE_HOME or HOME".into()),
         };
@@ -214,27 +221,32 @@ impl Server {
                         LOG_MAX_SECS / 3600
                     ));
                 }
+                let Ok(_one_at_a_time) = self.reading.try_lock() else {
+                    return Err("an OS log read is already running; try again shortly".into());
+                };
                 let log = self.log.clone();
-                let lines = tokio::task::spawn_blocking(move || log(from, to))
+                let read = tokio::task::spawn_blocking(move || log(from, to, LOG_READ_DEADLINE))
                     .await
                     .map_err(|e| e.to_string())??;
-                if lines.is_empty() {
-                    return Ok("No matching entries returned.".into());
-                }
-                let block = bundle::log_block(&lines, None, redactor.as_ref());
-                if redactor.is_some() && sweeps.is_empty() {
-                    format!(
+                let block = bundle::log_block(&read, None, redactor.as_ref());
+                match (&redactor, unreadable) {
+                    (Some(_), Some(e)) => format!(
+                        "The recording couldn't be read ({e}); only names the log labels as SSIDs or quotes are masked.\n{block}"
+                    ),
+                    (Some(_), None) if sweeps.is_empty() => format!(
                         "No recorded SSIDs to learn from; only names the log labels as SSIDs or quotes are masked.\n{block}"
-                    )
-                } else {
-                    block
+                    ),
+                    _ => block,
                 }
             }
             "get_bundle" => {
+                let Ok(_one_at_a_time) = self.reading.try_lock() else {
+                    return Err("an OS log read is already running; try again shortly".into());
+                };
                 let (log, salt) = (self.log.clone(), self.salt.clone());
                 let redact = redacting(args);
                 tokio::task::spawn_blocking(move || {
-                    let log = |from, to| log(from, to);
+                    let log = |from, to, deadline| log(from, to, deadline);
                     bundle::build(&records, &sweeps, since, redact.then_some(&salt), &log)
                 })
                 .await
@@ -318,16 +330,19 @@ fn tools() -> Value {
 mod tests {
     use super::*;
     use crate::history::{Log, Record};
-    use crate::platform::LogLine;
+    use crate::platform::{LogLine, LogRead};
 
-    fn log(from: u64, to: u64) -> Result<Vec<LogLine>, String> {
-        Ok(vec![LogLine {
-            ts: 0,
-            source: "configd".into(),
-            message: format!(
-                "window {from}-{to} SSID 'Cafe' BSSID 00:11:22:33:44:55 via 93.184.215.14"
-            ),
-        }])
+    fn log(from: u64, to: u64, _: Duration) -> Result<LogRead, String> {
+        Ok(LogRead {
+            lines: vec![LogLine {
+                ts: 0,
+                source: "configd".into(),
+                message: format!(
+                    "window {from}-{to} SSID 'Cafe' BSSID 00:11:22:33:44:55 via 93.184.215.14"
+                ),
+            }],
+            ..Default::default()
+        })
     }
 
     fn server(name: &str) -> Server {
@@ -360,6 +375,7 @@ mod tests {
             now: Some(1030),
             salt: RandomState::new(),
             sweeping: Default::default(),
+            reading: Default::default(),
         }
     }
 
@@ -370,7 +386,28 @@ mod tests {
             now: Some(0),
             salt: RandomState::new(),
             sweeping: Default::default(),
+            reading: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_recording_is_named_not_treated_as_empty() {
+        let mut s = server("unreadable");
+        let file = s.history.clone().unwrap();
+        let sweeps = file.with_file_name("sweeps.jsonl");
+        std::fs::remove_file(&sweeps).unwrap();
+        std::fs::create_dir(&sweeps).unwrap();
+        s.now = Some(1030);
+        let r = call(&s, "get_os_log", json!({ "from_ts": 1000, "to_ts": 1010 })).await;
+        assert!(text(&r).contains("couldn't be read"), "{}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn a_second_log_read_is_refused_not_queued() {
+        let s = none_server();
+        let _held = s.reading.try_lock().unwrap();
+        let r = call(&s, "get_os_log", json!({})).await;
+        assert!(text(&r).contains("already running"), "{}", text(&r));
     }
 
     #[tokio::test]
@@ -527,9 +564,9 @@ mod tests {
     #[tokio::test]
     async fn a_slow_log_read_doesnt_hold_up_other_requests() {
         let mut s = server("slow");
-        s.log = Arc::new(|_, _| {
+        s.log = Arc::new(|_, _, _| {
             std::thread::sleep(Duration::from_millis(800));
-            Ok(Vec::new())
+            Ok(LogRead::default())
         });
         let start = std::time::Instant::now();
         let ping = async {
@@ -581,6 +618,7 @@ mod tests {
             now: Some(0),
             salt: RandomState::new(),
             sweeping: Default::default(),
+            reading: Default::default(),
         };
         assert_eq!(
             call(&none, "list_episodes", json!({})).await["isError"],

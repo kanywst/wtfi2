@@ -21,8 +21,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if cli.mcp {
-        let log = |from, to| {
-            platform::Platform::network_log(&platform::current(), from, to)
+        let log = |from, to, deadline| {
+            platform::Platform::network_log(&platform::current(), from, to, deadline)
                 .map_err(|e| e.to_string())
         };
         let server = mcp::Server {
@@ -31,6 +31,7 @@ async fn main() -> Result<()> {
             now: None,
             salt: std::hash::RandomState::new(),
             sweeping: Default::default(),
+            reading: Default::default(),
         };
         mcp::serve(std::sync::Arc::new(server)).await?;
         return Ok(());
