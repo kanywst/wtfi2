@@ -45,11 +45,16 @@ pub(super) fn output_within(
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    // A helper the tool left behind can hold the pipes open; take what arrived by the deadline.
+    // A helper the tool left behind can hold the pipes open past the deadline.
     let left = deadline
         .saturating_sub(start.elapsed())
         .max(Duration::from_millis(100));
-    Ok((status, out.collect(left), err.collect(left)))
+    match (out.collect(left), err.collect(left)) {
+        (Some(out), Some(err)) => Ok((status, out, err)),
+        _ => Err(PlatformError::Command(format!(
+            "{cmd}: output still open after exit"
+        ))),
+    }
 }
 
 struct Drain {
@@ -58,10 +63,11 @@ struct Drain {
 }
 
 impl Drain {
-    fn collect(self, wait: Duration) -> String {
-        let _ = self.done.recv_timeout(wait);
-        let buf = self.buf.lock().map(|b| b.clone()).unwrap_or_default();
-        String::from_utf8_lossy(&buf).into_owned()
+    /// Everything the pipe carried, or `None` if it was still open after `wait`.
+    fn collect(self, wait: Duration) -> Option<String> {
+        self.done.recv_timeout(wait).ok()?;
+        let buf = self.buf.lock().ok()?.clone();
+        Some(String::from_utf8_lossy(&buf).into_owned())
     }
 }
 
@@ -163,13 +169,15 @@ mod tests {
     #[test]
     fn a_helper_holding_the_pipe_doesnt_outlast_the_deadline() {
         let start = Instant::now();
-        let (status, out, _) = output_within(
+        let held = output_within(
             "sh",
             &["-c", "echo hi; (sleep 5 &) ; exit 0"],
             Duration::from_millis(500),
-        )
-        .unwrap();
-        assert!(status.success() && out.trim() == "hi", "{out:?}");
+        );
+        assert!(
+            matches!(held, Err(PlatformError::Command(m)) if m.contains("still open")),
+            "half-read output isn't passed off as complete"
+        );
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "{:?}",
