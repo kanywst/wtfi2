@@ -147,11 +147,15 @@ impl Log {
             self.held = Some(snapshot);
         }
         let to = sweeps_path(&self.file);
+        let mut flushed = Ok(());
         while let Some(next) = self.unwritten.first() {
-            append_line(&to, next, SWEEPS_MAX_BYTES).map_err(|e| at(&to, e))?;
+            flushed = append_line(&to, next, SWEEPS_MAX_BYTES).map_err(|e| at(&to, e));
+            if flushed.is_err() {
+                break;
+            }
             self.unwritten.remove(0);
         }
-        appended
+        appended.and(flushed)
     }
 }
 
