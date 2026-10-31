@@ -360,6 +360,7 @@ mod tests {
                 wan_ms: None,
                 wan_loss_pct: None,
                 rssi_dbm: None,
+                channel: None,
                 interval_s: None,
                 partial: false,
             };

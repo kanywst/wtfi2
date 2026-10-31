@@ -236,7 +236,7 @@ pub fn build(
         }
     }
 
-    out.push_str("\n## Timeline\n\nOne line per run of identical state; `×N` is how many sweeps it lasted.\n\n```text\n");
+    out.push_str("\n## Timeline\n\nOne line per run of identical state; `×N` is how many sweeps it lasted. `Wi-Fi channel changed` marks the link moving to another channel: a roam, band steering, or the access point switching channel.\n\n```text\n");
     let timeline = timeline(&owned);
     if timeline.len() > MAX_TIMELINE {
         out.push_str(&format!(
@@ -377,26 +377,64 @@ fn collapse(lines: &[LogLine]) -> Vec<String> {
 
 fn timeline(records: &[Record]) -> Vec<String> {
     let mut lines = Vec::new();
+    // Last channel seen; a sweep with no link reading doesn't reset it.
+    let mut known: Option<&str> = None;
     let mut i = 0;
     while i < records.len() {
         let r = &records[i];
+        // Across a recorder gap the switch can't be placed in time.
+        if i > 0 && is_gap(&records[i - 1], r) {
+            known = None;
+        }
+        if let Some(c) = r.channel.as_deref() {
+            if let Some(was) = known.filter(|was| channel_moved(was, c)) {
+                lines.push(format!(
+                    "{}  Wi-Fi channel changed: {was} → {c}",
+                    history::utc(r.ts)
+                ));
+            }
+            known = Some(c);
+        }
         let same = |o: &Record| {
             o.status == r.status && o.first_break == r.first_break && o.headline == r.headline
         };
         // A run stops at a recorder gap, so it never spans time nobody measured.
-        let run = 1 + records[i..]
-            .windows(2)
-            .take_while(|w| same(&w[1]) && !is_gap(&w[0], &w[1]))
-            .count();
+        let mut end = i + 1;
+        while let Some(o) = records.get(end) {
+            let moved = o
+                .channel
+                .as_deref()
+                .is_some_and(|c| known.is_some_and(|k| channel_moved(k, c)));
+            if !same(o) || is_gap(&records[end - 1], o) || moved {
+                break;
+            }
+            known = o.channel.as_deref().or(known);
+            end += 1;
+        }
+        let run = end - i;
         let tail = if run > 1 {
-            format!("  ×{run} until {}", history::utc(records[i + run - 1].ts))
+            format!("  ×{run} until {}", history::utc(records[end - 1].ts))
         } else {
             String::new()
         };
         lines.push(format!("{}{tail}", history::line(r)));
-        i += run;
+        i = end;
     }
     lines
+}
+
+/// Channel number and band differ; width, or a band only one side reported, doesn't count.
+fn channel_moved(a: &str, b: &str) -> bool {
+    let parts = |s: &str| {
+        let num = s.split_whitespace().next().unwrap_or("").to_string();
+        let band = s
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(band, _)| band.to_string());
+        (num, band)
+    };
+    let ((na, ba), (nb, bb)) = (parts(a), parts(b));
+    na != nb || matches!((ba, bb), (Some(x), Some(y)) if x != y)
 }
 
 fn pct(sorted: &[f64], p: f64) -> Option<f64> {
@@ -760,7 +798,7 @@ const PROMPT: &str = "
 
 The data above was recorded by wtfi, a network-path diagnostic, while my connection was failing or slow. Each sweep probes the path in order: host (my machine), link (Wi-Fi), gateway (my router), wan (reachability of public anchors), dns, captive (portal check), and a vpn hop when a tunnel is up. `first_break` is the first hop that failed; `evidence` says how each hop was measured.
 
-1. For each episode, say which layer broke first (the OS network log, when present, often shows the Wi-Fi or DHCP event behind it) and what most likely caused it. Quote the records or sweep fields you rely on.
+1. For each episode, say which layer broke first (the OS network log, when present, often shows the Wi-Fi or DHCP event behind it, and a Wi-Fi channel change in the timeline just before an episode points at a roam or band switch) and what most likely caused it. Quote the records or sweep fields you rely on.
 2. Say whether the episodes share a cause or look unrelated.
 3. Keep what the data shows apart from what you infer, and say when it can't decide between causes.
 4. List concrete next steps, most likely fix first, and what I should capture next time to settle what is still open.
@@ -1007,6 +1045,7 @@ mod tests {
             wan_ms: None,
             wan_loss_pct: None,
             rssi_dbm: None,
+            channel: None,
             interval_s: interval,
             partial: false,
         }
@@ -1172,6 +1211,67 @@ mod tests {
         let t = timeline(&r);
         assert_eq!(t.len(), 3);
         assert!(t[0].ends_with("×2 until 1970-01-01 00:00:01Z"), "{}", t[0]);
+    }
+
+    #[test]
+    fn a_channel_change_splits_the_run_and_is_called_out() {
+        let on = |ts, ch: Option<&str>| Record {
+            channel: ch.map(Into::into),
+            ..rec(ts, "ok", None, None)
+        };
+        let r = [
+            on(0, Some("36 (5GHz) / 80MHz")),
+            on(1, None),
+            on(2, Some("36 (5GHz) / 80MHz")),
+            on(3, Some("1 (2.4GHz) / 20MHz")),
+            on(4, Some("1 (2.4GHz) / 20MHz")),
+        ];
+        let t = timeline(&r);
+        assert_eq!(t.len(), 3, "{t:#?}");
+        assert!(t[0].ends_with("×3 until 1970-01-01 00:00:02Z"), "{}", t[0]);
+        assert!(
+            t[1].ends_with("Wi-Fi channel changed: 36 (5GHz) / 80MHz → 1 (2.4GHz) / 20MHz"),
+            "{}",
+            t[1]
+        );
+        assert!(t[2].ends_with("×2 until 1970-01-01 00:00:04Z"), "{}", t[2]);
+    }
+
+    #[test]
+    fn width_or_a_missing_band_is_not_a_channel_change() {
+        assert!(!channel_moved("36 (5GHz) / 80MHz", "36 (5GHz) / 40MHz"));
+        assert!(!channel_moved("36 (5GHz) / 80MHz", "36"));
+        assert!(!channel_moved("36", "36 (5GHz)"));
+        assert!(channel_moved("36 (5GHz)", "40 (5GHz)"));
+        assert!(channel_moved("1 (2.4GHz)", "1 (6GHz)"));
+    }
+
+    #[test]
+    fn a_channel_change_across_a_recorder_gap_is_not_called_out() {
+        let on = |ts, ch: &str| Record {
+            channel: Some(ch.into()),
+            ..rec(ts, "ok", None, Some(30))
+        };
+        let t = timeline(&[
+            on(0, "36 (5GHz)"),
+            on(30, "36 (5GHz)"),
+            on(10_000, "6 (2.4GHz)"),
+        ]);
+        assert_eq!(t.len(), 2, "{t:#?}");
+        assert!(!t.iter().any(|l| l.contains("channel changed")), "{t:#?}");
+    }
+
+    #[test]
+    fn a_first_channel_reading_is_not_a_change() {
+        let r = [
+            rec(0, "ok", None, None),
+            Record {
+                channel: Some("6 (2.4GHz)".into()),
+                ..rec(1, "ok", None, None)
+            },
+        ];
+        let t = timeline(&r);
+        assert_eq!(t.len(), 1, "{t:#?}");
     }
 
     #[test]

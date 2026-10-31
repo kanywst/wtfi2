@@ -31,6 +31,9 @@ pub struct Record {
     pub wan_ms: Option<f64>,
     pub wan_loss_pct: Option<f64>,
     pub rssi_dbm: Option<f64>,
+    /// Wi-Fi channel as the link hop shows it, e.g. `36 (5GHz) / 80MHz`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
     /// Planned seconds until the next sweep, set by `--every`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_s: Option<u64>,
@@ -51,6 +54,7 @@ impl Record {
             wan_ms: latency(HopId::Wan),
             wan_loss_pct: path.get(HopId::Wan).and_then(|h| h.loss_pct),
             rssi_dbm: path.get(HopId::Link).and_then(rssi_dbm),
+            channel: path.get(HopId::Link).and_then(channel),
             interval_s: None,
             partial: path.hops.iter().any(|h| h.fault == Some(Fault::Unobserved)),
         }
@@ -73,6 +77,13 @@ fn rssi_dbm(link: &Hop) -> Option<f64> {
         .find(|m| m.label == "RSSI")
         .and_then(|m| m.value.split_whitespace().next())
         .and_then(|s| s.parse().ok())
+}
+
+fn channel(link: &Hop) -> Option<String> {
+    link.metrics
+        .iter()
+        .find(|m| m.label == "Channel")
+        .map(|m| m.value.clone())
 }
 
 /// `$WTFI_HISTORY`, else `$XDG_STATE_HOME/wtfi/history.jsonl`, else
@@ -363,6 +374,7 @@ mod tests {
             wan_ms: Some(18.0),
             wan_loss_pct: None,
             rssi_dbm: Some(-52.0),
+            channel: None,
             interval_s: None,
             partial: false,
         }
@@ -567,6 +579,14 @@ mod tests {
     }
 
     #[test]
+    fn lines_from_before_the_channel_field_still_parse() {
+        let old = r#"{"ts":1,"status":"ok","first_break":null,"headline":"All good","gateway_ms":3.0,"wan_ms":18.0,"wan_loss_pct":null,"rssi_dbm":-52.0}"#;
+        let r: Record = serde_json::from_str(old).unwrap();
+        assert_eq!(r.channel, None);
+        assert!(!serde_json::to_string(&r).unwrap().contains("channel"));
+    }
+
+    #[test]
     fn a_cut_off_sweep_is_marked_partial() {
         let mut path = crate::engine::skeleton();
         path.get_mut(HopId::Wan).unwrap().fault = Some(Fault::Unobserved);
@@ -596,10 +616,13 @@ mod tests {
         path.get_mut(HopId::Gateway).unwrap().latency_ms = Some(2.5);
         let link = path.get_mut(HopId::Link).unwrap();
         link.metrics.push(Metric::new("RSSI", "-61 dBm"));
+        link.metrics
+            .push(Metric::new("Channel", "149 (5GHz) / 80MHz"));
         let verdict = crate::diagnose::diagnose(&path);
         let r = Record::new(&path, &verdict, 7);
         assert_eq!(r.gateway_ms, Some(2.5));
         assert_eq!(r.rssi_dbm, Some(-61.0));
+        assert_eq!(r.channel.as_deref(), Some("149 (5GHz) / 80MHz"));
         assert_eq!(r.wan_ms, None);
     }
 }
