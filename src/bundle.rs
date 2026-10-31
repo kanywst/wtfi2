@@ -382,8 +382,12 @@ fn timeline(records: &[Record]) -> Vec<String> {
     let mut i = 0;
     while i < records.len() {
         let r = &records[i];
+        // Across a recorder gap the switch can't be placed in time.
+        if i > 0 && is_gap(&records[i - 1], r) {
+            known = None;
+        }
         if let Some(c) = r.channel.as_deref() {
-            if let Some(was) = known.filter(|was| *was != c) {
+            if let Some(was) = known.filter(|was| channel_moved(was, c)) {
                 lines.push(format!(
                     "{}  Wi-Fi channel changed: {was} → {c}",
                     history::utc(r.ts)
@@ -400,7 +404,7 @@ fn timeline(records: &[Record]) -> Vec<String> {
             let moved = o
                 .channel
                 .as_deref()
-                .is_some_and(|c| known.is_some_and(|k| k != c));
+                .is_some_and(|c| known.is_some_and(|k| channel_moved(k, c)));
             if !same(o) || is_gap(&records[end - 1], o) || moved {
                 break;
             }
@@ -417,6 +421,20 @@ fn timeline(records: &[Record]) -> Vec<String> {
         i = end;
     }
     lines
+}
+
+/// Channel number and band differ; width, or a band only one side reported, doesn't count.
+fn channel_moved(a: &str, b: &str) -> bool {
+    let parts = |s: &str| {
+        let num = s.split_whitespace().next().unwrap_or("").to_string();
+        let band = s
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(band, _)| band.to_string());
+        (num, band)
+    };
+    let ((na, ba), (nb, bb)) = (parts(a), parts(b));
+    na != nb || matches!((ba, bb), (Some(x), Some(y)) if x != y)
 }
 
 fn pct(sorted: &[f64], p: f64) -> Option<f64> {
@@ -1217,6 +1235,30 @@ mod tests {
             t[1]
         );
         assert!(t[2].ends_with("×2 until 1970-01-01 00:00:04Z"), "{}", t[2]);
+    }
+
+    #[test]
+    fn width_or_a_missing_band_is_not_a_channel_change() {
+        assert!(!channel_moved("36 (5GHz) / 80MHz", "36 (5GHz) / 40MHz"));
+        assert!(!channel_moved("36 (5GHz) / 80MHz", "36"));
+        assert!(!channel_moved("36", "36 (5GHz)"));
+        assert!(channel_moved("36 (5GHz)", "40 (5GHz)"));
+        assert!(channel_moved("1 (2.4GHz)", "1 (6GHz)"));
+    }
+
+    #[test]
+    fn a_channel_change_across_a_recorder_gap_is_not_called_out() {
+        let on = |ts, ch: &str| Record {
+            channel: Some(ch.into()),
+            ..rec(ts, "ok", None, Some(30))
+        };
+        let t = timeline(&[
+            on(0, "36 (5GHz)"),
+            on(30, "36 (5GHz)"),
+            on(10_000, "6 (2.4GHz)"),
+        ]);
+        assert_eq!(t.len(), 2, "{t:#?}");
+        assert!(!t.iter().any(|l| l.contains("channel changed")), "{t:#?}");
     }
 
     #[test]
