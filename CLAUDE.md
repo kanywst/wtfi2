@@ -18,20 +18,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Diagnosis invariants (what fixes in git log have repeatedly restored)
 
 - **Do not report "could not measure" as "broken".** Probe timeouts, command failures and unreadable values go to `Warn` / `Fault::Unobserved` / unknown, not `Fail` or packet loss. Do not judge a router that drops ICMP, or a gateway that filters probes, as "dead".
-- **Every probe is bounded by `PROBE_DEADLINE`, and the whole sweep by `SWEEP_DEADLINE`.** New probes go on the same clock (if one gets stuck, the channel never closes and the CLI hangs).
+- **Every probe is bounded by `PROBE_DEADLINE`.** One-shot runs (`run_once` / `run_once_within`, also used by `--mcp`'s `diagnose_now`) are additionally capped by `SWEEP_DEADLINE`. The live dashboard (`-w`) calls `engine::spawn()` directly, so the initial `platform::route()` lookup sits outside the sweep timer. New probes go on the same per-probe clock (if one gets stuck, the channel never closes and the CLI hangs).
 - **OS differences are absorbed in platform / probe, not in the diagnosis logic.** ping / traceroute flags are built per OS (iputils `-t` is TTL, Linux traceroute uses `-I`). Do not hardcode "Mac" in verdict text either.
-- **The only external contract is the exit code (0-4) and the shape of `--json`.** `tests/cli.rs` pins this against the real binary. If you change it, update the README table and the tests together. Exit 4 means "nothing could be measured" and is distinct from 2 (Broken).
-- Do not run real probes in tests (hit in #64).
+- **External contracts: the exit code (0-4), the shape of `--json`, and the `--mcp` stdio JSON-RPC server with its named tools** (`list_episodes`, `get_timeline`, `get_sweeps`, `get_os_log`, `get_bundle`, `diagnose_now`). `tests/cli.rs` pins the CLI side against the real binary. If you change any of them, update the README and the tests together. Exit 4 means "nothing could be measured" and is distinct from 2 (Broken).
+- Default unit tests must not run real probes (hit in #64). Two exceptions exist: `tests/cli.rs` runs the real binary against the real network with `--timeout 8` and asserts structure and invariants, not network health; and live probe tests in `src/probe/net.rs` are `#[ignore]` and run manually with `--ignored`.
 
 ## Common commands
 
-CI (`.github/workflows/ci.yml`) has two legs, macOS and ubuntu, with `RUSTFLAGS=-D warnings`. Pass the same combination locally.
+CI (`.github/workflows/ci.yml`) has two legs, macOS and ubuntu, with `RUSTFLAGS: -D warnings` set for the whole workflow. Export it so every local command matches.
 
 ```bash
+export RUSTFLAGS="-D warnings"
 cargo fmt --all -- --check
-RUSTFLAGS="-D warnings" cargo clippy --all-targets --all-features
+cargo clippy --all-targets --all-features
 cargo test --all-features
-RUSTFLAGS="-D warnings" cargo build --release
+cargo build --release
 cargo publish --dry-run --locked          # same packaging check as the CI Linux leg
 
 # Check behaviour on the real network
