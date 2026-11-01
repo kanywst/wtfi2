@@ -417,7 +417,9 @@ fn mcp_answers_over_stdio() {
         3,
         "the notification gets no reply: {replies:?}"
     );
-    assert_eq!(replies[0]["result"]["protocolVersion"], "2025-06-18");
-    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 6);
-    assert_eq!(replies[2]["id"], 3);
+    // Requests are served concurrently, so replies may arrive in any order.
+    let reply = |id: u64| replies.iter().find(|r| r["id"] == id).unwrap();
+    assert_eq!(reply(1)["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(reply(2)["result"]["tools"].as_array().unwrap().len(), 6);
+    reply(3);
 }
