@@ -2,71 +2,71 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## このリポジトリは何か
+## What this repository is
 
-**wtfi2**（What The F\*ck Internet）。Wi-Fi から internet までの経路を並列に probe し、topology 図と「どこで切れてるか + 直し方」の 1 行 verdict を出す Rust 製ネットワーク診断 CLI/TUI。ローカルディレクトリは `~/wtfi` だが **GitHub は `kanywst/wtfi2`、crate 名も `wtfi2`、インストールされるバイナリ名は `wtfi`**（旧 `kanywst/wtfi` は archived）。macOS ファースト、Linux も対応。
+**wtfi2** (What The F\*ck Internet). A network diagnostics CLI/TUI in Rust that probes the path from Wi-Fi to the internet in parallel and prints a topology diagram plus a one-line verdict on "where it breaks + how to fix it". The local directory is `~/wtfi`, but **the GitHub repo is `kanywst/wtfi2`, the crate name is also `wtfi2`, and the installed binary is `wtfi`** (the old `kanywst/wtfi` is archived). macOS first, Linux also supported.
 
-## 構成（big picture）
+## Layout (big picture)
 
-- `engine.rs` — 経路の骨格（`CHAIN`: Host → Link → Gateway → WAN → DNS → Captive）を作り、全 probe を並列に走らせて結果を mpsc channel に流す。`-w` の dashboard は届いた順に埋め、one-shot は同じ channel を drain するだけ。`Uplink` hop は WAN が壊れてるときだけ後から差し込まれる（TTL sweep は健康時に払わない）。
-- `probe/` — hop ごとの計測。`diagnose.rs` — 完成した `Path` から **最初の break** を見つけて verdict + fix + confidence にする（下流は巻き添え扱い）。break が無ければ loss/jitter で品質判定。
-- `platform/` — OS 依存は `Platform` trait の裏に閉じ込める。macOS は CoreWLAN (`objc2-core-wlan`) + `route` / `scutil`、Linux は `ip -j` / `iw` / `resolv.conf` と `/proc` fallback。それ以外の OS は `unsupported.rs` で exit 3。
-- `ui/`（ratatui dashboard）と `render.rs`（one-shot report）、`json.rs`（`--json`）。
-- 記録系: `recorder.rs` / `history.rs`（`--record` / `--history` / `--every`）、`bundle.rs`（`--bundle` で AI 向け Markdown）、`mcp.rs`（`--mcp` で stdio MCP server）。
-- `demo.rs` は `demo` feature 限定。README の GIF / PNG は `docs/*.tape` を vhs で `--demo` 再生して撮る（実ネットワークを載せないため。RFC 5737 アドレス）。
+- `engine.rs`: builds the skeleton of the path (`CHAIN`: Host → Link → Gateway → WAN → DNS → Captive), runs every probe in parallel and streams results into an mpsc channel. The `-w` dashboard fills in as results arrive; one-shot just drains the same channel. The `Uplink` hop is inserted afterwards only when WAN is broken (the TTL sweep is not paid when healthy).
+- `probe/`: per-hop measurement. `diagnose.rs`: finds the **first break** in the completed `Path` and turns it into verdict + fix + confidence (everything downstream is treated as collateral). With no break, it judges quality from loss/jitter.
+- `platform/`: OS-specific code is kept behind the `Platform` trait. macOS uses CoreWLAN (`objc2-core-wlan`) + `route` / `scutil`; Linux uses `ip -j` / `iw` / `resolv.conf` with a `/proc` fallback. Any other OS exits 3 via `unsupported.rs`.
+- `ui/` (ratatui dashboard), `render.rs` (one-shot report), `json.rs` (`--json`).
+- Recording: `recorder.rs` / `history.rs` (`--record` / `--history` / `--every`), `bundle.rs` (`--bundle`, Markdown for AI), `mcp.rs` (`--mcp`, stdio MCP server).
+- `demo.rs` is behind the `demo` feature. The README GIFs / PNGs are captured by replaying `--demo` through `docs/*.tape` with vhs (to keep the real network out of them; RFC 5737 addresses).
 
-## 診断ロジックの不変条件（git log の fix が繰り返し直してきたもの）
+## Diagnosis invariants (what fixes in git log have repeatedly restored)
 
-- **「測れなかった」を「壊れている」と言わない**。probe の timeout・コマンド失敗・読めなかった値は `Warn` / `Fault::Unobserved` / unknown に落とし、`Fail` や packet loss にしない。ICMP を落とす router や probe を filter する gateway を「dead」と判定しない。
-- **すべての probe は `PROBE_DEADLINE`、sweep 全体は `SWEEP_DEADLINE` で必ず有界**。新しい probe を足すときも同じ時計に乗せる（1 つ詰まると channel が閉じず CLI がハングする）。
-- **OS 差は判定ロジックではなく platform / probe 側で吸収**。ping / traceroute のフラグは OS ごとに組み立てる（iputils の `-t` は TTL、Linux の traceroute は `-I`）。verdict 文言も "Mac" 決め打ちにしない。
-- **外部契約は exit code（0-4）と `--json` の形だけ**。`tests/cli.rs` が実バイナリでこれを pin している。変えるなら README の表とテストも同時に。exit 4 は「何も測れなかった」で 2（Broken）とは別物。
-- テストで本物の probe を走らせない（#64 で踏んだ）。
+- **Do not report "could not measure" as "broken".** Probe timeouts, command failures and unreadable values go to `Warn` / `Fault::Unobserved` / unknown, not `Fail` or packet loss. Do not judge a router that drops ICMP, or a gateway that filters probes, as "dead".
+- **Every probe is bounded by `PROBE_DEADLINE`, and the whole sweep by `SWEEP_DEADLINE`.** New probes go on the same clock (if one gets stuck, the channel never closes and the CLI hangs).
+- **OS differences are absorbed in platform / probe, not in the diagnosis logic.** ping / traceroute flags are built per OS (iputils `-t` is TTL, Linux traceroute uses `-I`). Do not hardcode "Mac" in verdict text either.
+- **The only external contract is the exit code (0-4) and the shape of `--json`.** `tests/cli.rs` pins this against the real binary. If you change it, update the README table and the tests together. Exit 4 means "nothing could be measured" and is distinct from 2 (Broken).
+- Do not run real probes in tests (hit in #64).
 
-## よく使うコマンド
+## Common commands
 
-CI（`.github/workflows/ci.yml`）は `RUSTFLAGS=-D warnings` で macOS と ubuntu の 2 leg。ローカルでも同じ組み合わせで通す。
+CI (`.github/workflows/ci.yml`) has two legs, macOS and ubuntu, with `RUSTFLAGS=-D warnings`. Pass the same combination locally.
 
 ```bash
 cargo fmt --all -- --check
 RUSTFLAGS="-D warnings" cargo clippy --all-targets --all-features
 cargo test --all-features
 RUSTFLAGS="-D warnings" cargo build --release
-cargo publish --dry-run --locked          # CI の Linux leg と同じ packaging チェック
+cargo publish --dry-run --locked          # same packaging check as the CI Linux leg
 
-# 実ネットワークで動作確認
+# Check behaviour on the real network
 ./target/release/wtfi -v --no-color
 ./target/release/wtfi --json --timeout 1
 
-# README 用の録画（vhs 必須、demo feature でビルド）
+# Recording for the README (requires vhs, build with the demo feature)
 cargo build --release --features demo && vhs docs/report.tape
 
-# workflow の静的チェック / dist の release 計画
+# Static check of workflows / dist release plan
 actionlint .github/workflows/*.yml
 dist plan
 ```
 
-Linux leg（`platform/linux.rs`）は macOS ローカルではコンパイルされないので、Linux 側を触ったら CI の `linux build · package` の結果まで見る。
+The Linux leg (`platform/linux.rs`) is not compiled locally on macOS, so if you touch the Linux side, check the result of CI's `linux build · package` too.
 
-## 変更の出し方
+## How to ship changes
 
-- **main に直コミットしない。必ず feature branch → PR**。PR が CI + review bot の動作確認を兼ねる。
-- PR の title / body は英語、conventional commit の 1 行 title + 数行の事実（何を変えた・reviewer が知るべき注意・どう確認した）。"Why" セクションの講釈は書かない。
-- コードコメントは 1 行まで。設計の理由は PR body へ（古いコードの長文コメントは真似しない）。
-- PR に付く check: `CI`、`CodeRabbit`、`Claude Review`、`plan`（dist dry-run）。**CodeRabbit の green は「レビューしてない」の意味**（star < 10 で skip しても pass を返す）。必要なら comment の "Trigger review" を手で押す。`Claude Review` は dependabot PR では意図的に skip。
+- **Do not commit directly to main. Always feature branch → PR.** The PR doubles as the check that CI and the review bots work.
+- PR title / body in English: a one-line conventional commit title plus a few lines of facts (what changed, caveats the reviewer should know, how it was verified). No "Why" section lecturing.
+- Code comments are one line at most. Design reasoning goes in the PR body (do not imitate the long comments in older code).
+- Checks on PRs: `CI`, `CodeRabbit`, `Claude Review`, `plan` (dist dry-run). **A green CodeRabbit means "did not review"** (it returns pass even when it skips because stars < 10). If needed, press "Trigger review" in its comment by hand. `Claude Review` is intentionally skipped on dependabot PRs.
 
-## stacked PR の落とし穴（実際に PR を失った）
+## Stacked PR pitfalls (a PR was actually lost)
 
-- `ci.yml` は `pull_request: branches: [main]` なので **base が feature branch の PR には CI が走らない**。stack の green は CI pass を意味しない。下から順に main へ retarget して merge するか、ローカルで検証する。
-- merge 手順は「子を `gh pr edit N --base main` で retarget → 親を merge → 親 branch を削除」の順。**子が残っているのに `--delete-branch` すると子 PR が close され、二度と reopen できない**（#35 を失い #46 で出し直した）。
-- retarget だけでは CI は起きない（`edited` は trigger 外）。retarget してから rebase & push する。push 済みなら `gh pr close` → `gh pr reopen`。
-- 親を squash merge したら `git rebase --update-refs --onto origin/main <merged-branch> <top-branch>` で restack。
-- Claude Review は stack の全 PR に thread を付ける。merge 対象だけでなく open な全 PR の未返信 thread を毎回確認する。
+- `ci.yml` uses `pull_request: branches: [main]`, so **CI does not run on PRs whose base is a feature branch**. Green in a stack does not mean CI passed. Retarget to main and merge from the bottom up, or verify locally.
+- Merge order: retarget the child with `gh pr edit N --base main`, merge the parent, then delete the parent branch. **Using `--delete-branch` while a child still exists closes the child PR, and it can never be reopened** (#35 was lost and resubmitted as #46).
+- Retargeting alone does not trigger CI (`edited` is not a trigger). Retarget, then rebase & push. If already pushed, `gh pr close` → `gh pr reopen`.
+- After squash-merging the parent, restack with `git rebase --update-refs --onto origin/main <merged-branch> <top-branch>`.
+- Claude Review posts threads on every PR in the stack. Each time, check unreplied threads on all open PRs, not just the one being merged.
 
-## リリース
+## Releases
 
-- `chore(release): X.Y.Z` で `Cargo.toml` と `Cargo.lock` の version だけ上げる PR を merge し、`vX.Y.Z` tag を push。
-- tag は **2 つの独立 workflow** を起動する: `release.yml`（cargo-dist → GitHub Release、macOS/Linux バイナリ、attestation、CycloneDX SBOM、`kanywst/homebrew-tap` の formula、secret `HOMEBREW_TAP_TOKEN`）と `publish-crate.yml`（crates.io、secret `CARGO_REGISTRY_TOKEN`）。**crates.io は不可逆**（yank はできても同じ version は二度と使えない）。tag 前に両方を明言し、version が空いているか確認する: `curl -s https://crates.io/api/v1/crates/wtfi2/versions`。
-- `release.yml` は dist 生成物に **手パッチ**が当たっている（formula commit の冪等化、`cargo-cyclonedx` output 名の typo 修正）。`dist generate` で再生成したら手パッチが消えるので差分を確認して戻す。`dist-workspace.toml` の `allow-dirty = ["ci"]` はそのため。
-- tap の secret 名 `HOMEBREW_TAP_TOKEN` は他リポ（`HOMEBREW_TAP_GITHUB_TOKEN`）と違うが、dist がハードコードしているので **揃えない**。
-- crates.io 公開物から `.github/` / `docs/` / `dist-workspace.toml` は `exclude` 済み。
+- Merge a `chore(release): X.Y.Z` PR that bumps only the version in `Cargo.toml` and `Cargo.lock`, then push the `vX.Y.Z` tag.
+- The tag starts **two independent workflows**: `release.yml` (cargo-dist → GitHub Release, macOS/Linux binaries, attestation, CycloneDX SBOM, the formula in `kanywst/homebrew-tap`, secret `HOMEBREW_TAP_TOKEN`) and `publish-crate.yml` (crates.io, secret `CARGO_REGISTRY_TOKEN`). **crates.io is irreversible** (you can yank, but the same version can never be used again). Before tagging, state both explicitly and check that the version is free: `curl -s https://crates.io/api/v1/crates/wtfi2/versions`.
+- `release.yml` has **hand patches** on top of the dist output (making the formula commit idempotent, fixing a typo in the `cargo-cyclonedx` output name). Regenerating with `dist generate` drops them, so check the diff and restore them. That is why `dist-workspace.toml` has `allow-dirty = ["ci"]`.
+- The tap secret name `HOMEBREW_TAP_TOKEN` differs from other repos (`HOMEBREW_TAP_GITHUB_TOKEN`), but dist hardcodes it, so **do not align them**.
+- `.github/` / `docs/` / `dist-workspace.toml` are already `exclude`d from the crates.io package.
