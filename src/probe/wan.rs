@@ -382,7 +382,7 @@ async fn verify_egress() -> Egress {
 }
 
 /// A certificate only this far ahead of the clock is more likely freshly minted by an interceptor.
-const MIN_CLOCK_LAG: u64 = 86_400;
+const MIN_CLOCK_LAG: u64 = 3_600;
 
 /// How far behind the clock is, when a request was refused for a certificate not yet valid.
 fn clock_lag(err: &(dyn std::error::Error + 'static)) -> Option<u64> {
@@ -411,8 +411,12 @@ fn clock_lag(err: &(dyn std::error::Error + 'static)) -> Option<u64> {
 
 fn clock_summary(lag: u64) -> String {
     format!(
-        "The internet answers, but its HTTPS certificate isn't valid for another {} days by this machine's clock ({})",
-        lag.div_ceil(86_400),
+        "The internet answers, but its HTTPS certificate isn't valid for another {} by this machine's clock ({})",
+        if lag >= 86_400 {
+            format!("{} days", lag.div_ceil(86_400))
+        } else {
+            format!("{} hours", lag.div_ceil(3_600))
+        },
         crate::history::utc(now_secs())
     )
 }
@@ -756,6 +760,8 @@ mod tests {
         // The shape hyper actually returns: io::Error(Other) around io::Error(InvalidData) around rustls.
         let nested = std::io::Error::other(wrap(ahead(3 * 86_400)));
         assert_eq!(clock_lag(&nested), Some(3 * 86_400));
+        // An RTC kept in local time is hours off, not days.
+        assert_eq!(clock_lag(&wrap(ahead(9 * 3_600))), Some(9 * 3_600));
         // Minutes ahead is an interceptor minting certificates, not our clock.
         assert_eq!(clock_lag(&wrap(ahead(600))), None);
         assert_eq!(clock_lag(&wrap(CertificateError::NotValidYet)), None);
