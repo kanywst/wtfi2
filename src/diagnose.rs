@@ -484,6 +484,11 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
         // diagram cannot show you, so the verdict has to say it in words.
         // Ahead of both arms below: "the path carries nothing" outranks "the
         // path is lossy" and "the path is filtered".
+        HopId::Wan if path.get(id).and_then(|h| h.fault) == Some(Fault::ClockBehind) => (
+            "Your clock is behind",
+            format!("{summary}. Every HTTPS site will refuse to connect until the date and time are right."),
+            Some("Turn on automatic date and time (NTP) and run again. Devices without a battery-backed clock, like a Raspberry Pi, lose the time on every power cut.".to_string()),
+        ),
         HopId::Wan if path.get(id).and_then(|h| h.fault) == Some(Fault::HandshakeOnly) => (
             "Something is answering for the internet",
             "Every connection completes, but no real request does. A device on the path is replying to handshakes without carrying the traffic — an interception appliance, a misbehaving proxy, or a portal you haven't signed in to.".to_string(),
@@ -961,6 +966,23 @@ mod tests {
         );
         assert!(!v.headline.contains("dropping packets"), "{}", v.headline);
         assert!(v.fix.as_deref().unwrap().contains("sign-in page"));
+    }
+
+    #[test]
+    fn a_clock_behind_is_blamed_on_the_clock_not_the_network() {
+        let mut wan = hop(HopId::Wan, Layer::Internet, Status::Warn);
+        wan.fault = Some(Fault::ClockBehind);
+        let p = Path {
+            hops: vec![
+                hop(HopId::Host, Layer::Link, Status::Ok),
+                hop(HopId::Link, Layer::Link, Status::Ok),
+                hop(HopId::Gateway, Layer::Network, Status::Ok),
+                wan,
+            ],
+        };
+        let v = diagnose(&p);
+        assert!(v.headline.contains("clock"), "{}", v.headline);
+        assert!(v.fix.as_deref().unwrap().contains("NTP"));
     }
 
     /// The verdict this whole hop exists to replace. "Your ISP / uplink is

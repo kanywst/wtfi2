@@ -178,7 +178,7 @@ complete:
    rate, graded into a signal quality.
 3. **L3 Gateway** — resolves the default route and sends a short ICMP burst to the router, measuring RTT, packet loss and jitter, and flagging VPN/tunnel interfaces and sub-1500 MTU.
 4. **Uplink** — when, and only when, something upstream is already broken, a bounded ICMP TTL sweep turns the single edge between your gateway and the internet back into hops. Where the replies stop decides whether the break is on your own line (modem/ONU, WAN cable) or inside your ISP's network — and names the last address that answered, so you have something to quote.
-5. **WAN** — real TCP handshakes to three independent anycast operators (Cloudflare, Google, Quad9) over IPv4 and IPv6, which exposes asymmetric blackholing without needing raw ICMP and separates "the internet is unreachable" from "this network blocks that address". It then repeats the handshake against the quickest one to measure loss and jitter on the uplink itself.
+5. **WAN** — real TCP handshakes to three independent anycast operators (Cloudflare, Google, Quad9) over IPv4 and IPv6, which exposes asymmetric blackholing without needing raw ICMP and separates "the internet is unreachable" from "this network blocks that address". It then repeats the handshake against the quickest one to measure loss and jitter on the uplink itself. One real HTTPS request checks that the handshakes carry traffic; when it is refused because the certificate isn't valid yet, the verdict blames this machine's clock instead of the network.
 6. **DNS** — benchmarks the system resolver against Cloudflare and Google to
    separate "DNS is down" from "your resolver is just slow".
 7. **Captive portal** — a plain-HTTP hotspot check that catches login-page
