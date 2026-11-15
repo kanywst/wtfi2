@@ -217,7 +217,7 @@ pub async fn probe() -> Hop {
             let quality = apply_quality(&mut hop, &q, JITTER_WARN_MS);
             let blocked = blocked_targets(&v4, &v6);
             let handshake_only = handshake_only(&v4, &v6, &egress);
-            let clock_behind = !egress.verified && egress.clock_behind;
+            let clock_behind = egress.clock_behind;
             hop.status =
                 quality
                     .max(block_status(&blocked))
@@ -231,10 +231,7 @@ pub async fn probe() -> Hop {
             // operator being filtered.
             if clock_behind {
                 hop.fault = Some(Fault::ClockBehind);
-                hop.summary = Some(format!(
-                    "The internet answers, but its HTTPS certificate isn't valid yet by this machine's clock ({})",
-                    crate::history::utc(now_secs())
-                ));
+                hop.summary = Some(clock_summary());
             } else if handshake_only {
                 hop.fault = Some(Fault::HandshakeOnly);
                 hop.summary = Some(
@@ -256,10 +253,15 @@ pub async fn probe() -> Hop {
         (false, true) => {
             hop.status = Status::Warn;
             hop.latency_ms = v6.best().and_then(|(_, _, p)| p.ms());
-            hop.summary = Some(format!(
-                "IPv6-only reachable — all {} IPv4 targets are blackholed",
-                V4.len()
-            ));
+            if egress.clock_behind {
+                hop.fault = Some(Fault::ClockBehind);
+                hop.summary = Some(clock_summary());
+            } else {
+                hop.summary = Some(format!(
+                    "IPv6-only reachable — all {} IPv4 targets are blackholed",
+                    V4.len()
+                ));
+            }
         }
         (false, false) => {
             // Every operator, on every family, independently silent. That is
@@ -396,6 +398,13 @@ fn not_yet_valid(err: &(dyn std::error::Error + 'static)) -> bool {
         };
     }
     false
+}
+
+fn clock_summary() -> String {
+    format!(
+        "The internet answers, but its HTTPS certificate isn't valid yet by this machine's clock ({})",
+        crate::history::utc(now_secs())
+    )
 }
 
 fn now_secs() -> u64 {
