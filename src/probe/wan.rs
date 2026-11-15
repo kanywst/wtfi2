@@ -119,6 +119,8 @@ struct Egress {
     /// works". A middlebox can complete a handshake to anything; it cannot
     /// produce Cloudflare's certificate.
     verified: bool,
+    /// The certificate was rejected as not yet valid, so this machine's clock is behind.
+    clock_behind: bool,
 }
 
 /// One family's results: which targets answered, and how fast.
@@ -201,10 +203,7 @@ pub async fn probe() -> Hop {
         }
     }
 
-    hop.evidence = Some(evidence(
-        v4.reached.len() + v6.reached.len(),
-        egress.verified,
-    ));
+    hop.evidence = Some(evidence(v4.reached.len() + v6.reached.len(), &egress));
 
     match (v4.any_up(), v6.any_up()) {
         (true, dual_stack) => {
@@ -218,15 +217,25 @@ pub async fn probe() -> Hop {
             let quality = apply_quality(&mut hop, &q, JITTER_WARN_MS);
             let blocked = blocked_targets(&v4, &v6);
             let handshake_only = handshake_only(&v4, &v6, &egress);
-            hop.status = quality.max(block_status(&blocked)).max(if handshake_only {
-                Status::Warn
-            } else {
-                Status::Ok
-            });
+            let clock_behind = !egress.verified && egress.clock_behind;
+            hop.status =
+                quality
+                    .max(block_status(&blocked))
+                    .max(if handshake_only || clock_behind {
+                        Status::Warn
+                    } else {
+                        Status::Ok
+                    });
             // Whichever finding is the more serious owns the code; a path that
             // answers handshakes but carries nothing is worse news than one
             // operator being filtered.
-            if handshake_only {
+            if clock_behind {
+                hop.fault = Some(Fault::ClockBehind);
+                hop.summary = Some(format!(
+                    "The internet answers, but its HTTPS certificate isn't valid yet by this machine's clock ({})",
+                    crate::history::utc(now_secs())
+                ));
+            } else if handshake_only {
                 hop.fault = Some(Fault::HandshakeOnly);
                 hop.summary = Some(
                     "Every handshake completes but no real request does — something is answering connections on the path without carrying them".into(),
@@ -318,9 +327,10 @@ fn handshake_only(v4: &Family, v6: &Family, egress: &Egress) -> bool {
 /// One complete request through the uplink: the check that makes a green hop
 /// mean something, and the only place a public address can come from.
 async fn verify_egress() -> Egress {
-    let unverified = Egress {
+    let mut unverified = Egress {
         public_ip: None,
         verified: false,
+        clock_behind: false,
     };
     let Ok(client) = reqwest::Client::builder().build() else {
         return unverified;
@@ -337,8 +347,14 @@ async fn verify_egress() -> Egress {
         if left < MIN_TRACE {
             break;
         }
-        let Ok(resp) = client.get(url).timeout(left).send().await else {
-            continue;
+        let resp = match client.get(url).timeout(left).send().await {
+            Ok(resp) => resp,
+            Err(e) if not_yet_valid(&e) => {
+                // The by-name retry would be judged by the same clock.
+                unverified.clock_behind = true;
+                break;
+            }
+            Err(_) => continue,
         };
         if !resp.status().is_success() {
             continue;
@@ -352,10 +368,40 @@ async fn verify_egress() -> Egress {
             return Egress {
                 public_ip: Some(ip),
                 verified: true,
+                clock_behind: false,
             };
         }
     }
     unverified
+}
+
+/// Whether a failed request was refused because the certificate isn't valid yet.
+fn not_yet_valid(err: &(dyn std::error::Error + 'static)) -> bool {
+    use rustls::{CertificateError, Error as TlsError};
+    let mut cur = Some(err);
+    while let Some(e) = cur {
+        if let Some(TlsError::InvalidCertificate(
+            CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. },
+        )) = e.downcast_ref::<TlsError>()
+        {
+            return true;
+        }
+        // io::Error::source() skips the error it wraps, and hyper nests rustls two io::Errors deep.
+        cur = match e
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+        {
+            Some(inner) => Some(inner as &(dyn std::error::Error + 'static)),
+            None => e.source(),
+        };
+    }
+    false
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Pull the `ip=` line out of a `cdn-cgi/trace` response.
@@ -402,12 +448,14 @@ fn block_status(blocked: &[&str]) -> Status {
 /// HTTPS request" was guaranteed to contradict the cause printed beside it
 /// whenever `HandshakeOnly` fired — in exactly the case the evidence matters
 /// most.
-fn evidence(addresses: usize, verified: bool) -> String {
+fn evidence(addresses: usize, egress: &Egress) -> String {
     format!(
         "{addresses} handshakes to :{PORT} across {} independent networks, and one HTTPS request that {}",
         operator_count(),
-        if verified {
+        if egress.verified {
             "completed"
+        } else if egress.clock_behind {
+            "was refused: certificate not yet valid"
         } else {
             "did not complete"
         }
@@ -667,7 +715,37 @@ mod tests {
         Egress {
             public_ip: None,
             verified,
+            clock_behind: false,
         }
+    }
+
+    #[test]
+    fn a_not_yet_valid_certificate_is_found_inside_the_io_error() {
+        use rustls::{CertificateError, Error as TlsError};
+        let wrap = |c| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                TlsError::InvalidCertificate(c),
+            )
+        };
+        assert!(not_yet_valid(&wrap(CertificateError::NotValidYet)));
+        // The shape hyper actually returns: io::Error(Other) around io::Error(InvalidData) around rustls.
+        let nested = std::io::Error::other(wrap(CertificateError::NotValidYet));
+        assert!(not_yet_valid(&nested));
+        // Expired could be a real stale certificate on an interception box, not our clock.
+        assert!(!not_yet_valid(&wrap(CertificateError::Expired)));
+        assert!(!not_yet_valid(&wrap(CertificateError::UnknownIssuer)));
+        assert!(!not_yet_valid(&std::io::Error::other("timed out")));
+    }
+
+    #[test]
+    fn a_refused_certificate_is_said_so_in_the_evidence() {
+        let e = Egress {
+            public_ip: None,
+            verified: false,
+            clock_behind: true,
+        };
+        assert!(evidence(5, &e).contains("not yet valid"));
     }
 
     fn all_up() -> Family {
@@ -756,13 +834,13 @@ mod tests {
         let v6 = family(&[("Cloudflare v6", None), ("Google v6", None)]);
         assert!(handshake_only(&all_up(), &v6, &egress(false)));
 
-        let unverified = evidence(5, false);
+        let unverified = evidence(5, &egress(false));
         assert!(unverified.contains("did not complete"), "got: {unverified}");
         assert!(
             !unverified.contains("verified"),
             "must not read as a completed request: {unverified}"
         );
-        assert!(evidence(5, true).contains("completed"));
+        assert!(evidence(5, &egress(true)).contains("completed"));
     }
 
     #[test]

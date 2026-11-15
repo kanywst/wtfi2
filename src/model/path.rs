@@ -92,6 +92,9 @@ pub enum Fault {
     /// Every TCP handshake completes, but no real request does — something on
     /// the path answers connections without carrying them.
     HandshakeOnly,
+    /// The HTTPS certificate is not yet valid by this machine's clock: the
+    /// clock is behind, so every TLS connection fails.
+    ClockBehind,
     /// The system resolver returned no answer.
     ResolverDead,
     /// The system resolver answers, but not truthfully — it synthesises
@@ -121,6 +124,7 @@ impl Fault {
             Fault::NoInternet => "no_internet",
             Fault::TargetBlocked => "target_blocked",
             Fault::HandshakeOnly => "handshake_only",
+            Fault::ClockBehind => "clock_behind",
             Fault::ResolverDead => "resolver_dead",
             Fault::ResolverHijacked => "resolver_hijacked",
             Fault::PortalIntercept => "portal_intercept",
@@ -467,6 +471,7 @@ mod tests {
             Fault::NoInternet,
             Fault::TargetBlocked,
             Fault::HandshakeOnly,
+            Fault::ClockBehind,
             Fault::ResolverDead,
             Fault::ResolverHijacked,
             Fault::PortalIntercept,
