@@ -119,8 +119,8 @@ struct Egress {
     /// works". A middlebox can complete a handshake to anything; it cannot
     /// produce Cloudflare's certificate.
     verified: bool,
-    /// The certificate was rejected as not yet valid, so this machine's clock is behind.
-    clock_behind: bool,
+    /// How far behind this machine's clock is, when a certificate was refused as not yet valid.
+    clock_lag: Option<u64>,
 }
 
 /// One family's results: which targets answered, and how fast.
@@ -217,7 +217,7 @@ pub async fn probe() -> Hop {
             let quality = apply_quality(&mut hop, &q, JITTER_WARN_MS);
             let blocked = blocked_targets(&v4, &v6);
             let handshake_only = handshake_only(&v4, &v6, &egress);
-            let clock_behind = egress.clock_behind;
+            let clock_behind = egress.clock_lag.is_some();
             hop.status =
                 quality
                     .max(block_status(&blocked))
@@ -231,7 +231,7 @@ pub async fn probe() -> Hop {
             // operator being filtered.
             if clock_behind {
                 hop.fault = Some(Fault::ClockBehind);
-                hop.summary = Some(clock_summary());
+                hop.summary = Some(clock_summary(egress.clock_lag.unwrap_or_default()));
             } else if handshake_only {
                 hop.fault = Some(Fault::HandshakeOnly);
                 hop.summary = Some(
@@ -253,15 +253,17 @@ pub async fn probe() -> Hop {
         (false, true) => {
             hop.status = Status::Warn;
             hop.latency_ms = v6.best().and_then(|(_, _, p)| p.ms());
-            if egress.clock_behind {
-                hop.fault = Some(Fault::ClockBehind);
-                hop.summary = Some(clock_summary());
-            } else {
-                hop.summary = Some(format!(
-                    "IPv6-only reachable — all {} IPv4 targets are blackholed",
-                    V4.len()
-                ));
-            }
+            let blackholed = format!(
+                "IPv6-only reachable — all {} IPv4 targets are blackholed",
+                V4.len()
+            );
+            hop.summary = Some(match egress.clock_lag {
+                Some(lag) => {
+                    hop.fault = Some(Fault::ClockBehind);
+                    format!("{}; separately, {blackholed}", clock_summary(lag))
+                }
+                None => blackholed,
+            });
         }
         (false, false) => {
             // Every operator, on every family, independently silent. That is
@@ -332,7 +334,7 @@ async fn verify_egress() -> Egress {
     let mut unverified = Egress {
         public_ip: None,
         verified: false,
-        clock_behind: false,
+        clock_lag: None,
     };
     let Ok(client) = reqwest::Client::builder().build() else {
         return unverified;
@@ -351,12 +353,14 @@ async fn verify_egress() -> Egress {
         }
         let resp = match client.get(url).timeout(left).send().await {
             Ok(resp) => resp,
-            Err(e) if not_yet_valid(&e) => {
+            Err(e) => {
+                unverified.clock_lag = clock_lag(&e);
                 // The by-name retry would be judged by the same clock.
-                unverified.clock_behind = true;
-                break;
+                if unverified.clock_lag.is_some() {
+                    break;
+                }
+                continue;
             }
-            Err(_) => continue,
         };
         if !resp.status().is_success() {
             continue;
@@ -370,23 +374,28 @@ async fn verify_egress() -> Egress {
             return Egress {
                 public_ip: Some(ip),
                 verified: true,
-                clock_behind: false,
+                clock_lag: None,
             };
         }
     }
     unverified
 }
 
-/// Whether a failed request was refused because the certificate isn't valid yet.
-fn not_yet_valid(err: &(dyn std::error::Error + 'static)) -> bool {
+/// A certificate only this far ahead of the clock is more likely freshly minted by an interceptor.
+const MIN_CLOCK_LAG: u64 = 86_400;
+
+/// How far behind the clock is, when a request was refused for a certificate not yet valid.
+fn clock_lag(err: &(dyn std::error::Error + 'static)) -> Option<u64> {
     use rustls::{CertificateError, Error as TlsError};
     let mut cur = Some(err);
     while let Some(e) = cur {
-        if let Some(TlsError::InvalidCertificate(
-            CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. },
-        )) = e.downcast_ref::<TlsError>()
+        if let Some(TlsError::InvalidCertificate(CertificateError::NotValidYetContext {
+            time,
+            not_before,
+        })) = e.downcast_ref::<TlsError>()
         {
-            return true;
+            let lag = not_before.as_secs().saturating_sub(time.as_secs());
+            return (lag >= MIN_CLOCK_LAG).then_some(lag);
         }
         // io::Error::source() skips the error it wraps, and hyper nests rustls two io::Errors deep.
         cur = match e
@@ -397,12 +406,13 @@ fn not_yet_valid(err: &(dyn std::error::Error + 'static)) -> bool {
             None => e.source(),
         };
     }
-    false
+    None
 }
 
-fn clock_summary() -> String {
+fn clock_summary(lag: u64) -> String {
     format!(
-        "The internet answers, but its HTTPS certificate isn't valid yet by this machine's clock ({})",
+        "The internet answers, but its HTTPS certificate isn't valid for another {} days by this machine's clock ({})",
+        lag.div_ceil(86_400),
         crate::history::utc(now_secs())
     )
 }
@@ -463,7 +473,7 @@ fn evidence(addresses: usize, egress: &Egress) -> String {
         operator_count(),
         if egress.verified {
             "completed"
-        } else if egress.clock_behind {
+        } else if egress.clock_lag.is_some() {
             "was refused: certificate not yet valid"
         } else {
             "did not complete"
@@ -724,12 +734,13 @@ mod tests {
         Egress {
             public_ip: None,
             verified,
-            clock_behind: false,
+            clock_lag: None,
         }
     }
 
     #[test]
     fn a_not_yet_valid_certificate_is_found_inside_the_io_error() {
+        use rustls::pki_types::UnixTime;
         use rustls::{CertificateError, Error as TlsError};
         let wrap = |c| {
             std::io::Error::new(
@@ -737,14 +748,21 @@ mod tests {
                 TlsError::InvalidCertificate(c),
             )
         };
-        assert!(not_yet_valid(&wrap(CertificateError::NotValidYet)));
+        let at = |s: u64| UnixTime::since_unix_epoch(Duration::from_secs(s));
+        let ahead = |lag: u64| CertificateError::NotValidYetContext {
+            time: at(1_000_000_000),
+            not_before: at(1_000_000_000 + lag),
+        };
         // The shape hyper actually returns: io::Error(Other) around io::Error(InvalidData) around rustls.
-        let nested = std::io::Error::other(wrap(CertificateError::NotValidYet));
-        assert!(not_yet_valid(&nested));
+        let nested = std::io::Error::other(wrap(ahead(3 * 86_400)));
+        assert_eq!(clock_lag(&nested), Some(3 * 86_400));
+        // Minutes ahead is an interceptor minting certificates, not our clock.
+        assert_eq!(clock_lag(&wrap(ahead(600))), None);
+        assert_eq!(clock_lag(&wrap(CertificateError::NotValidYet)), None);
         // Expired could be a real stale certificate on an interception box, not our clock.
-        assert!(!not_yet_valid(&wrap(CertificateError::Expired)));
-        assert!(!not_yet_valid(&wrap(CertificateError::UnknownIssuer)));
-        assert!(!not_yet_valid(&std::io::Error::other("timed out")));
+        assert_eq!(clock_lag(&wrap(CertificateError::Expired)), None);
+        assert_eq!(clock_lag(&wrap(CertificateError::UnknownIssuer)), None);
+        assert_eq!(clock_lag(&std::io::Error::other("timed out")), None);
     }
 
     #[test]
@@ -752,7 +770,7 @@ mod tests {
         let e = Egress {
             public_ip: None,
             verified: false,
-            clock_behind: true,
+            clock_lag: Some(86_400),
         };
         assert!(evidence(5, &e).contains("not yet valid"));
     }

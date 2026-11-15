@@ -486,7 +486,7 @@ fn explain_warn(path: &Path, id: HopId) -> Verdict {
         // path is lossy" and "the path is filtered".
         HopId::Wan if path.get(id).and_then(|h| h.fault) == Some(Fault::ClockBehind) => (
             "Your clock is behind",
-            format!("{summary}. Every HTTPS site will refuse to connect until the date and time are right; the network itself is fine."),
+            format!("{summary}. Every HTTPS site will refuse to connect until the date and time are right."),
             Some("Turn on automatic date and time (NTP) and run again. Devices without a battery-backed clock, like a Raspberry Pi, lose the time on every power cut.".to_string()),
         ),
         HopId::Wan if path.get(id).and_then(|h| h.fault) == Some(Fault::HandshakeOnly) => (
